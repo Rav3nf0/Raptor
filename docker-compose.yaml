@@ -1,0 +1,16 @@
+# RAPTOR demo — MongoDB only. The app runs locally via uvicorn (see demo/run_demo.sh).
+services:
+  mongodb:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mongodb_data: {}

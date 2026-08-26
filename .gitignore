@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Secrets / local config
+.env
+*.env
+!demo/demo.env
+!env.example
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Runtime
+*.log
+output/

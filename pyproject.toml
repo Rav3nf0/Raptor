@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "raptor-soc"
+version = "0.1.0"
+description = "Autonomous L1 alert triage with a data-sovereignty boundary and institutional memory"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    "motor>=3.3.0",
+    "beanie>=1.24.0,<2.1.0",
+    "pymongo>=4.6.0",
+    "httpx>=0.26.0",
+    "PyJWT>=2.8.0",
+    "python-multipart>=0.0.6",
+    "boto3>=1.34.0",
+]
+
+[project.optional-dependencies]
+# LLM backends beyond the deterministic/rule-based path.
+llm = ["google-genai>=1.0.0", "anthropic>=0.116.0"]
+dev = ["pytest>=7.4.0", "pytest-asyncio>=0.23.0", "ruff>=0.2.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*", "lib*", "edr_triage*", "agent_core*", "agent_tools*", "entity_graph*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
