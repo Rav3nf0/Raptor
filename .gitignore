@@ -23,3 +23,7 @@ env/
 # Runtime
 *.log
 output/
+
+# Black Hat submission prep — not part of the public tool
+docs/blackhat-arsenal-submission.md
+docs/arsenal-form-answers.txt
