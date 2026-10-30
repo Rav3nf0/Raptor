@@ -92,6 +92,25 @@ class AgentResult:
     # Lets us measure how often a gate turned an intended auto-close into an escalation
     # (i.e. whether the safety layer is over-gating), which the final triage_class hides.
     pre_safety_class: str = ""
+    # The MODEL's own reasoning text, before a gate that fires on an evidence gap (e.g.
+    # _too_early_for_blank_bound_evidence) replaces `reasoning` with a grounded placeholder.
+    # DEMO-110018: the blank-arrival gate correctly blocked the verdict, but the model's
+    # narrative — a confident FP story naming a device, script, and VT hash that no tool
+    # call had actually returned — still rendered verbatim in the Jira comment, ahead of
+    # the safety-gate caveat. Kept here (not shown to analysts) purely for debugging/audit.
+    pre_safety_reasoning: str = ""
+    # Stable machine-readable tag for WHICH gate set blocked_by_safety, set alongside it at
+    # each gate site in agent_core/loop.py (e.g. "multi_host_unassessed", "grounding_actor").
+    # Deliberately a fixed key, not a match against safety_block_reason's free-form prose —
+    # edr_triage/gate_retriage.py filters on this to decide which escalations are worth an
+    # automatic deferred retry (an evidence gap that more time can resolve) versus a hard
+    # stop that retrying cannot change (CRITICAL severity, a real VT detection, ...). Empty
+    # when no gate fired, or for a gate not yet opted into the retry sweep.
+    safety_gate_kind: str = ""
+
+    # Checks the reasoning reports that no successful tool call backs (agent_core/
+    # claim_check.py). Annotates the comment only — never changes the verdict.
+    unverified_claims: list[str] = field(default_factory=list)
 
     # Validation-debate critic outcome (agent_core/critic.py)
     critic_ran: bool = False
@@ -131,11 +150,15 @@ class AgentResult:
             for tc in self.tool_calls:
                 result_summary = _summarize_tool_result(tc.name, tc.result)
                 lines.append(f"* {tc.name}({_fmt_args(tc.args)}) → {result_summary}")
+            lines += _office_activity_lines(self.tool_calls)
+
+        from agent_core.claim_check import render as _render_claims
+        lines += _render_claims(self.unverified_claims)
 
         lines += ["", "[Auto-triaged by DeepIntel Agent]"]
         return "\n".join(lines)
 
-    def to_jira_recommendation(self, alert_name: str) -> str:
+    def to_jira_recommendation(self, alert_name: str, state_note: str = "") -> str:
         """Format as an advisory copilot comment (AGENT_PHASE=copilot).
 
         Deliberately NOT to_jira_comment(): that one is written in the voice of a
@@ -160,9 +183,13 @@ class AgentResult:
             "",
             f"*Recommends:* {headline} ({self.triage_class})",
             f"*Confidence:* {self.confidence:.0%}",
+            # `state_note` replaces the promise below for families whose PLAYBOOK still
+            # drives the ticket in autonomous phase (the Netskope UBA chase): there the
+            # ticket DOES move — to Awaiting more inputs — and "will not" would be false.
+            state_note or (
             "*Ticket state:* unchanged — this is advisory only. RAPTOR has not "
             "closed, resolved, or transitioned this ticket, and will not. The "
-            "triage note above stands until an analyst decides.",
+            "triage note above stands until an analyst decides."),
             "",
             "*Reasoning:*",
             self.reasoning,
@@ -186,9 +213,59 @@ class AgentResult:
                     f"* {tc.name}({_fmt_args(tc.args)}) → "
                     f"{_summarize_tool_result(tc.name, tc.result)}"
                 )
+            lines += _office_activity_lines(self.tool_calls)
+
+        from agent_core.claim_check import render as _render_claims
+        lines += _render_claims(self.unverified_claims)
 
         lines += ["", "[RAPTOR copilot · advisory only — no action taken]"]
         return "\n".join(lines)
+
+
+def _office_activity_lines(tool_calls) -> list[str]:
+    """What the Office operations actually were, from hunt_office's rows: per actor and
+    operation, how many, when, on what, and the risk-deciding values. L2 on DEMO-116333
+    (auto-closed Remove-StoreMailbox and Set-AdminAuditLogConfig): the narrative named the
+    operations but not the exact activity, which is what a reviewer checks."""
+    groups: dict = {}
+    for tc in tool_calls or []:
+        if tc.name != "hunt_office" or not isinstance(tc.result, dict):
+            continue
+        for r in tc.result.get("rows") or []:
+            if not isinstance(r, dict):
+                continue
+            g = groups.setdefault((str(r.get("UserId") or "?"), str(r.get("Operation") or "?")),
+                                  {"n": 0, "times": [], "targets": [], "settings": [],
+                                   "params": [], "external": set(), "failed": 0})
+            g["n"] += 1
+            g["times"].append(str(r.get("TimeGenerated") or "")[:16].replace("T", " "))
+            for key, val in (("targets", r.get("Target")), ("settings", r.get("KeySettings"))):
+                v = " ".join(str(val or "").split())
+                if v and v not in g[key]:
+                    g[key].append(v)
+            for prm in str(r.get("ChangedParams") or "").split(","):
+                if prm.strip() and prm.strip() not in g["params"]:
+                    g["params"].append(prm.strip())
+            g["external"].add(str(r.get("ExternalAccess")))
+            if str(r.get("ResultStatus")).lower() in ("false", "failed"):
+                g["failed"] += 1
+    if not groups:
+        return []
+    out = ["", "*Office activity seen (hunt_office rows):*"]
+    for (who, op), g in list(groups.items())[:10]:
+        t = sorted(x for x in g["times"] if x)
+        when = (f"{t[0]} – {t[-1]} UTC" if t and t[0] != t[-1] else f"{t[0]} UTC") if t else ""
+        out.append(f"* *{op}* by {who[:60]} ×{g['n']}" + (f", {when}" if when else "")
+                   + (f", {g['failed']} failed" if g["failed"] else "")
+                   + (", external access" if "True" in g["external"] else ""))
+        if g["targets"]:
+            more = f" (+{len(g['targets']) - 3} more)" if len(g["targets"]) > 3 else ""
+            out.append("  ** On: " + "; ".join(x[-70:] for x in g["targets"][:3]) + more)
+        if g["settings"]:
+            out.append("  ** Set: " + "; ".join(x[:120] for x in g["settings"][:3]))
+        elif g["params"]:
+            out.append("  ** Parameters: " + ", ".join(g["params"][:10]))
+    return out
 
 
 def _fmt_args(args: dict) -> str:
@@ -228,6 +305,13 @@ def _summarize_tool_result(name: str, result: dict) -> str:
         return f"{result.get('count', 0)} rows"
     if name == "scg_get_entity_context":
         if result.get("found"):
+            # A shared account's counts are fleet-wide, so summarising them as "found: 176
+            # prior alerts, risk=100.0" reads as this actor's record. DEMO-109417 escalated
+            # on exactly that line for `root`. Say what it is instead.
+            if result.get("shared_account"):
+                return (f"SHARED account — fleet-wide totals only "
+                        f"({result.get('fleet_alert_count', 0)} alerts across all hosts), "
+                        f"no actor history for this event")
             return f"found: {result.get('alert_count', 0)} prior alerts, risk={result.get('risk_score', 0)}"
         return "not seen before"
     if name == "scg_check_concurrent_alerts":

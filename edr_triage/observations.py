@@ -16,6 +16,7 @@ _SOURCE_LABELS = {
     "netskope":     "Netskope",
     "aws_guardduty":"AWS GuardDuty",
     "entra_pim":    "Entra PIM",
+    "upwind":       "Upwind CNAPP",
     "unknown":      "Unknown",
 }
 
@@ -44,6 +45,8 @@ def detect_source(description: str, alert_name: str) -> str:
     if re.search(r'Microsoft\.SecurityInsights/Incidents/', description or ""):
         return "sentinel"
     name = (alert_name or "").lower()
+    if "upwind detection" in name or re.search(r'console\.upwind\.io/', description or ""):
+        return "upwind"
     if any(k in name for k in ("netskope", " dlp", "dlp ")):
         return "netskope"
     if any(k in name for k in ("ec2 instance", "guardduty", "assumedrole", "aws credential",
@@ -84,8 +87,9 @@ def record_observation(
                     "reviewed":       False,
                     "review_action":  None,
                     "review_note":    None,
+                    "count":          0,
                 },
-                "$inc": {"count": 1},   # creates `count`=1 on insert (never in $setOnInsert — conflict)
+                "$inc": {"count": 1},
             },
             upsert=True,
         )

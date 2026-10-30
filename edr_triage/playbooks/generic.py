@@ -45,6 +45,17 @@ _NOISE_CMD_PREFIXES = (
 _MAX_CMDS = 12
 
 
+def privesc_commands(evidence: dict | None, aws: dict | None) -> list[str]:
+    """The command list a Root Privesc / CloudTrail comment shows, in priority order: the
+    MDE alert's flagged processes, then the Sentinel Process-entity commands, then the
+    cleaned KQL command blob. One function so privesc_guard compares the live ticket with
+    exactly what earlier tickets' comments recorded."""
+    aws = aws or {}
+    return (list((evidence or {}).get("command_lines") or [])
+            or list(aws.get("command_lines") or [])
+            or _clean_commands(aws.get("command", "") or ""))
+
+
 def _clean_commands(raw: str) -> list[str]:
     """Deduplicate and strip OS/systemd noise from a semicolon-separated command string."""
     seen: set[str] = set()
@@ -62,15 +73,27 @@ def _clean_commands(raw: str) -> list[str]:
     return result
 
 
+_JIT_SESSION = re.compile(r"^jit-[a-z0-9]+-[a-z0-9]+-([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})$", re.I)
+
+
 def _arn_session_user(arn: str) -> str:
     """Extract the session principal from an assumed-role ARN.
 
     arn:aws:sts::123:assumed-role/role-name/user@company.com → user@company.com
+
+    A just-in-time access session names the person after a tool prefix:
+    `jit-ec2-ssm-cleo.menon@example.com` → cleo.menon@example.com. Left with the prefix, the
+    person was unresolvable, so RAPTOR never asked them (DEMO-115923, 2026-10-06) — and the
+    same person seen with and without it counted as two actors. Only the
+    `jit-<a>-<b>-<email>` form is stripped; the console/S3 form that encodes the address
+    (`jit-console-t-security-jordan-blake-at-acme-in`) is left as it is rather than guessed.
     """
     if not arn or "assumed-role/" not in arn:
         return ""
     parts = arn.split("/")
-    return parts[-1] if len(parts) >= 3 else ""
+    user = parts[-1] if len(parts) >= 3 else ""
+    m = _JIT_SESSION.match(user)
+    return m.group(1) if m else user
 
 
 def _is_service_account(name: str) -> bool:
@@ -96,8 +119,8 @@ def _additional_hosts_lines(aws: dict) -> list[str]:
     ARN / command) — a grouped root-privesc alert bundles several SSM sessions and
     L1 documents each one; the primary host is rendered inline above this."""
     # isinstance guard: same malformed-row shape already fixed at the source in
-    # pipeline.py — guard here too since this reads the RAW additional_hosts rows
-    # independently, before that filtering necessarily runs.
+    # pipeline.py (DEMO-108679/108667/108518) — guard here too since this reads the
+    # RAW additional_hosts rows independently, before that filtering necessarily runs.
     extra = [e for e in ((aws or {}).get("additional_hosts") or []) if isinstance(e, dict)]
     if not extra:
         return []
@@ -138,7 +161,7 @@ def _parse_aws_fields(description: str) -> dict:
 
 
 _CLOUDTRAIL_ANALYSIS_PROMPT = """\
-You are a senior cloud security analyst at a financial services company (ExampleCorp).
+You are a senior cloud security analyst at a financial services company (Acme).
 Analyse the following AWS CloudTrail / GuardDuty alert and determine whether it represents
 a genuine threat or legitimate authorized activity.
 
@@ -245,7 +268,7 @@ async def _llm_analyze_cloudtrail(aws: dict) -> tuple[str, list[str], str, str]:
     import os
 
     llm_backend = os.getenv("LLM_BACKEND", "ollama").lower()
-    llm_url     = os.getenv("LOCAL_LLM_URL", "http://localhost:11434")
+    llm_url     = os.getenv("LOCAL_LLM_URL", "http://localhost:80")
 
     if llm_backend != "ollama" or not llm_url:
         return _rule_based_analyze(aws)
@@ -611,6 +634,34 @@ class GenericPlaybook(BasePlaybook):
                 session_user = _arn_session_user(aws_user_arn)
                 if session_user:
                     l1_lines.append(f"*Session Principal:* {session_user}")
+            if aws.get("actor_ambiguous"):
+                _who = aws.get("session_principals") or aws.get("candidate_devices") or []
+                l1_lines.append(
+                    f"*Actor ambiguous:* SSM sessions by {', '.join(_who)} overlap this "
+                    "command, and the telemetry cannot tell which of them ran it. L2 must "
+                    "establish the actor — RAPTOR will not close this.")
+            if aws.get("finding_type"):
+                l1_lines.append(f"*GuardDuty Finding Type:* {aws['finding_type']}"
+                                + (f" (severity {aws['finding_severity']})"
+                                   if aws.get("finding_severity") else ""))
+            if aws.get("service_name") or aws.get("api_error_code"):
+                _call = " ".join(x for x in (aws.get("service_name", ""),
+                                             aws.get("event_name", "")) if x)
+                _err = aws.get("api_error_code", "")
+                l1_lines.append(f"*API Call:* {_call or 'unknown'}"
+                                + (f" — failed: {_err}" if _err else " — succeeded"))
+            if aws.get("principal_id"):
+                l1_lines.append(f"*Principal ID:* {aws['principal_id']}")
+            if aws.get("private_ip"):
+                l1_lines.append(f"*Private IP:* {aws['private_ip']}")
+            if aws.get("instance_name") or aws.get("instance_tribe"):
+                l1_lines.append("*Instance Tags:* " + ", ".join(
+                    f"{k} {v}" for k, v in (("Name", aws.get("instance_name")),
+                                            ("Tribe", aws.get("instance_tribe"))) if v))
+            if aws.get("event_first_seen"):
+                _last = aws.get("event_last_seen", "")
+                l1_lines.append(f"*Event Seen (UTC):* {aws['event_first_seen']}"
+                                + (f" → {_last}" if _last and _last != aws["event_first_seen"] else ""))
             if aws_access_key:
                 l1_lines.append(f"*Access Key ID:* {aws_access_key}")
             if aws_mfa_status:
@@ -618,8 +669,7 @@ class GenericPlaybook(BasePlaybook):
             # Command source priority: MDE alert evidence (flagged process) →
             # Sentinel Process-entity commands (also flagged, what L1 cites) →
             # the KQL "Initiating Command" blob (whole-device history, last resort).
-            _mde_cmds = (evidence or {}).get("command_lines") or []
-            cmds = _mde_cmds or aws.get("command_lines") or _clean_commands(aws_command)
+            cmds = privesc_commands(evidence, aws)
             if cmds:
                 total = len(cmds)
                 l1_lines.append(f"*Initiating Commands ({total}):*")

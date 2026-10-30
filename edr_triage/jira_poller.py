@@ -103,6 +103,103 @@ def parse_sentinel_alert_id(description: str) -> Optional[str]:
     return aid if aid.lower().startswith("sn") else None
 
 
+# Upwind CNAPP detection tickets, raised by Upwind's own Jira integration (critical
+# detections only). Format verified against DEMO-115057: summary
+# "<Severity> Severity Upwind Detection | <title>", label "Upwind", and a description of
+# "Label:" / value pairs where the value may sit on the same line or the next one
+# depending on how the ADF paragraphs split. The detection id exists ONLY inside the
+# console link (sidePanelItemId=uwd-...).
+_UPWIND_SUMMARY_RE = re.compile(r'^\s*(?:\w+\s+severity\s+)?upwind\s+detection\s*\|\s*(.*)$',
+                                re.IGNORECASE)
+_UPWIND_CONSOLE_RE = re.compile(r'https?://console\.upwind\.io/\S+', re.IGNORECASE)
+_UPWIND_DETECTION_ID_RE = re.compile(r'\b(uwd-[A-Za-z0-9]+)\b')
+_UPWIND_FIELD_RE = {
+    "title":          re.compile(r'^\s*Title:[ \t]*\n?[ \t]*(\S.*)$', re.IGNORECASE | re.MULTILINE),
+    "detail":         re.compile(r'^\s*Description:[ \t]*\n?[ \t]*(\S.*)$', re.IGNORECASE | re.MULTILINE),
+    "severity":       re.compile(r'^\s*Severity:[ \t]*\n?[ \t]*(\S.*)$', re.IGNORECASE | re.MULTILINE),
+    "resource_name":  re.compile(r'^\s*Resource\s+name:[ \t]*\n?[ \t]*(\S.*)$', re.IGNORECASE | re.MULTILINE),
+    "resource_kind":  re.compile(r'^\s*Resource\s+kind:[ \t]*\n?[ \t]*(\S.*)$', re.IGNORECASE | re.MULTILINE),
+    "resource_path":  re.compile(r'^\s*Resource\s+path:[ \t]*\n?[ \t]*(\S.*)$', re.IGNORECASE | re.MULTILINE),
+    "cloud_provider": re.compile(r'^\s*Cloud\s+Provider:[ \t]*\n?[ \t]*(\S.*)$', re.IGNORECASE | re.MULTILINE),
+    "account_id":     re.compile(r'^\s*Cloud\s+Account\s+ID:[ \t]*\n?[ \t]*(\S.*)$', re.IGNORECASE | re.MULTILINE),
+}
+# A value that is itself the next label means the field was empty on the ticket.
+_UPWIND_LABEL_LINE_RE = re.compile(
+    r'^(?:Title|Description|Severity|Link|Resource\s+(?:name|kind|path|details)|'
+    r'Cloud\s+Provider|Cloud\s+Account\s+ID|Affected\s+Resource|Detection\s+Details):?\s*$',
+    re.IGNORECASE,
+)
+
+
+def is_upwind_ticket(summary: str, labels: list | None, description: str) -> bool:
+    if any(str(l).strip().lower() == "upwind" for l in (labels or [])):
+        return True
+    if _UPWIND_SUMMARY_RE.match(summary or ""):
+        return True
+    return bool(_UPWIND_CONSOLE_RE.search(description or ""))
+
+
+def parse_upwind_ticket(summary: str, description: str) -> dict:
+    """Extract the Upwind detection fields. Missing fields are omitted, never guessed."""
+    text = description or ""
+    out: dict = {}
+    for field, rx in _UPWIND_FIELD_RE.items():
+        m = rx.search(text)
+        if m:
+            val = m.group(1).strip()
+            if val and not _UPWIND_LABEL_LINE_RE.match(val):
+                out[field] = val
+    link = _UPWIND_CONSOLE_RE.search(text)
+    if link:
+        out["link"] = link.group(0).rstrip(").,;")
+        det = _UPWIND_DETECTION_ID_RE.search(out["link"])
+        if det:
+            out["detection_id"] = det.group(1)
+    if not out.get("title"):
+        m = _UPWIND_SUMMARY_RE.match(summary or "")
+        if m and m.group(1).strip():
+            out["title"] = m.group(1).strip()
+    parts = [p.strip() for p in out.get("resource_path", "").split("|")]
+    if len(parts) >= 3 and parts[1]:
+        out["environment"] = parts[1]
+    return out
+
+
+def build_upwind_ticket(key: str, fields: dict, description: str,
+                        existing_comments: str = "") -> Optional[dict]:
+    """The pipeline ticket dict for an Upwind detection ticket, or None if it isn't one.
+
+    Shared by the poller, manual run-ticket and dependent re-triage so all three see
+    the same ticket. Dedup stays per TICKET (alert_id = jira_key), not per uwd- id:
+    claim_alert skips an already-claimed id with no Jira action at all, so keying on the
+    detection id would leave a second ticket for the same detection silently untouched.
+    """
+    summary = fields.get("summary", "") or ""
+    if not is_upwind_ticket(summary, fields.get("labels"), description):
+        return None
+    uw = parse_upwind_ticket(summary, description)
+    return {
+        "jira_key":     key,
+        "alert_id":     key,
+        "alert_name":   f"Upwind Detection | {uw.get('title') or summary}",
+        "description":  description,
+        "created_at":   fields.get("created", ""),
+        # Upwind's own rating first: the Jira priority can be edited after creation
+        # (DEMO-115057 went Critical -> Medium while Upwind still said CRITICAL), and
+        # severity feeds the never-auto-close-CRITICAL gate.
+        "severity":     uw.get("severity", "").title()
+                        or (fields.get("priority") or {}).get("name", ""),
+        "tactics":      "",
+        "device_name":  uw.get("resource_name", ""),
+        "user_name":    "",
+        "is_sentinel":  False,
+        "observe_only": False,
+        "is_upwind":    True,
+        "upwind":       uw,
+        "existing_comments": existing_comments,
+    }
+
+
 def parse_description_fields(description: str) -> dict:
     """Extract structured fields from an MDE Jira ticket description.
 
@@ -134,6 +231,10 @@ def _build_client(cfg: EDRTriageConfig) -> httpx.AsyncClient:
     )
 
 
+# 10 x 100 tickets per poll; the 6h window normally matches well under one page.
+_MAX_POLL_PAGES = 10
+
+
 async def poll_new_mde_tickets(cfg: Optional[EDRTriageConfig] = None) -> list[dict]:
     """Poll Jira for new SIM tickets and return only MDE alert tickets.
 
@@ -162,16 +263,32 @@ async def poll_new_mde_tickets(cfg: Optional[EDRTriageConfig] = None) -> list[di
 
     try:
         async with _build_client(cfg) as client:
-            resp = await client.get(
-                "/rest/api/3/search/jql",
-                params={
+            # Page until isLast/no token. One 100-row page, oldest first, meant that any
+            # time more than 100 tickets matched (a DLP burst: 70 in one hour on
+            # 2026-09-29), the NEWEST tickets fell off the end; if an analyst moved one
+            # out of these statuses before the queue drained, RAPTOR never saw it.
+            # Hard page cap so a pathological window can't spin forever.
+            issues: list[dict] = []
+            next_token: str | None = None
+            for _ in range(_MAX_POLL_PAGES):
+                params = {
                     "jql":        jql,
                     "fields":     "summary,description,created,priority,labels,comment",
                     "maxResults": "100",
-                },
-            )
-            resp.raise_for_status()
-            issues = resp.json().get("issues", [])
+                }
+                if next_token:
+                    params["nextPageToken"] = next_token
+                resp = await client.get("/rest/api/3/search/jql", params=params)
+                resp.raise_for_status()
+                page = resp.json()
+                issues.extend(page.get("issues", []))
+                next_token = page.get("nextPageToken")
+                if page.get("isLast") or not next_token:
+                    break
+            else:
+                logger.warning("Jira poll hit the %d-page cap (%d tickets) — the newest "
+                               "tickets in the window were not fetched this cycle",
+                               _MAX_POLL_PAGES, len(issues))
     except Exception as exc:
         logger.error("Jira poll failed: %s", exc)
         return []
@@ -189,10 +306,10 @@ async def poll_new_mde_tickets(cfg: Optional[EDRTriageConfig] = None) -> list[di
 
         # Analyst notes ALREADY on the ticket (a re-swept "Awaiting more inputs" or
         # "L2 Analysis Required" ticket, not a brand-new one) — L1/L2 frequently type
-        # out the exact field-level diff by hand (e.g. the full policy change:
-        # Policy/Result/Change Detected/Current Applications/Current Users), none of
-        # which the agent ever saw, because only `description` was ever fetched.
-        # Passed through as context; oscar.py decides how to weigh it.
+        # out the exact field-level diff by hand (DEMO-108035: Subodh Patil posted the
+        # full policy change — Policy/Result/Change Detected/Current Applications/
+        # Current Users — none of which the agent ever saw, because only `description`
+        # was ever fetched). Passed through as context; oscar.py decides how to weigh it.
         existing_comments, _, _ = _extract_all_comments(fields, bot_email=cfg.jira_email or "")
 
         alert_id = parse_mde_alert_id(description)
@@ -200,6 +317,13 @@ async def poll_new_mde_tickets(cfg: Optional[EDRTriageConfig] = None) -> list[di
 
         if not alert_id:
             alert_name = parsed.get("alert_name", fields.get("summary", ""))
+            upwind_ticket = build_upwind_ticket(key, fields, description, existing_comments)
+            if upwind_ticket:
+                logger.info("[upwind] %s → detection=%s resource=%s", key,
+                            upwind_ticket["upwind"].get("detection_id", "?"),
+                            upwind_ticket["device_name"] or "?")
+                mde_tickets.append(upwind_ticket)
+                continue
             sentinel_url = parse_sentinel_incident_url(description)
             if sentinel_url:
                 logger.info("[sentinel] %s → Sentinel incident alert_name='%s'", key, alert_name)
@@ -253,6 +377,42 @@ async def poll_new_mde_tickets(cfg: Optional[EDRTriageConfig] = None) -> list[di
 
     logger.info("Jira poll: %d tickets fetched, %d MDE/Sentinel alerts identified", len(issues), len(mde_tickets))
     return mde_tickets
+
+
+def adf_to_marked_text(adf: dict) -> str:
+    """ADF back to the wiki markup RAPTOR posted: a code run as `x`, a strong run as *x*,
+    a paragraph's inline runs joined on one line, a list item indented.
+
+    _adf_to_text drops every mark and puts each inline run on its own line. Since comments
+    started arriving as real formatting (mid-October), RAPTOR's own evidence records read
+    back as "Device:\\n host" with the command backticks gone, so the PowerShell and Root
+    Privesc precedent parsers matched nothing and human FP closes stopped counting
+    (DEMO-117178/117953: the same cleared script asked about again and again). Read with
+    this, a record parses exactly as it was written, and each command stays one command
+    even when it spans lines."""
+    if not adf or not isinstance(adf, dict):
+        return ""
+    t = adf.get("type")
+    if t == "text":
+        s = adf.get("text", "")
+        marks = {m.get("type") for m in (adf.get("marks") or []) if isinstance(m, dict)}
+        if "code" in marks:
+            s = f"`{s}`"
+        if "strong" in marks:
+            s = f"*{s}*"
+        return s
+    if t == "hardBreak":
+        return "\n"
+    if t in ("mention", "emoji", "inlineCard", "status", "date"):
+        a = adf.get("attrs") or {}
+        return str(a.get("text") or a.get("shortName") or a.get("url") or "")
+    kids = adf.get("content") or []
+    if t in ("paragraph", "heading", "codeBlock"):
+        return "".join(adf_to_marked_text(k) for k in kids)
+    inner = "\n".join(p for p in (adf_to_marked_text(k) for k in kids) if p)
+    if t == "listItem":
+        return "\n".join("  " + ln for ln in inner.split("\n"))
+    return inner
 
 
 def _adf_to_text(adf: dict) -> str:

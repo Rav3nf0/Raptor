@@ -38,6 +38,11 @@ class MemoryTier(str, Enum):
     quarantine = "quarantine"
     curated = "curated"
     golden = "golden"
+    # Decayed below the floor, or an allowlist entry past its expiry. Kept, not deleted:
+    # these are L2-approved decisions, and deleting one used to erase the audit trail of
+    # WHY a ticket was closed. Every retrieval path filters tier in (curated, golden), so
+    # an archived memory is inert everywhere without any caller having to know about it.
+    archived = "archived"
 
 
 class TriageClass(str, Enum):
@@ -108,7 +113,14 @@ class SCGMemory(Document):
     # LLM (get_playbook_memories). Defaulting to "entity" stops one actor/device FP
     # from teaching the model that the whole alert class is benign (DEMO-104192).
     scope: str = "entity"          # "entity" | "playbook"
-    actor: str = ""                # principal (user / service account) the verdict is scoped to
+    actor: str = ""                # PRIMARY principal (user / service account) the verdict is scoped to
+    # Every OTHER actor this same verdict covers, on a multi-actor incident. `actor`
+    # stays the primary for backward compatibility with every existing lookup; this is
+    # additive so a co-actor's justification is findable too. write_memory() dedupes
+    # on jira_key (one memory per ticket), so a multi-actor incident can't just write
+    # one memory per actor — this field is what makes the single memory findable for
+    # each of them. EMPTY for a single-actor verdict, same as additional_users.
+    actors: list[str] = Field(default_factory=list)
     device: str = ""              # device the verdict is scoped to (optional)
     # Optional command/process narrowing for the actor-allowlist. When set, an
     # armed auto_fp entry only fires if EVERY normalized process in the live alert
@@ -124,11 +136,32 @@ class SCGMemory(Document):
     # The Netskope path already binds per-user apps from Netskope_Alerts_CL and prints
     # them in the L1 comment; this is where that becomes queryable rather than prose.
     apps: list[str] = Field(default_factory=list)
+    # Which ACCOUNT of those apps (Netskope instance_id: example.onmicrosoft.com,
+    # acme, ...). "Bulk upload to Slack is fine" must not clear an upload to a personal
+    # Slack, so an entry with app_instances set only fires when EVERY live instance is
+    # in this list — fail-closed, like commands and apps. Empty = instance-agnostic.
+    app_instances: list[str] = Field(default_factory=list)
+    # Netskope UBA direction the approval covers: "upload" | "download" | "" (n/a). Both
+    # families share one subtype, so without this a download approval would also clear
+    # the same person's UPLOADS — the exfiltration direction.
+    uba_direction: str = ""
+    # What the L2-approved Netskope UBA activity looked like: {"hosts": [...],
+    # "max_events": int, "max_bytes": int}. uba_guard refuses a learned close from
+    # another device or at more than twice the approved volume — the approval alone
+    # cannot tell the owner from an insider or an attacker repeating the same shape.
+    uba_baseline: dict = Field(default_factory=dict)
     # Deterministic actor-allowlist: when a golden memory has auto_fp=True and the
     # live alert's actor (+device, if set) + alert_type (+commands, if set) match,
     # the pipeline auto-closes as FP WITHOUT invoking the LLM. Human-gated: only an
     # L2 promote/arm can set this — it never auto-populates from an L1 closure.
     auto_fp: bool = False
+    # Hard expiry for an armed auto_fp entry. Unlike decay, which only lowers a
+    # confidence the deterministic matcher used to ignore, this bounds how long an
+    # "actor X is fine" decision can close tickets without an L2 re-arming it. None on
+    # rows armed before expiry existed — the matcher then derives one from
+    # resolved_at/created_at, so legacy entries age out too.
+    expires_at: Optional[datetime] = None
+    archived_at: Optional[datetime] = None
     # Quarantine fields
     quarantine_reason: str = ""
     resolved_by: str = ""
@@ -189,11 +222,48 @@ class ShadowResult(Document):
     # actually reached about — and recall is entity-id scoped, so that memory would
     # never surface for him. EMPTY for single-user alerts.
     additional_users: list[str] = Field(default_factory=list)
+    # Paired host<->actor groups for a multi-actor incident: [{"actor","hosts","commands"}].
+    # additional_users/additional_hosts are flat, unlinked lists — neither can answer
+    # "which host belongs to which actor". DEMO-109720: one incident, two actors, each
+    # with their own disjoint set of hosts/commands; a justification request addressed
+    # to one actor settles nothing about the other. EMPTY for single-actor alerts, and
+    # for anything not on the AWS/SSM CloudTrail path (this is built from ARN session
+    # principals — see edr_triage/pipeline.py::_add_actor_host).
+    actor_hosts: list[dict] = Field(default_factory=list)
     severity: str = ""
     # Normalized process basenames seen in this alert (from the enrichment the
     # pipeline already computed). Persisted so the allowlist suggester can mine
     # command-level FP patterns — it is NOT used at triage time.
     alert_processes: list[str] = Field(default_factory=list)
+    # Identity of the underlying detection EVENT, when it can be established from the
+    # vendor's own ids (see edr_triage/burst.py). One Netskope sweep fans out into many
+    # Jira tickets — DEMO-110864..110872 were 9 tickets in 101 seconds for one finding,
+    # each paying for its own agent run. Tickets sharing a finding_group_id reuse the first
+    # one's verdict instead of re-deriving it. EMPTY whenever event identity is unknown,
+    # which disables reuse entirely. Every sibling is still scored; nothing is excluded.
+    finding_group_id: str = ""
+    # Set on a ticket whose verdict was carried over from a sibling rather than
+    # independently investigated. Empty on a ticket that was actually triaged.
+    duplicate_of: str = ""
+    # How the DLP evidence was bound: "alert" (the alert's own matched rows) or
+    # "window_sweep" (the fallback, whose rows are NOT established to be this alert's).
+    # Persisted purely so the question is answerable from the row. Without it the two
+    # are indistinguishable after the fact — a sweep filtered by user_hint returns one
+    # user and one event, exactly like a correct alert-scoped bind — and answering
+    # "did this ticket bind the right event?" required logs nobody can reach
+    # (DEMO-110937). EMPTY on non-DLP alerts and on rows written before this existed.
+    dlp_bind_source: str = ""
+    # The Sentinel alert id the DLP bind actually used, and the users it returned.
+    # Diagnostic: without these, "did this ticket bind its own alert's rows?" cannot be
+    # answered from the row, and three separate theories about DEMO-110937 (truncation,
+    # time-column mismatch, sweep fallback) were each plausible and each wrong.
+    dlp_bind_alert_id: str = ""
+    dlp_bound_users: list[str] = Field(default_factory=list)
+    # Asset ownership at triage time. "unregistered" / "unresolved:<tag>" are recorded
+    # rather than left blank: not being in the asset register is a different and
+    # actionable fact from never having been looked up.
+    asset_tribe: str = ""
+    asset_owners: list[str] = Field(default_factory=list)
     # AI verdict
     ai_triage_class: str
     ai_confidence: float
@@ -237,6 +307,12 @@ class ShadowResult(Document):
     l1_resolved_at: Optional[datetime] = None
     # L1 → L2 handoff (populated when ticket hits "L2 ANALYSIS REQUIRED")
     l1_handoff_at: Optional[datetime] = None
+    # When L1 opened the business-justification loop (Jira "AWAITING MORE INPUTS").
+    # Stamped once and never cleared. This is the only record that L1 CHOSE TO ASK:
+    # l1_triage_class captures escalate-or-close and nothing else, so an agent verdict of
+    # REQUEST_JUSTIFICATION could never be scored as agreeing with L1 even when both made
+    # the same call. Read by the l1_agreement metric; it scores nothing on its own.
+    l1_awaiting_inputs_at: Optional[datetime] = None
     l1_handoff_comment: str = ""
     # L2 final verdict (populated when L2 closes the ticket)
     l2_triage_class: Optional[str] = None
@@ -255,11 +331,49 @@ class ShadowResult(Document):
     blocked_by_safety: bool = False
     safety_block_reason: str = ""
     pre_safety_class: str = ""
+    # Stable machine-readable tag for WHICH gate set blocked_by_safety (e.g.
+    # "multi_host_unassessed", "grounding_actor") — see AgentResult.safety_gate_kind in
+    # agent_core/result.py. edr_triage/gate_retriage.py filters on this (never on the
+    # free-form safety_block_reason prose) to decide which escalations are an evidence
+    # gap worth an automatic deferred retry. Empty when no gate fired.
+    safety_gate_kind: str = ""
     # Set ONLY when blocked_by_safety came from the concurrent-open-alerts gate — the
     # OTHER ticket(s) whose still-open status blocked this one. Lets the closure poller
     # re-trigger this ticket the moment any of those siblings actually closes, instead of
     # it sitting at NEEDS_L2 forever with nothing tracking that the block has lifted.
     blocked_by_concurrent_keys: list[str] = Field(default_factory=list)
+    # ------------------------------------------------------------------
+    # Autonomous close + its overturn (edr_triage.jira_closure_poller)
+    #
+    # Only populated when RAPTOR itself closed the ticket (AGENT_PHASE=autonomous AND the
+    # family on EDR_AUTONOMOUS_FAMILIES), never when a human closed it. That distinction
+    # is the whole point: an autonomous close is the only kind nobody reviewed before it
+    # happened, so it is the only kind that needs a standing report.
+    #
+    # The overturn signal is the REOPEN, not a label or a review click. `False Positive ->
+    # Event Analysis` is transition 61 and works (verified on DEMO-112428), it is what an
+    # analyst would do on disagreeing anyway, and it therefore needs no new habit — an
+    # unpracticed habit produces silence that reads as approval.
+    #
+    # CAVEAT worth remembering when reading these: a reopen detects DISAGREEMENT, not
+    # diligence. reopened_at being None cannot distinguish "checked and correct" from
+    # "nobody ever looked", which is why the report pairs it with age-since-close.
+    # ------------------------------------------------------------------
+    # Closed as a duplicate of another ticket. Stamped by
+    # jira_closure_poller._mark_duplicate_resolved, which already stamps l1_resolved_at so
+    # the concurrency gate stops treating the ticket as an open sibling — but left no
+    # record of WHY it resolved. Without that, `verdict_match is None` plus a resolution
+    # is indistinguishable from "still awaiting a human", so ~14% of all incidents (857 in
+    # 45 days) reported as pending review forever. They are not pending; they will never be
+    # scoreable, because "see the other ticket" is not a verdict. Reported as their own
+    # bucket so the accuracy denominator is honest about what it excludes and why.
+    duplicate_at: Optional[datetime] = None
+    autonomous_closed_at: Optional[datetime] = None
+    reopened_at: Optional[datetime] = None
+    reopened_by: Optional[str] = None
+    # Status the reopen landed on, so a reopen straight to `L2 Analysis required` reads
+    # differently from one parked back in `Event Analysis`.
+    reopened_to: str = ""
     created_at: datetime = Field(default_factory=datetime.utcnow)
     phase: str = "shadow"  # "shadow" | "copilot" | "autonomous"
 
@@ -270,7 +384,35 @@ class ShadowResult(Document):
             [("created_at", -1)],
             [("verdict_match", 1)],
             [("blocked_by_concurrent_keys", 1)],
+            [("safety_gate_kind", 1)],
         ]
+
+
+class TriageProgress(Document):
+    """Live step-by-step progress for a manually-triggered run-ticket call, so an
+    operator watching the dashboard can see what the agent is doing right now instead
+    of only the finished verdict.
+
+    Mongo-backed, not an in-memory dict — `_ticket_run_state` (app/views/edr_triage_views.py)
+    already taught this lesson once: per-process state is meaningless to poll behind a
+    multi-replica load balancer, since the request that started the run and the request
+    polling for it can land on different pods. This document is written by whichever pod
+    is actually running the triage and read by whichever pod happens to serve the poll.
+
+    One document per jira_key, overwritten on each new run (mirrors ShadowResult's
+    overwrite-on-re-triage pattern) — this is transient UI state, not a durable record,
+    so there is nothing here worth keeping a history of across runs.
+    """
+    jira_key: str
+    status: str = "running"  # "running" | "done" | "error"
+    steps: list[dict] = Field(default_factory=list)
+    started_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    error: str = ""
+
+    class Settings:
+        name = "eg_triage_progress"
+        indexes = [[("jira_key", 1)]]
 
 
 class PlaybookSuggestion(Document):
@@ -316,6 +458,11 @@ class AllowlistSuggestion(Document):
     actor: str = ""                      # principal the FP closures share
     device: str = ""                     # device (empty = any)
     commands: list = Field(default_factory=list)   # normalized processes common to the cluster
+    apps: list = Field(default_factory=list)       # cloud apps the pattern covers (Netskope UBA)
+    app_instances: list = Field(default_factory=list)  # which ACCOUNT of those apps
+    uba_direction: str = ""              # "upload" | "download" for Netskope UBA patterns
+    uba_baseline: dict = Field(default_factory=dict)  # approved hosts + largest volume
+    source: str = ""                     # which miner proposed it (e.g. "uba_learner")
     fp_count: int = 0                    # how many FP closures back this pattern
     evidence_jira_keys: list = Field(default_factory=list)
     cluster_key: str = ""                # dedupe key: f"{alert_type}|{actor}|{device}"

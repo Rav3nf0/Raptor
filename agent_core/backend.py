@@ -15,11 +15,58 @@ import logging
 import os
 import re
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+# --- Per-run sampling-temperature override ---------------------------------
+# Temperature is normally global (BEDROCK_TEMPERATURE, default 0 since 2026-09-01).
+# Measuring a temperature change must NOT be done by flipping that env var:
+# it would apply to every alert in flight at once, so a regression on a family
+# we're not looking at would only surface after the damage. This ContextVar pins
+# ONE pipeline run to a different temperature while every other run keeps the
+# deployed default.
+#
+# Unset (None) is the only state the normal path ever sees, and it resolves to
+# exactly the env value used before — so with no override requested this is a
+# no-op by construction.
+#
+# NOTE: this covers the agent-loop backends in this module only. The KQL
+# auto-fixer (lib/mde_client.py) builds its own Gemini payload at its own
+# temperature 0.0 and is deliberately untouched.
+_TEMPERATURE_OVERRIDE: ContextVar[float | None] = ContextVar(
+    "llm_temperature_override", default=None,
+)
+
+
+@contextmanager
+def temperature_override(value: float | None):
+    """Pin sampling temperature for the duration of this context.
+
+    Propagates into `asyncio.to_thread` calls made inside it (to_thread runs the
+    target under a copy of the calling context), which is how the sync Bedrock
+    and SigV4 paths inherit it. Passing None is a no-op, so callers can forward
+    an optional parameter straight through without branching.
+    """
+    if value is None:
+        yield
+        return
+    token = _TEMPERATURE_OVERRIDE.set(float(value))
+    try:
+        yield
+    finally:
+        _TEMPERATURE_OVERRIDE.reset(token)
+
+
+def _effective_temperature(default: float) -> float:
+    """The override if one is pinned for this run, else the configured default."""
+    override = _TEMPERATURE_OVERRIDE.get()
+    return default if override is None else override
 
 
 class OllamaUnavailableError(Exception):
@@ -72,7 +119,7 @@ def _parse_tool_calls(text: str, valid_names: set[str]) -> list[ToolCall]:
 
 class OllamaBackend(LLMBackend):
     def __init__(self):
-        self.base_url = (os.getenv("LOCAL_LLM_URL") or os.getenv("OLLAMA_URL", "http://localhost:11434")).rstrip("/")
+        self.base_url = (os.getenv("LOCAL_LLM_URL") or os.getenv("OLLAMA_URL", "http://localhost:80")).rstrip("/")
         self.model = os.getenv("LOCAL_LLM_MODEL") or os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
         self.timeout = int(os.getenv("OLLAMA_TIMEOUT", "600"))
         # Output token cap per call. R1 is a REASONING model — its <think> chain
@@ -109,7 +156,7 @@ class OllamaBackend(LLMBackend):
             "messages": augmented,
             "stream": False,
             "options": {
-                "temperature": 0.1,
+                "temperature": _effective_temperature(0.1),
                 "num_predict": self.num_predict,
                 "num_ctx": self.num_ctx,
             },
@@ -191,6 +238,7 @@ _OLLAMA_ONLY_ALERT_TYPES = frozenset({
     "encoded_powershell", "lolbin", "guardduty",
     "netskope",           # carries usernames + internal hostnames — keep on-prem
     "endpoint_process",   # carries raw command lines — keep on-prem
+    "upwind",             # carries cloud account ids + internal resource names — keep on-prem
 })
 
 
@@ -248,7 +296,7 @@ class GeminiBackend(LLMBackend):
 
         config = gtypes.GenerateContentConfig(
             tools=gemini_tools,
-            temperature=0.1,
+            temperature=_effective_temperature(0.1),
             system_instruction=system_text or None,
         )
 
@@ -323,6 +371,19 @@ def _to_converse_tool_config(tools: list[dict]) -> dict | None:
     return {"tools": specs}
 
 
+def cache_billed_input(uncached: int, cache_read: int = 0, cache_write: int = 0) -> int:
+    """Input tokens as billed: cache reads ~0.1x, cache writes ~1.25x of the input price."""
+    return int((uncached or 0) + 0.1 * (cache_read or 0) + 1.25 * (cache_write or 0))
+
+
+def _boto_config(timeout_s: int = 0):
+    """botocore read timeout; Opus with thinking can take minutes (default is 60 s)."""
+    if not timeout_s:
+        return None
+    from botocore.config import Config
+    return Config(read_timeout=int(timeout_s), connect_timeout=10, retries={"max_attempts": 2, "mode": "standard"})
+
+
 class BedrockBackend(LLMBackend):
     """AWS Bedrock Converse backend — in-region (ap-south-1), native tool use.
 
@@ -342,14 +403,41 @@ class BedrockBackend(LLMBackend):
       AGENT_MODEL          default mistral.mistral-large-3-675b-instruct
       AWS_REGION           default ap-south-1
       BEDROCK_MAX_TOKENS   default 8192
-      BEDROCK_TEMPERATURE  default 0.1
+      BEDROCK_TEMPERATURE  default 0 (see __init__)
     """
+
+    # Which monthly cap a call counts against (agent_core/budget.py); /shadow's Claude
+    # backend sets "shadow" so its spend can never stop RAPTOR triage.
+    budget_scope = "agent"
+    # Claude extended thinking via Converse additionalModelRequestFields; 0 = off. Only
+    # for single-shot calls: a tool loop would have to hand thinking blocks back each turn.
+    thinking_budget = 0
+    # Prompt caching (Claude): a cache point after the system prompt, so a stable prefix is
+    # billed at ~10% when the next call repeats it within ~5 minutes.
+    cache_system = False
 
     def __init__(self) -> None:
         self.region = os.getenv("AWS_REGION", "ap-south-1")
         self.model_id = os.getenv("AGENT_MODEL", "mistral.mistral-large-3-675b-instruct")
         self.max_tokens = int(os.getenv("BEDROCK_MAX_TOKENS", "8192"))
-        self.temperature = float(os.getenv("BEDROCK_TEMPERATURE", "0.1"))
+        # Default 0, not 0.1. Sampling variance was the binding accuracy constraint:
+        # measured 2026-08-28 over three arms x 3 runs on 4 tickets, verdict stability
+        # 0.750 -> 1.000 and accuracy 0.667 -> 1.000 at temperature 0, with no regression
+        # across 18 runs on three human-AUTO_CLOSED_TP tickets (a real threat was never
+        # auto-closed). At 0.1 the same tickets returned a different verdict on ~1 run in
+        # 4, which made every single-run "did the fix work?" check a coin flip.
+        #
+        # Known trade-offs, deliberately accepted: run-to-run variance had been acting as
+        # an accidental retry (DEMO-110734 reached the right verdict only on its third
+        # attempt), and a flip-flopping verdict was a usable "model is unsure" signal that
+        # ai_confidence does NOT provide (DEMO-110937 was wrong at 0.95). Neither survives
+        # here. Also note this is not true determinism — MoE routing, batching and float
+        # non-associativity remain — and it does nothing for variance that comes from the
+        # EVIDENCE changing between runs (see the hunt-window anchoring issue).
+        #
+        # BEDROCK_TEMPERATURE still overrides, and it is mapped in lib/config's
+        # _SECRET_ENV_MAP, so reverting to "0.1" is a secret change with no deploy.
+        self.temperature = float(os.getenv("BEDROCK_TEMPERATURE", "0"))
 
     async def health_check(self) -> bool:
         import asyncio
@@ -377,10 +465,11 @@ class BedrockBackend(LLMBackend):
         # Hard monthly budget guard — refuse before spending if over the cap.
         # Raising OllamaUnavailableError makes the pipeline fall back to the
         # deterministic playbook (fail safe to L2), not silently drop the alert.
-        if budget.is_over_budget():
-            mtd, cap = budget.month_to_date_usd(), budget.budget_usd()
-            logger.error("[BEDROCK] BUDGET EXCEEDED: month-to-date $%.2f >= cap $%.2f — "
-                         "refusing call, falling back to playbook", mtd, cap)
+        scope = self.budget_scope
+        if budget.is_over_budget(scope):
+            mtd, cap = budget.month_to_date_usd(scope=scope), budget.budget_usd(scope)
+            logger.error("[BEDROCK] BUDGET EXCEEDED (%s): month-to-date $%.2f >= cap $%.2f — "
+                         "refusing call, falling back to playbook", scope, mtd, cap)
             raise OllamaUnavailableError(
                 f"Bedrock monthly budget exceeded (${mtd:.2f} >= ${cap:.2f})"
             )
@@ -392,25 +481,35 @@ class BedrockBackend(LLMBackend):
         kwargs: dict = {
             "modelId": self.model_id,
             "messages": conv,
-            "inferenceConfig": {"maxTokens": self.max_tokens, "temperature": self.temperature},
+            "inferenceConfig": {"maxTokens": self.max_tokens,
+                                "temperature": _effective_temperature(self.temperature)},
         }
         if system:
-            kwargs["system"] = system
+            kwargs["system"] = system + ([{"cachePoint": {"type": "default"}}] if self.cache_system else [])
         if tool_config:
             kwargs["toolConfig"] = tool_config
+        if int(self.thinking_budget or 0) > 0:
+            # Claude requires the default temperature with thinking, and maxTokens above the budget.
+            kwargs["additionalModelRequestFields"] = {
+                "thinking": {"type": "enabled", "budget_tokens": int(self.thinking_budget)}}
+            kwargs["inferenceConfig"].pop("temperature", None)
+            kwargs["inferenceConfig"]["maxTokens"] = max(self.max_tokens, int(self.thinking_budget) + 2048)
 
         try:
-            client = boto3.client("bedrock-runtime", region_name=self.region)
+            client = boto3.client("bedrock-runtime", region_name=self.region,
+                                  config=_boto_config(getattr(self, "timeout", 0)))
             resp = client.converse(**kwargs)
         except (ClientError, BotoCoreError) as exc:
             raise OllamaUnavailableError(f"Bedrock converse failed ({self.model_id}): {exc}") from exc
 
         usage = resp.get("usage", {})
-        cost = budget.record(self.model_id, usage.get("inputTokens", 0), usage.get("outputTokens", 0))
+        in_eff = cache_billed_input(usage.get("inputTokens", 0), usage.get("cacheReadInputTokens", 0),
+                                    usage.get("cacheWriteInputTokens", 0))
+        cost = budget.record(self.model_id, in_eff, usage.get("outputTokens", 0), scope=scope)
         logger.info(
-            "[BEDROCK] model=%s in=%s out=%s total=%s cost=$%.4f mtd=$%.2f stop=%s",
-            self.model_id, usage.get("inputTokens"), usage.get("outputTokens"),
-            usage.get("totalTokens"), cost, budget.month_to_date_usd(), resp.get("stopReason"),
+            "[BEDROCK] model=%s scope=%s in=%s out=%s total=%s cost=$%.4f mtd=$%.2f stop=%s",
+            self.model_id, scope, usage.get("inputTokens"), usage.get("outputTokens"),
+            usage.get("totalTokens"), cost, budget.month_to_date_usd(scope=scope), resp.get("stopReason"),
         )
 
         blocks = resp.get("output", {}).get("message", {}).get("content", []) or []
@@ -418,7 +517,7 @@ class BedrockBackend(LLMBackend):
         tool_calls: list[ToolCall] = []
         for b in blocks:
             if b.get("text"):
-                text_parts.append(b["text"])
+                text_parts.append(b["text"])     # reasoningContent (thinking) blocks are left out
             tu = b.get("toolUse")
             if not tu:
                 continue
@@ -585,7 +684,9 @@ class MantleBackend(LLMBackend):
                         or os.getenv("ANTHROPIC_WORKSPACE_ID", "proj_axhu5xs7zltkvkc2p2gw"))
         self.model_id = os.getenv("AGENT_MODEL", "mistral.mistral-large-3-675b-instruct")
         self.max_tokens = int(os.getenv("BEDROCK_MAX_TOKENS", "8192"))
-        self.temperature = float(os.getenv("BEDROCK_TEMPERATURE", "0.1"))
+        # Default 0 — same rationale as BedrockBackend above. This is the LIVE backend
+        # (AGENT_BACKEND defaults to "mantle"), so this line is the one that takes effect.
+        self.temperature = float(os.getenv("BEDROCK_TEMPERATURE", "0"))
         self.timeout = int(os.getenv("MANTLE_TIMEOUT", "120"))
 
     async def health_check(self) -> bool:
@@ -594,9 +695,10 @@ class MantleBackend(LLMBackend):
     async def chat(self, messages: list[dict], tools: list[dict]) -> tuple[str, list[ToolCall]]:
         from agent_core import budget
 
-        if budget.is_over_budget():
-            mtd, cap = budget.month_to_date_usd(), budget.budget_usd()
-            logger.error("[MANTLE] BUDGET EXCEEDED month-to-date $%.2f >= cap $%.2f — refusing", mtd, cap)
+        scope = getattr(self, "budget_scope", "agent")
+        if budget.is_over_budget(scope):
+            mtd, cap = budget.month_to_date_usd(scope=scope), budget.budget_usd(scope)
+            logger.error("[MANTLE] BUDGET EXCEEDED (%s) month-to-date $%.2f >= cap $%.2f — refusing", scope, mtd, cap)
             raise OllamaUnavailableError(f"Monthly budget exceeded (${mtd:.2f} >= ${cap:.2f})")
 
         if self.protocol == "anthropic":
@@ -620,7 +722,7 @@ class MantleBackend(LLMBackend):
             "model": self.model_id,
             "messages": oai_messages,
             "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
+            "temperature": _effective_temperature(self.temperature),
         }
         if oai_tools:
             payload["tools"] = oai_tools
@@ -704,11 +806,18 @@ class MantleBackend(LLMBackend):
         kwargs: dict = {
             "model": self.model_id,
             "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
+            "temperature": _effective_temperature(self.temperature),
             "messages": conv,
         }
+        # Extended thinking (the close reviewer sets thinking_budget). Claude requires the
+        # default temperature when thinking is on, so the override is dropped.
+        _think = int(getattr(self, "thinking_budget", 0) or 0)
+        if _think > 0:
+            kwargs["thinking"] = {"type": "enabled", "budget_tokens": _think}
+            kwargs.pop("temperature", None)
         if system:
-            kwargs["system"] = system
+            kwargs["system"] = ([{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+                                if getattr(self, "cache_system", False) else system)
         if atools:
             kwargs["tools"] = atools
 
@@ -718,11 +827,14 @@ class MantleBackend(LLMBackend):
             raise OllamaUnavailableError(f"Mantle messages.create failed ({self.model_id}): {exc}") from exc
 
         usage = getattr(resp, "usage", None)
-        in_t = getattr(usage, "input_tokens", 0) if usage else 0
+        in_t = cache_billed_input(getattr(usage, "input_tokens", 0) or 0,
+                                  getattr(usage, "cache_read_input_tokens", 0) or 0,
+                                  getattr(usage, "cache_creation_input_tokens", 0) or 0) if usage else 0
         out_t = getattr(usage, "output_tokens", 0) if usage else 0
-        cost = budget.record(self.model_id, in_t, out_t)
-        logger.info("[MANTLE] model=%s in=%s out=%s cost=$%.4f mtd=$%.2f stop=%s",
-                    self.model_id, in_t, out_t, cost, budget.month_to_date_usd(),
+        scope = getattr(self, "budget_scope", "agent")
+        cost = budget.record(self.model_id, in_t, out_t, scope=scope)
+        logger.info("[MANTLE] model=%s scope=%s in=%s out=%s cost=$%.4f mtd=$%.2f stop=%s",
+                    self.model_id, scope, in_t, out_t, cost, budget.month_to_date_usd(scope=scope),
                     getattr(resp, "stop_reason", ""))
 
         text_parts: list[str] = []
@@ -793,3 +905,53 @@ def get_internal_backend() -> LLMBackend:
     if backend == "gemini":
         return OllamaBackend()   # raw grounding data stays on-prem — never Gemini
     return MantleBackend()       # mantle (default) + any unrecognized value
+
+
+def shadow_llm() -> str:
+    """Which model family /shadow uses: "mistral" (default, the shared in-region backend) or
+    "claude" (SHADOW_LLM=claude). RAPTOR ticket triage never reads this."""
+    return "claude" if os.getenv("SHADOW_LLM", "mistral").strip().lower() == "claude" else "mistral"
+
+
+def shadow_model_id() -> str:
+    if shadow_llm() == "claude":
+        return os.getenv("SHADOW_CLAUDE_MODEL", "").strip()
+    return os.getenv("AGENT_MODEL", "mistral.mistral-large-3-675b-instruct")
+
+
+def get_shadow_backend(thinking: bool = False) -> LLMBackend:
+    """The backend for /shadow only (AI suggestions, story reports). Never Gemini.
+
+    SHADOW_LLM=claude selects Claude (e.g. Opus) on Bedrock, charged to the separate
+    "shadow" budget (SHADOW_CLAUDE_MONTHLY_BUDGET_USD), so it cannot use up RAPTOR's cap:
+      SHADOW_CLAUDE_MODEL          model or inference-profile id, e.g. apac.anthropic.claude-opus-…
+                                   (required; Anthropic models in ap-south-1 are reached through a
+                                   cross-region inference profile — apac.* keeps inference in APAC
+                                   regions, global.* may route anywhere)
+      SHADOW_CLAUDE_TRANSPORT      "runtime" (default: bedrock-runtime Converse, needs
+                                   bedrock:InvokeModel on the profile) or "mantle" (the Mantle
+                                   gateway's Anthropic path, like the close reviewer)
+      SHADOW_CLAUDE_MAX_TOKENS     default 16000
+      SHADOW_CLAUDE_THINKING_TOKENS  extended thinking for single-shot calls (thinking=True),
+                                   default 6000; tool loops always run without it
+      SHADOW_CLAUDE_TIMEOUT        seconds, default 300
+    Anything else: the shared internal backend (Mistral on Mantle), exactly as before.
+    """
+    if shadow_llm() != "claude":
+        return get_internal_backend()
+    model = shadow_model_id()
+    if not model:
+        raise OllamaUnavailableError("SHADOW_LLM=claude but SHADOW_CLAUDE_MODEL is not set")
+    transport = os.getenv("SHADOW_CLAUDE_TRANSPORT", "runtime").strip().lower()
+    b: LLMBackend
+    if transport == "mantle":
+        b = MantleBackend()
+        b.protocol = "anthropic"
+    else:
+        b = BedrockBackend()
+    b.model_id = model
+    b.budget_scope = "shadow"
+    b.max_tokens = int(os.getenv("SHADOW_CLAUDE_MAX_TOKENS", "16000"))
+    b.timeout = int(os.getenv("SHADOW_CLAUDE_TIMEOUT", "300"))
+    b.thinking_budget = int(os.getenv("SHADOW_CLAUDE_THINKING_TOKENS", "6000")) if thinking else 0
+    return b

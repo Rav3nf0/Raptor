@@ -24,10 +24,25 @@ L1 SOC analyst you can run in your own environment. It polls your ticketing/EDR 
 classifies each alert, investigates it with a ReAct agent loop over real tools, and posts a
 verdict.
 
-Two things make it different. A bidirectional entity sanitizer keeps device names, user
-principals, ARNs, internal IPs, and command lines out of every external-LLM call. And a
-tiered memory learns from how your analysts actually close tickets, then ages out stale
-patterns, so accuracy climbs without collecting bad habits.
+Three things make it different.
+
+**It assumes the model will be confidently wrong.** Most of this codebase is not the agent —
+it is the layer that refuses the agent's answer. Grounding and claim checks reject verdicts
+that rest on values no tool returned; an actor-confusion gate catches a username read out of
+an IAM role name; an absence-of-evidence gate stops "no alerts found" from becoming "benign";
+an autonomy brake disarms a whole alert family the moment an analyst overturns one of its
+auto-closes. Each gate exists because a real alert got triaged wrong, and each one ships with
+the regression test for that failure. See [Safety gates](#safety-gates).
+
+**It is measured, not asserted.** The included shadow-mode harness runs the agent beside your
+analysts without touching tickets, scores every verdict against what they actually decided,
+and quarantines disagreements for review. The accuracy numbers you care about are the ones
+you generate — see [Measuring it](#measuring-it).
+
+**It keeps regulated data out of the model.** A bidirectional entity sanitizer keeps device
+names, user principals, ARNs, internal IPs, and command lines out of every external-LLM call,
+while a tiered memory learns from how your analysts actually close tickets and ages out stale
+patterns.
 
 > **Status:** extracted from a platform running in a financial-services SOC. Apache-2.0.
 > Runs offline on synthetic data with no credentials — see [Quick start](#quick-start).
@@ -136,18 +151,65 @@ query layer) and the classifier, playbooks, agent, boundary, and memory stay the
 ## How it compares
 
 Autonomous AI-SOC triage is not new. What is specific to RAPTOR is the combination below: an
-enforced application-layer data boundary, memory that reviews and decays, and an open-source
-release.
+enforced application-layer data boundary, memory that reviews and decays, a gate layer that
+overrules the model, and a harness that scores it against your own analysts — all open source.
 
-| | Data boundary | Learns from analysts | Open source |
-|---|:---:|:---:|:---:|
-| Google Sec-Gemini | cloud-hosted | aggregate CTI only | ❌ |
-| AWS Security IR | region-scoped | cross-customer CTI | ❌ |
-| Dropzone AI | contractual only | context memory (no decay/review) | ❌ |
-| Mate Security | undocumented | context graph | ❌ |
-| **RAPTOR** | **enforced tokenizer** | **tiered memory + decay** | ✅ |
+| | Data boundary | Learns from analysts | Overrules the model | Ships its own scoring | Open source |
+|---|:---:|:---:|:---:|:---:|:---:|
+| Google Sec-Gemini | cloud-hosted | aggregate CTI only | undocumented | ❌ | ❌ |
+| AWS Security IR | region-scoped | cross-customer CTI | undocumented | ❌ | ❌ |
+| Dropzone AI | contractual only | context memory (no decay/review) | undocumented | ❌ | ❌ |
+| Mate Security | undocumented | context graph | undocumented | ❌ | ❌ |
+| **RAPTOR** | **enforced tokenizer** | **tiered memory + decay** | **gate layer + brake** | **shadow harness** | ✅ |
 
 <sub>Based on public documentation at time of writing; corrections welcome via PR.</sub>
+
+## Safety gates
+
+The agent proposes; the gate layer disposes. Every verdict passes through
+`_apply_safety_gates` before it can change a ticket, and a gate can only ever make the
+outcome *more* cautious — downgrade to "needs L2", never upgrade to a close. A few of them:
+
+| Gate | What it refuses |
+|---|---|
+| Grounding / claim check | A verdict resting on a value no tool actually returned — hostnames, usernames and counts the model supplied itself. |
+| Actor confusion | A username read out of an IAM role or session ARN and then treated as a human actor. |
+| Absence of evidence | "The hunt returned nothing" being used as proof of benign on privilege-escalation and credential-access alerts. |
+| Errored hunt | A close that rests on a tool call which actually failed. |
+| Service / fleet masquerade | A binary trusted because it is named like a vendor service, without the signer or fleet evidence to back it. |
+| Concurrency hold | Closing an alert while a sibling on the same incident is still open with a human. |
+| Autonomy brake | The whole alert family, the moment an analyst overturns one of its auto-closes. |
+
+Each gate is there because a real alert was triaged wrongly without it, and each ships with
+the regression test for that specific failure. The guards live in
+[`edr_triage/`](edr_triage/) (`privesc_guard`, `signin_guard`, `powershell_guard`,
+`usb_guard`, `uba_guard`, `log_ingestion_guard`, `custom_block_guard`, `duplicate_guard`,
+`autonomy_brake`, `concurrency_hold`) and the model-facing checks in
+[`agent_core/`](agent_core/) (`claim_check`, `critic`, `close_review`).
+
+Autonomy is per-alert-family and off by default — see [Earning autonomy](#earning-autonomy).
+
+## Measuring it
+
+Claims about triage accuracy are only worth the harness that produced them, so the harness is
+included. [`shadow_hunter/`](shadow_hunter/) runs the agent in **shadow mode**: it triages
+real alerts beside your analysts, changes no ticket state, and scores each verdict against
+what the analyst actually decided.
+
+```bash
+# score the agent against your analysts without touching a ticket
+curl localhost:8000/api/shadow/ai/run          # triage a batch in shadow mode
+curl localhost:8000/api/shadow/ai/stats        # agreement, by alert family
+curl localhost:8000/api/memory/shadow-stats    # verdict match rate over time
+```
+
+Disagreements are quarantined rather than averaged away, so the number you end up quoting is
+one you can walk back to individual tickets. The harness also ships the detectors it hunts
+with and a comparison mode for running two models over the same alerts
+(`/api/shadow/ai/compare`).
+
+> We deliberately do not print our own accuracy figure here. It is a property of one SOC's
+> alert mix, and it would not be reproducible for you. Run the harness on yours.
 
 ## Security & threat model
 

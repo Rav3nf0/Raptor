@@ -21,6 +21,11 @@ from entity_graph.models import (
     PlannedActivity,
     AlertUnderTest,
 )
+from shadow_hunter.models import (
+    AuditLog as ShadowAuditLog,
+    Finding as ShadowFinding,
+    Story as ShadowStory,
+)
 
 _client: AsyncIOMotorClient | None = None
 
@@ -42,6 +47,9 @@ async def init_db() -> None:
             AllowlistSuggestion,
             PlannedActivity,
             AlertUnderTest,
+            ShadowFinding,
+            ShadowAuditLog,
+            ShadowStory,
         ],
     )
 

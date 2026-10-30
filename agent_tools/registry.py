@@ -89,8 +89,25 @@ def register(name: str, description: str, parameters: dict):
     return decorator
 
 
-def get_tools() -> list[dict]:
-    """Return tool definitions formatted for LLM system prompt."""
+def get_tools(only: set[str] | None = None) -> list[dict]:
+    """Return tool definitions formatted for LLM system prompt.
+
+    `only` restricts which definitions are ADVERTISED, for token cost. Measured
+    2026-09-02: the 29 registered schemas serialise to ~7,300 tokens and are re-sent on
+    every iteration of every run — 57% of each request, against ~430 output tokens. On
+    Netskope DLP (82% of all traffic) the agent only ever called 5 of the 29, so the
+    other 24 were pure cost.
+
+    This does NOT restrict capability: `get_tool_names` and `execute` are deliberately
+    left unfiltered, so a model that asks for an unadvertised tool by name still runs it.
+    Advertising less makes it unlikely to ask; it cannot make the tool unavailable. That
+    matters because usage has a long tail — `mde_advanced_hunt` appeared once in 174 DLP
+    runs — and a trim that silently removed a capability would trade cost for a wrong
+    verdict.
+
+    Unknown names in `only` are ignored, so a stale env allowlist degrades to "advertise
+    what still exists" rather than to an empty tool list.
+    """
     return [
         {
             "name": t.name,
@@ -98,6 +115,7 @@ def get_tools() -> list[dict]:
             "parameters": t.parameters,
         }
         for t in _REGISTRY.values()
+        if only is None or t.name in only
     ]
 
 

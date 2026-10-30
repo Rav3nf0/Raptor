@@ -8,11 +8,12 @@ import re
 import httpx
 
 from agent_tools.registry import register
+from lib.mde_client import _is_private_ip
 
 logger = logging.getLogger(__name__)
 
 _VT_BASE = "https://www.virustotal.com/api/v3"
-_SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
+from edr_triage.vt_hash import FILE_HASH_RE as _FILE_HASH_RE
 # A hostname: labels of alnum/hyphen separated by dots, with a TLD. Deliberately
 # strict enough to reject URLs, IPs, paths, and free text passed as a "domain".
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}$")
@@ -31,13 +32,13 @@ def _normalize_domain(raw: str) -> str:
 
 @register(
     name="vt_lookup_hash",
-    description=("Look up a SHA256 file hash (64 hex chars) on VirusTotal. Returns detection "
-                 "count, verdict, and engine names. Pass ONLY a real SHA256 — never a filename "
-                 "(e.g. 'mfewc.exe'). If the alert has no hash, you cannot check the file here."),
+    description=("Look up a file hash on VirusTotal (SHA256 preferred; MD5 or SHA1 also accepted). "
+                 "Returns detection count, verdict, and engine names. Pass ONLY a real hash — never "
+                 "a filename (e.g. 'mfewc.exe'). If the alert has no hash, you cannot check the file here."),
     parameters={
         "type": "object",
         "properties": {
-            "sha256": {"type": "string", "description": "SHA256 hash to look up — 64 hex chars, NOT a filename"},
+            "sha256": {"type": "string", "description": "File hash to look up — SHA256 (64 hex), or MD5 (32) / SHA1 (40). NOT a filename"},
         },
         "required": ["sha256"],
     },
@@ -52,19 +53,27 @@ async def vt_lookup_hash(sha256: str) -> dict:
     # result that reads like "clean". Reject it with an instructive error instead
     # of silently returning 0/0, so the model doesn't infer the file is benign.
     h = (sha256 or "").strip()
-    if not _SHA256_RE.match(h):
+    if not _FILE_HASH_RE.match(h):
         # invalid_input: a rejected argument is the model asking wrongly, not evidence
         # we failed to retrieve — so it must not trip the critical-tool confidence cap
         # (see _apply_safety_gates). The "absence is not benign" warning below still
         # stands; it is guidance to the model, not a signal that the lookup broke.
         return {"invalid_input": True, "error": (
-            f"'{sha256}' is not a SHA256. vt_lookup_hash needs a 64-hex-char SHA256, not a "
-            "filename. This alert may not carry a file hash — if so, you CANNOT check the "
+            f"'{sha256}' is not a file hash. vt_lookup_hash needs a SHA256, MD5 or SHA1 in hex, "
+            "not a filename. This alert may not carry a file hash — if so, you CANNOT check the "
             "file's reputation on VirusTotal. Do NOT treat a missing/absent VT result as "
             "evidence the file is benign. Obtain the real SHA256 from the alert evidence or "
             "mde_get_timeline, or escalate to L2."
         )}
-    return await check_hash(h, api_key)
+    result = await check_hash(h, api_key)
+    # VirusTotal has never seen this file. `detections: 0` here reads like a clean
+    # verdict, and was reported as one (DEMO-115542: "0/0, unknown" became "hashes
+    # returned 0 detections on VirusTotal" in a root privesc auto-close).
+    if not result.get("error") and not result.get("total"):
+        result["no_data"] = True
+        result["note"] = ("VirusTotal has NO record of this file (0 engines scanned it). This is "
+                          "NOT a clean result and is not evidence the file is benign.")
+    return result
 
 
 @register(
@@ -135,6 +144,12 @@ async def vt_lookup_domain(domain: str) -> dict:
     },
 )
 async def vt_lookup_ip(ip: str) -> dict:
+    ip = (ip or "").strip()
+    if _is_private_ip(ip):
+        # RFC1918/loopback/link-local has no external reputation to check — skip the
+        # call rather than spend it on something that can only ever come back "unknown".
+        return {"ip": ip, "is_private": True, "detections": 0, "total": 0,
+                "verdict": "not_applicable_private_ip"}
     api_key = os.getenv("VIRUSTOTAL_API_KEY", "")
     if not api_key:
         return {"error": "VIRUSTOTAL_API_KEY not configured"}

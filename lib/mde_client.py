@@ -43,13 +43,13 @@ _HUNTING_URL  = "https://api.security.microsoft.com/api/advancedqueries/run"
 # ---------------------------------------------------------------------------
 # False-positive domain set
 # CDN, corporate, and security-vendor domains that appear in telemetry but
-# are not threat indicators. Add your own owned domains here (or via config).
+# are not threat indicators for Acme.
 # ---------------------------------------------------------------------------
 
 _FP_DOMAINS: frozenset[str] = frozenset([
-    # Your production infra (own domains should not be escalated as FPs from
-    # external threat intel; they surface naturally when compromised)
-    "example.com", "example.app", "example.net",
+    # Acme production infra (our own domains should not be escalated as FPs
+    # from external threat intel; they surface naturally when compromised)
+    "example.com", "example.com", "example.com",
     # Microsoft infra
     "microsoft.com", "microsoftonline.com", "windows.com", "windowsupdate.com",
     "office.com", "office365.com", "azure.com", "azurefd.net", "msftconnecttest.com",
@@ -82,6 +82,149 @@ _FP_DOMAINS: frozenset[str] = frozenset([
 ])
 
 
+# ---------------------------------------------------------------------------
+# Public / shared-hosting suffixes
+#
+# These are registrable suffixes under which anyone can stand up a hostname —
+# Cloudflare Workers, GitHub Pages, Azure blob storage, Firebase, etc. Threat
+# feeds routinely list one as a "domain" IOC when the actual indicator was a
+# specific subdomain (DEMO-112467: the BlueMoon advisory shipped a bare
+# "workers.dev", which matched 91 rows of ordinary corporate traffic and none
+# of the real C2 infrastructure).
+#
+# An IOC that is ONLY a suffix identifies a hosting platform, not an attacker.
+# A hostname *under* one of these (evil-c2.workers.dev) is still a valid IOC
+# and is not rejected.
+# ---------------------------------------------------------------------------
+
+_HOSTING_SUFFIXES: frozenset[str] = frozenset([
+    # Cloudflare
+    "workers.dev", "pages.dev", "r2.dev", "trycloudflare.com", "cfargotunnel.com",
+    # GitHub / GitLab / Bitbucket
+    "github.io", "githubusercontent.com", "gitlab.io", "bitbucket.io",
+    # Google / Firebase
+    "web.app", "firebaseapp.com", "appspot.com", "googlecode.com",
+    "storage.googleapis.com", "drive.google.com", "docs.google.com",
+    "script.google.com", "sites.google.com", "page.link", "firebasestorage.app",
+    # Microsoft / Azure
+    "blob.core.windows.net", "file.core.windows.net", "queue.core.windows.net",
+    "table.core.windows.net", "azurewebsites.net", "azureedge.net",
+    "cloudapp.azure.com", "cloudapp.net", "sharepoint.com", "onedrive.live.com",
+    "1drv.ms",
+    # AWS
+    "s3.amazonaws.com", "amazonaws.com", "elasticbeanstalk.com",
+    "execute-api.amazonaws.com", "cloudfront.net", "awsapprunner.com",
+    # PaaS / hosting / tunnels
+    "herokuapp.com", "netlify.app", "vercel.app", "now.sh", "surge.sh",
+    "glitch.me", "repl.co", "replit.dev", "render.com", "fly.dev",
+    "ngrok.io", "ngrok-free.app", "ngrok.app", "loca.lt", "serveo.net",
+    "localtunnel.me", "tunnelto.dev", "telebit.io",
+    # File sharing / paste / messaging CDNs
+    "dropbox.com", "dropboxusercontent.com", "box.com", "mediafire.com",
+    "mega.nz", "anonfiles.com", "gofile.io", "transfer.sh", "file.io",
+    "pastebin.com", "paste.ee", "ghostbin.com", "hastebin.com",
+    "discord.com", "discordapp.com", "discordapp.net", "cdn.discordapp.com",
+    "t.me", "telegram.org", "telegra.ph",
+    # Dynamic DNS
+    "duckdns.org", "no-ip.org", "no-ip.com", "ddns.net", "hopto.org",
+    "zapto.org", "sytes.net", "serveo.com", "myftp.org", "onthewifi.com",
+    "dynu.com", "freedns.afraid.org", "chickenkiller.com", "mooo.com",
+    # URL shorteners
+    "bit.ly", "tinyurl.com", "goo.gl", "t.co", "ow.ly", "is.gd",
+    "buff.ly", "rebrand.ly", "cutt.ly", "shorturl.at",
+    # Blogging / free web hosts
+    "blogspot.com", "wordpress.com", "weebly.com", "wixsite.com",
+    "000webhostapp.com", "altervista.org", "neocities.org", "webflow.io",
+    "squarespace.com", "myshopify.com",
+    # Misc shared infra
+    "sendgrid.net", "mailchimp.com", "hubspotusercontent.com",
+    "zendesk.com", "atlassian.net", "notion.site", "canva.site",
+])
+
+
+# ---------------------------------------------------------------------------
+# Vendor-owned SaaS domains abused as C2 / dead-drop channels
+#
+# Unlike _HOSTING_SUFFIXES, nobody can register a subdomain here — every host
+# under them (api.github.com, main.realtime.ably.net) is the vendor's own
+# service, used by the whole fleet. Threat feeds still list them when a
+# campaign hides C2 inside one (a GitHub repo, an Ably channel). The attacker
+# lives in the URL path, never the host: DEMO-117968 hunted "api.github.com"
+# from the IOC hxxps://api.github.com/repos/<attacker> plus "ably.net" and
+# returned 4,085 rows of developer and browser traffic.
+#
+# Matched by suffix. A bare domain IOC here is dropped; a URL IOC is hunted
+# by its full URL only.
+# ---------------------------------------------------------------------------
+
+_SHARED_SERVICE_DOMAINS: frozenset[str] = frozenset([
+    "github.com", "githubusercontent.com", "githubassets.com",
+    "gitlab.com", "bitbucket.org",
+    "ably.io", "ably.net", "ably-realtime.com",
+    "telegram.org", "discord.com", "discordapp.com", "discordapp.net",
+    "slack.com", "pastebin.com", "dropbox.com", "dropboxusercontent.com",
+])
+
+
+def _refang(value: str) -> str:
+    """Undo threat-feed defanging so a value can be matched against telemetry.
+
+    Feeds ship indicators neutered for safe display ("hxxps://evil[.]com/a").
+    Those forms can never match a real RemoteUrl, so they must be refanged
+    before being embedded in KQL. Display/storage keeps the defanged form.
+    """
+    d = (value or "").strip()
+    if not d:
+        return ""
+    d = (d.replace("[.]", ".").replace("(.)", ".").replace("{.}", ".")
+          .replace("[:]", ":").replace("[/]", "/").replace("[@]", "@"))
+    d = re.sub(r"^hxx(?=ps?://)", "htt", d, flags=re.IGNORECASE)  # hxxps:// -> https://
+    d = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", lambda m: m.group(0).lower(), d)
+    return d.strip()
+
+
+def _strip_to_host(value: str) -> str:
+    """Reduce a domain/URL IOC to its bare lowercase hostname.
+
+    Handles defanged forms (hxxp, [.]), schemes, ports, paths, credentials.
+    """
+    d = _refang(value).lower()
+    if not d:
+        return ""
+    d = re.sub(r"^[a-z][a-z0-9+.\-]*://", "", d)
+    d = d.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    if "@" in d:
+        d = d.rsplit("@", 1)[1]
+    d = d.split(":", 1)[0]
+    return d.strip(".")
+
+
+def is_hosting_suffix_only(value: str) -> bool:
+    """True if value is a bare shared-hosting suffix, not an attacker-owned host.
+
+    "workers.dev"           -> True   (platform suffix; matches everyone)
+    "evil-c2.workers.dev"   -> False  (specific attacker host; keep it)
+    "secboxes.com"          -> False
+    """
+    host = _strip_to_host(value)
+    if not host:
+        return True  # nothing usable to hunt on
+    host = host.removeprefix("www.")
+    return host in _HOSTING_SUFFIXES
+
+
+def is_shared_service_host(value: str) -> bool:
+    """True if the host of value is a vendor-owned SaaS service the fleet uses.
+
+    "api.github.com/repos/x" -> True   (hunt the URL, never the host)
+    "main.realtime.ably.net" -> True
+    "evil.github.io"         -> False  (tenant host; see _HOSTING_SUFFIXES)
+    """
+    host = _strip_to_host(value)
+    return bool(host) and any(host == s or host.endswith("." + s)
+                              for s in _SHARED_SERVICE_DOMAINS)
+
+
 def _is_private_ip(ip: str) -> bool:
     """Return True if ip is RFC-1918 / loopback / link-local."""
     try:
@@ -91,7 +234,7 @@ def _is_private_ip(ip: str) -> bool:
 
 
 def _domain_is_fp(domain: str) -> bool:
-    d = domain.lower().lstrip("www.")
+    d = _strip_to_host(domain).removeprefix("www.")
     return any(d == fp or d.endswith("." + fp) for fp in _FP_DOMAINS)
 
 
@@ -596,17 +739,169 @@ SENTINEL_TABLE_SCHEMA: dict[str, list[str]] = {
     ] if c not in _SENTINEL_INTERNAL],
 }
 
+# Tables the agent's hunts reach for beyond the ones above (log ingestion, Office, Entra
+# audit, CloudTrail, firewall/CEF). Without them every Gemini query on these tables had
+# its `where` filter read as an unknown column and was rejected whole, so hunt_query
+# reported "empty KQL" (log-ingestion triage failed on every run, 9-13 Oct). Columns
+# read from the workspace with `<table> | getschema` on 2026-10-14, not written by hand.
+_SENTINEL_EXTRA_TABLES: dict[str, list[str]] = {
+    "Usage": [c for c in [
+        "TenantId", "Computer", "TimeGenerated", "Plan", "SourceSystem", "StartTime",
+        "EndTime", "ResourceUri", "LinkedResourceUri", "DataType", "Solution",
+        "BatchesWithinSla", "BatchesOutsideSla", "BatchesCapped", "TotalBatches",
+        "AvgLatencyInSeconds", "Quantity", "QuantityUnit", "IsBillable", "MeterId",
+        "LinkedMeterId", "Type",
+    ] if c not in _SENTINEL_INTERNAL],
+    "Heartbeat": [c for c in [
+        "TenantId", "SourceSystem", "TimeGenerated", "MG", "ManagementGroupName",
+        "SourceComputerId", "ComputerIP", "Computer", "Category", "OSType", "OSName",
+        "OSMajorVersion", "OSMinorVersion", "Version", "SCAgentChannel",
+        "IsGatewayInstalled", "RemoteIPLongitude", "RemoteIPLatitude",
+        "RemoteIPCountry", "SubscriptionId", "ResourceGroup", "ResourceProvider",
+        "Resource", "ResourceId", "ResourceType", "ComputerEnvironment", "Solutions",
+        "VMUUID", "ComputerPrivateIPs", "Type",
+    ] if c not in _SENTINEL_INTERNAL],
+    "SentinelHealth": [c for c in [
+        "TenantId", "TimeGenerated", "OperationName", "SentinelResourceId",
+        "SentinelResourceName", "Status", "Description", "Reason", "WorkspaceId",
+        "SentinelResourceType", "SentinelResourceKind", "RecordId",
+        "ExtendedProperties", "SourceSystem", "Type",
+    ] if c not in _SENTINEL_INTERNAL],
+    "OfficeActivity": [c for c in [
+        "TenantId", "Application", "UserDomain", "Activity", "UserAgent", "RecordType",
+        "TimeGenerated", "Operation", "OrganizationId", "OrganizationId_", "UserType",
+        "UserKey", "OfficeWorkload", "ResultStatus", "ResultReasonType",
+        "OfficeObjectId", "UserId", "UserId_", "ClientIP", "ClientIP_", "Scope",
+        "Site_", "ItemType", "EventSource", "Source_Name", "MachineDomainInfo",
+        "MachineId", "Site_Url", "Site_Url_", "SourceRelativeUrl", "SourceRelativeUrl_",
+        "SourceFileName", "SourceFileName_", "SourceFileExtension",
+        "DestinationRelativeUrl", "DestinationFileName", "DestinationFileExtension",
+        "UserSharedWith", "SharingType", "CustomEvent", "Event_Data",
+        "ModifiedObjectResolvedName", "Parameters", "ExternalAccess",
+        "OriginatingServer", "OrganizationName", "Logon_Type", "InternalLogonType",
+        "MailboxGuid", "MailboxOwnerUPN", "MailboxOwnerSid",
+        "MailboxOwnerMasterAccountSid", "LogonUserSid", "LogonUserDisplayName",
+        "ClientInfoString", "Client_IPAddress", "ClientMachineName",
+        "ClientProcessName", "ClientVersion", "Folder", "CrossMailboxOperations",
+        "DestMailboxId", "DestMailboxOwnerUPN", "DestMailboxOwnerSid",
+        "DestMailboxOwnerMasterAccountSid", "DestFolder", "Folders", "AffectedItems",
+        "Item", "ModifiedProperties", "SendAsUserSmtp", "SendAsUserMailboxGuid",
+        "SendOnBehalfOfUserSmtp", "SendonBehalfOfUserMailboxGuid", "ExtendedProperties",
+        "Client", "LoginStatus", "Actor", "ActorContextId", "ActorIpAddress",
+        "InterSystemsId", "IntraSystemId", "SupportTicketId", "TargetContextId",
+        "DataCenterSecurityEventType", "EffectiveOrganization", "ElevationTime",
+        "ElevationApprover", "ElevationApprovedTime", "ElevationRequestId",
+        "ElevationRole", "ElevationDuration", "GenericInfo", "SourceSystem", "OfficeId",
+        "SourceRecordId", "AzureActiveDirectory_EventType", "AADTarget", "Start_Time",
+        "OfficeTenantId", "OfficeTenantId_", "TargetUserOrGroupName",
+        "TargetUserOrGroupType", "MessageId", "Members", "TeamName", "TeamGuid",
+        "ChannelType", "ChannelName", "ChannelGuid", "ExtraProperties", "AddOnType",
+        "AddonName", "TabType", "Name", "OldValue", "NewValue", "ItemName",
+        "ChatThreadId", "ChatName", "CommunicationType", "AADGroupId", "AddOnGuid",
+        "AppDistributionMode", "TargetUserId", "OperationScope", "AzureADAppId",
+        "OperationProperties", "AppId", "ClientAppId", "ApplicationId", "SRPolicyId",
+        "SRPolicyName", "SRRuleMatchDetails", "IsManagedDevice", "AppPoolName",
+        "UniqueTokenId", "IssuedAtTime", "AppAccessContext", "Attendees",
+        "ArtifactsShared", "IsJoinedFromLobby", "JoinTime", "LeaveTime",
+        "DeviceInformation", "MeetingDetailId", "ListItemUniqueId",
+        "SensitivityLabelId", "UniqueSharingId", "ActorContextId_", "Type",
+    ] if c not in _SENTINEL_INTERNAL],
+    "AuditLogs": [c for c in [
+        "TenantId", "SourceSystem", "TimeGenerated", "ResourceId", "OperationName",
+        "OperationVersion", "Category", "ResultType", "ResultSignature",
+        "ResultDescription", "DurationMs", "CorrelationId", "Resource", "ResourceGroup",
+        "ResourceProvider", "Identity", "Level", "Location", "AdditionalDetails", "Id",
+        "InitiatedBy", "LoggedByService", "Result", "ResultReason", "TargetResources",
+        "AADTenantId", "ActivityDisplayName", "ActivityDateTime", "AADOperationType",
+        "Type",
+    ] if c not in _SENTINEL_INTERNAL],
+    "AWSCloudTrail": [c for c in [
+        "TimeGenerated", "AwsEventId", "EventVersion", "EventSource", "EventTypeName",
+        "EventName", "UserIdentityType", "UserIdentityPrincipalid", "UserIdentityArn",
+        "UserIdentityAccountId", "UserIdentityInvokedBy", "UserIdentityAccessKeyId",
+        "UserIdentityUserName", "SessionMfaAuthenticated", "SessionCreationDate",
+        "SessionIssuerType", "SessionIssuerPrincipalId", "SessionIssuerArn",
+        "SessionIssuerAccountId", "SessionIssuerUserName", "AWSRegion",
+        "SourceIpAddress", "UserAgent", "ErrorCode", "ErrorMessage",
+        "RequestParameters", "ResponseElements", "AdditionalEventData", "AwsRequestId",
+        "AwsRequestId_", "Resources", "APIVersion", "ReadOnly", "RecipientAccountId",
+        "ServiceEventDetails", "SharedEventId", "VpcEndpointId", "ManagementEvent",
+        "TenantId", "SourceSystem", "OperationName", "Category", "EC2RoleDelivery",
+        "TlsVersion", "CipherSuite", "ClientProvidedHostHeader", "IpProtocol",
+        "SourcePort", "DestinationPort", "CidrIp", "UserIdentityUserId",
+        "UserIdentityStoreArn", "Type",
+    ] if c not in _SENTINEL_INTERNAL],
+    "CommonSecurityLog": [c for c in [
+        "TenantId", "TimeGenerated", "DeviceVendor", "DeviceProduct", "DeviceVersion",
+        "DeviceEventClassID", "Activity", "LogSeverity", "OriginalLogSeverity",
+        "AdditionalExtensions", "DeviceAction", "ApplicationProtocol", "EventCount",
+        "DestinationDnsDomain", "DestinationServiceName",
+        "DestinationTranslatedAddress", "DestinationTranslatedPort",
+        "CommunicationDirection", "DeviceDnsDomain", "DeviceExternalID",
+        "DeviceFacility", "DeviceInboundInterface", "DeviceNtDomain",
+        "DeviceOutboundInterface", "DevicePayloadId", "ProcessName",
+        "DeviceTranslatedAddress", "DestinationHostName", "DestinationMACAddress",
+        "DestinationNTDomain", "DestinationProcessId", "DestinationUserPrivileges",
+        "DestinationProcessName", "DestinationPort", "DestinationIP", "DeviceTimeZone",
+        "DestinationUserID", "DestinationUserName", "DeviceAddress", "DeviceName",
+        "DeviceMacAddress", "ProcessID", "EndTime", "ExternalID", "ExtID",
+        "FileCreateTime", "FileHash", "FileID", "FileModificationTime", "FilePath",
+        "FilePermission", "FileType", "FileName", "FileSize", "ReceivedBytes",
+        "Message", "OldFileCreateTime", "OldFileHash", "OldFileID",
+        "OldFileModificationTime", "OldFileName", "OldFilePath", "OldFilePermission",
+        "OldFileSize", "OldFileType", "SentBytes", "EventOutcome", "Protocol", "Reason",
+        "RequestURL", "RequestClientApplication", "RequestContext", "RequestCookies",
+        "RequestMethod", "ReceiptTime", "SourceHostName", "SourceMACAddress",
+        "SourceNTDomain", "SourceDnsDomain", "SourceServiceName",
+        "SourceTranslatedAddress", "SourceTranslatedPort", "SourceProcessId",
+        "SourceUserPrivileges", "SourceProcessName", "SourcePort", "SourceIP",
+        "StartTime", "SourceUserID", "SourceUserName", "EventType",
+        "DeviceEventCategory", "DeviceCustomIPv6Address1",
+        "DeviceCustomIPv6Address1Label", "DeviceCustomIPv6Address2",
+        "DeviceCustomIPv6Address2Label", "DeviceCustomIPv6Address3",
+        "DeviceCustomIPv6Address3Label", "DeviceCustomIPv6Address4",
+        "DeviceCustomIPv6Address4Label", "DeviceCustomFloatingPoint1",
+        "DeviceCustomFloatingPoint1Label", "DeviceCustomFloatingPoint2",
+        "DeviceCustomFloatingPoint2Label", "DeviceCustomFloatingPoint3",
+        "DeviceCustomFloatingPoint3Label", "DeviceCustomFloatingPoint4",
+        "DeviceCustomFloatingPoint4Label", "DeviceCustomNumber1",
+        "FieldDeviceCustomNumber1", "DeviceCustomNumber1Label", "DeviceCustomNumber2",
+        "FieldDeviceCustomNumber2", "DeviceCustomNumber2Label", "DeviceCustomNumber3",
+        "FieldDeviceCustomNumber3", "DeviceCustomNumber3Label", "DeviceCustomString1",
+        "DeviceCustomString1Label", "DeviceCustomString2", "DeviceCustomString2Label",
+        "DeviceCustomString3", "DeviceCustomString3Label", "DeviceCustomString4",
+        "DeviceCustomString4Label", "DeviceCustomString5", "DeviceCustomString5Label",
+        "DeviceCustomString6", "DeviceCustomString6Label", "DeviceCustomDate1",
+        "DeviceCustomDate1Label", "DeviceCustomDate2", "DeviceCustomDate2Label",
+        "FlexDate1", "FlexDate1Label", "FlexNumber1", "FlexNumber1Label", "FlexNumber2",
+        "FlexNumber2Label", "FlexString1", "FlexString1Label", "FlexString2",
+        "FlexString2Label", "RemoteIP", "RemotePort", "MaliciousIP", "ThreatSeverity",
+        "IndicatorThreatType", "ThreatDescription", "ThreatConfidence",
+        "ReportReferenceLink", "MaliciousIPLongitude", "MaliciousIPLatitude",
+        "MaliciousIPCountry", "Computer", "SourceSystem", "SimplifiedDeviceAction",
+        "CollectorHostName", "Type",
+    ] if c not in _SENTINEL_INTERNAL],
+}
+SENTINEL_TABLE_SCHEMA.update(_SENTINEL_EXTRA_TABLES)
+
 
 def _sentinel_query_url() -> str | None:
     """Build the Log Analytics query URL from env vars. Returns None if not configured.
 
-    Reads SENTINEL_* first, then the SHADOW_SENTINEL_* aliases. If neither is set,
-    returns None and Sentinel hunts report 'workspace not configured' (expected in
-    a credential-free run).
+    Falls back to SHADOW_SENTINEL_* — the Sentinel workspace creds are provisioned
+    under those names in Secrets Manager (the SENTINEL_* names were never set, which
+    is why every sentinel_run_kql returned 'workspace not configured').
     """
-    sub = os.getenv("SENTINEL_SUBSCRIPTION_ID") or os.getenv("SHADOW_SENTINEL_SUBSCRIPTION_ID")
-    rg  = os.getenv("SENTINEL_RESOURCE_GROUP") or os.getenv("SHADOW_SENTINEL_RESOURCE_GROUP")
-    ws  = os.getenv("SENTINEL_WORKSPACE_NAME") or os.getenv("SHADOW_SENTINEL_WORKSPACE_NAME")
+    # TEMPORARY hardcoded fallback so we can test end-to-end while the secret's
+    # shadow_sentinel_* values are still empty. These are non-secret Azure resource
+    # identifiers (the subscription GUID is already visible in every incident URL).
+    # Once the values are in security/uat/deepintel, REVERT this to the env-only form.
+    sub = (os.getenv("SENTINEL_SUBSCRIPTION_ID") or os.getenv("SHADOW_SENTINEL_SUBSCRIPTION_ID")
+           or "00000000-0000-0000-0000-000000000000")
+    rg  = (os.getenv("SENTINEL_RESOURCE_GROUP") or os.getenv("SHADOW_SENTINEL_RESOURCE_GROUP")
+           or "acme-siem")
+    ws  = (os.getenv("SENTINEL_WORKSPACE_NAME") or os.getenv("SHADOW_SENTINEL_WORKSPACE_NAME")
+           or "acme-siem-ws")
     if not all([sub, rg, ws]):
         return None
     return (
@@ -619,6 +914,9 @@ def _sentinel_query_url() -> str | None:
 async def run_sentinel_query(
     kql: str,
     timeout: int = 60,
+    iocs: dict | None = None,
+    on_query=None,
+    autofix: bool = True,
 ) -> tuple[list[dict], str | None]:
     """Execute one KQL query against the Log Analytics workspace.
 
@@ -666,13 +964,17 @@ async def run_sentinel_query(
 
     rows, err = await _execute(kql)
     if err is None:
+        if on_query:
+            on_query(kql)
         return rows, None
 
-    if "permission denied" in err or "timed out" in err:
+    if "permission denied" in err or "timed out" in err or not autofix:
+        # autofix=False: the caller must not send its query to the (Gemini) fixer — /shadow
+        # data never leaves the AWS boundary
         logger.warning("Sentinel query error (no fix attempted): %s", err)
         return [], err
 
-    return await _autofix_loop(kql, err, _execute, "Sentinel")
+    return await _autofix_loop(kql, err, _execute, "Sentinel", iocs=iocs, on_query=on_query)
 
 
 # ---------------------------------------------------------------------------
@@ -721,15 +1023,20 @@ def _invalid_cols(line: str) -> set[str]:
     return tokens - _ALL_VALID_COLUMNS - _KQL_VALUE_TOKENS
 
 
-def _sanitize_kql_columns(kql: str) -> str:
+def _sanitize_kql_columns(kql: str) -> str | None:
     """Drop or trim pipe stages that reference columns not in any known schema.
 
     - ``| project``: removes individual invalid column names from the list.
-    - All other pipe stages (where, extend, summarize, …): drops the whole line.
+    - ``| where``: returns None — the whole query is rejected. Dropping a filter WIDENS
+      the hunt: a PascalCase `let MaliciousDomains` read as an unknown column removed
+      `where RemoteUrl has_any (MaliciousDomains)` and the IOC hunt ran against all
+      non-browser traffic (DEMO-115974: 30,372 "hits", zero IOC matches).
+    - All other pipe stages (extend, summarize, …): drops the whole line.
 
-    This is a whitelist approach — no enumeration of bad columns needed; anything
-    Gemini invents that isn't in MDE_TABLE_SCHEMA or SENTINEL_TABLE_SCHEMA is pruned.
+    Names declared by `let` in the query are valid. Anything else Gemini invents that
+    isn't in MDE_TABLE_SCHEMA or SENTINEL_TABLE_SCHEMA is pruned.
     """
+    declared = set(re.findall(r"^\s*let\s+([A-Za-z_]\w*)\s*=", kql, re.MULTILINE))
     out = []
     for line in kql.splitlines():
         stripped = line.strip()
@@ -737,7 +1044,7 @@ def _sanitize_kql_columns(kql: str) -> str:
             out.append(line)
             continue
 
-        bad = _invalid_cols(stripped)
+        bad = _invalid_cols(stripped) - declared
         if not bad:
             out.append(line)
             continue
@@ -745,6 +1052,10 @@ def _sanitize_kql_columns(kql: str) -> str:
         rest = stripped.lstrip("|").strip()
         keyword = rest.split()[0].lower() if rest.split() else ""
 
+        if keyword == "where":
+            logger.warning("Rejecting KQL block: `where` references unknown %s — dropping "
+                           "the filter would widen the hunt", sorted(bad))
+            return None
         if keyword == "project":
             new = line
             for col in bad:
@@ -760,28 +1071,72 @@ def _sanitize_kql_columns(kql: str) -> str:
     return "\n".join(out)
 
 
+# A `let` statement, including multi-line dynamic([...]) bodies. Non-greedy to the
+# first ';' — KQL let bodies used here contain no semicolons.
+_LET_RE = re.compile(r"^[ \t]*let\s+([A-Za-z_]\w*)\s*=.*?;", re.DOTALL | re.MULTILINE)
+
+
+def _split_lets(block: str) -> tuple[dict[str, str], str]:
+    """Split a KQL block into its `let` declarations and the remaining body.
+
+    Returns ({name: statement}, body_without_lets).
+    """
+    lets = {m.group(1): m.group(0).strip() for m in _LET_RE.finditer(block)}
+    return lets, _LET_RE.sub("", block)
+
+
+def _first_table_token(body: str) -> str:
+    """First meaningful token of a KQL body — the table name, or "" if none."""
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//"):
+            continue
+        return stripped.split()[0]
+    return ""
+
+
 def extract_kql_blocks(text: str) -> list[str]:
     """Extract KQL code blocks from a Gemini markdown response.
 
     Filters out blocks that are markdown prose, headers, or reference unknown tables.
     Applies column whitelisting to every surviving block.
+
+    `let` declarations are carried forward across blocks. Gemini routinely emits a
+    shared preamble of `let ioc_domains = dynamic([...]);` in its OWN fenced block
+    and then references those names from later query blocks. Treating each fence
+    independently dropped the preamble and left the queries referencing undefined
+    variables — MDE 400s, the auto-fixer then invented placeholder literals to make
+    them resolve, and the hunt "matched" example.com / 1.1.1.1 (DEMO-113069: 1416
+    fabricated hits, zero real IOC matches). Only the declarations a block actually
+    references are prepended, so an unused or malformed one can't break a good query.
     """
     blocks = [b.strip() for b in _KQL_PATTERN.findall(text) if b.strip()]
+    pending_lets: dict[str, str] = {}
     valid = []
     for b in blocks:
-        if len(b) < 20 or "|" not in b:
-            continue
-        # Skip leading comment and let-binding lines to find the table name
-        first_token = ""
-        for line in b.splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith("//") or stripped.startswith("let "):
-                continue
-            first_token = stripped.split()[0]
-            break
+        lets, body = _split_lets(b)
+        first_token = _first_table_token(body)
+
         if first_token not in _ALL_KNOWN_TABLES:
+            # Not a runnable query. If it declared lets, keep them for later blocks.
+            if lets:
+                pending_lets.update(lets)
             continue
-        valid.append(_sanitize_kql_columns(b))
+        if len(body.strip()) < 20 or "|" not in body:
+            continue
+
+        # Carry forward only the declarations this block references and does not
+        # already declare itself.
+        needed = [stmt for name, stmt in pending_lets.items()
+                  if name not in lets and re.search(rf"\b{re.escape(name)}\b", body)]
+        if needed:
+            logger.info("Prepending %d carried-forward let declaration(s) to %s block",
+                        len(needed), first_token)
+            b = "\n".join(needed) + "\n" + b
+        pending_lets.update(lets)
+        clean = _sanitize_kql_columns(b)
+        if clean is not None:
+            valid.append(clean)
     return valid
 
 
@@ -860,7 +1215,86 @@ def _gemini_url(model: str | None = None) -> str:
     return f"https://generativelanguage.googleapis.com/v1beta/models/{model or _gemini_model()}:generateContent"
 
 
-async def _fix_kql_with_gemini(broken_kql: str, error_msg: str, kind: str = "MDE") -> str | None:
+# ---------------------------------------------------------------------------
+# Repair grounding — a fixed query must not invent new indicators
+# ---------------------------------------------------------------------------
+
+# Dotted literals whose last label is one of these are filenames, not hostnames.
+_NON_DOMAIN_TLDS: frozenset[str] = frozenset([
+    "exe", "dll", "sys", "py", "sh", "ps1", "bat", "cmd", "vbs", "js", "jar",
+    "cfg", "conf", "ini", "yaml", "yml", "json", "xml", "html", "htm", "csv",
+    "log", "txt", "md", "dat", "bin", "tmp", "zip", "gz", "tar", "rar", "7z",
+    "msi", "scr", "lnk", "so", "dylib", "c", "cpp", "go", "rs", "php", "asp",
+])
+
+_STR_LIT_RE = re.compile(r'"([^"]*)"|\'([^\']*)\'')
+
+
+def _looks_like_indicator(value: str) -> bool:
+    """True if a string literal looks like a hostname or IP address."""
+    v = (value or "").strip()
+    if not v or len(v) > 253:
+        return False
+    try:
+        ipaddress.ip_address(v)
+        return True
+    except ValueError:
+        pass
+    if not re.fullmatch(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+", v):
+        return False
+    tld = v.rsplit(".", 1)[1].lower()
+    return tld not in _NON_DOMAIN_TLDS and bool(re.fullmatch(r"[A-Za-z]{2,}", tld))
+
+
+def _grounded_ioc_values(iocs: dict | None) -> set[str]:
+    """Every indicator value the repair is allowed to reference, normalized."""
+    allowed: set[str] = set()
+    for values in (iocs or {}).values():
+        for v in (values or []):
+            if not isinstance(v, str) or not v.strip():
+                continue
+            allowed.add(v.strip().lower())
+            host = _strip_to_host(v)
+            if host:
+                allowed.add(host)
+    return allowed
+
+
+def _ungrounded_indicators(kql: str, iocs: dict | None) -> set[str]:
+    """Host/IP literals in `kql` that are not in the IOC set and not known-safe.
+
+    The auto-fixer is never given the IOC values, so when it repairs a query that
+    referenced an undefined `ioc_domains`, its only way to make the query resolve
+    is to invent literals — and it reaches for placeholders (example.com, 1.1.1.1).
+    Those execute cleanly and produce thousands of meaningless "hits". Any network
+    indicator in a repair that did not come from the advisory is fabricated.
+
+    Known-safe CDN/corporate domains are allowed: repairs legitimately carry the
+    exclusion lists (`not(RemoteUrl has_any(safe_cdn_domains))`) as inline literals.
+    """
+    allowed = _grounded_ioc_values(iocs)
+    found: set[str] = set()
+    for m in _STR_LIT_RE.finditer(kql):
+        lit = (m.group(1) if m.group(1) is not None else m.group(2) or "").strip()
+        if not _looks_like_indicator(lit):
+            continue
+        host = _strip_to_host(lit) or lit.lower()
+        if host in allowed or lit.lower() in allowed:
+            continue
+        if _domain_is_fp(host):
+            continue  # CDN/corporate exclusion list, not an indicator
+        try:
+            ip = ipaddress.ip_address(host)
+            if ip.is_private or ip.is_loopback or ip.is_link_local:
+                continue
+        except ValueError:
+            pass
+        found.add(lit)
+    return found
+
+
+async def _fix_kql_with_gemini(broken_kql: str, error_msg: str, kind: str = "MDE",
+                               iocs: dict | None = None) -> str | None:
     """Ask Gemini to fix a KQL syntax error. Returns corrected query or None.
 
     SOURCE-AWARE: MDE repairs are grounded on MDE_TABLE_SCHEMA + ``Timestamp``;
@@ -898,17 +1332,43 @@ async def _fix_kql_with_gemini(broken_kql: str, error_msg: str, kind: str = "MDE
     tables_label = ("KNOWN Sentinel tables (not exhaustive — other valid tables exist):"
                     if is_sentinel else "VALID MDE TABLES (use ONLY these):")
 
+    # Ground the repair in the real indicators. Without this the fixer has no way
+    # to resolve a dangling `ioc_domains` except to invent literals, and it reaches
+    # for placeholders (example.com, 1.1.1.1) that match thousands of benign rows.
+    allowed = sorted(_grounded_ioc_values(iocs))
+    if allowed:
+        ioc_section = (
+            "\nINDICATORS from the advisory — the ONLY indicator values you may use:\n"
+            + "\n".join(f"  {v}" for v in allowed[:60])
+            + "\n"
+        )
+        ioc_rule = (
+            "- If the query references an undefined variable (ioc_domains, ioc_urls, ioc_ipv4, …), "
+            "replace it with an inline dynamic([...]) built ONLY from the INDICATORS listed above\n"
+            "- NEVER invent indicator values. Do not emit placeholders such as example.com, "
+            "test.com, 1.1.1.1, 8.8.8.8, or 127.0.0.1. A repair that hunts a value not in the "
+            "INDICATORS list is worse than no query at all\n"
+            "- If an undefined variable has no corresponding indicator above, delete that filter "
+            "stage rather than substituting a value\n"
+        )
+    else:
+        ioc_section = ""
+        ioc_rule = ("- Do NOT introduce any new domain, hostname or IP literal that is not already "
+                    "present in the broken query\n")
+
     prompt = (
         f"Fix this {engine} KQL query that failed with an error.\n\n"
         f"error: {error_msg}\n"
         f"{tables_label} {valid_tables}\n"
-        f"{schema_section}\n"
+        f"{schema_section}"
+        f"{ioc_section}\n"
         "Broken query:\n"
         f"{broken_kql}\n\n"
         "Rules:\n"
         "- Return ONLY the corrected KQL, no explanation, no markdown fences\n"
         "- The query must START with a valid table name, not a comment\n"
         f"{table_rule}"
+        f"{ioc_rule}"
         "- Use valid columns for the table — remove or replace any column not valid for it\n"
         f"- Add | where {time_field} > ago(7d) if no time filter exists"
     )
@@ -942,7 +1402,8 @@ async def _fix_kql_with_gemini(broken_kql: str, error_msg: str, kind: str = "MDE
     return None
 
 
-async def _autofix_loop(kql, err, execute, kind: str, attempts: int = 2):
+async def _autofix_loop(kql, err, execute, kind: str, attempts: int = 2,
+                        iocs: dict | None = None, on_query=None):
     """Gemini auto-fix loop: up to `attempts` fixes, linting each candidate before
     executing so we don't burn an API round-trip on a still-malformed query, and
     feeding both the engine error and the lint error back into the next fix.
@@ -951,9 +1412,10 @@ async def _autofix_loop(kql, err, execute, kind: str, attempts: int = 2):
     """
     current_err = str(err)
     candidate = kql
+    ungrounded: set[str] = set()
     for i in range(attempts):
         logger.warning("%s KQL auto-fix attempt %d/%d: %s", kind, i + 1, attempts, current_err[:120])
-        fixed = await _fix_kql_with_gemini(candidate, current_err, kind)
+        fixed = await _fix_kql_with_gemini(candidate, current_err, kind, iocs=iocs)
         if not fixed:
             logger.warning("%s KQL auto-fix: Gemini returned nothing (attempt %d)", kind, i + 1)
             break
@@ -964,12 +1426,50 @@ async def _autofix_loop(kql, err, execute, kind: str, attempts: int = 2):
             logger.warning("%s KQL auto-fix attempt %d still lints bad: %s", kind, i + 1, lint)
             current_err = f"{current_err}; lint: {lint}"
             continue
+        # Grounding gate: refuse to run a repair that hunts indicators the advisory
+        # never mentioned. A fabricated literal executes cleanly and reports
+        # confident hits on benign traffic, which is worse than a failed query —
+        # a failure falls through to the programmatic IOC fallback.
+        if iocs:
+            invented = _ungrounded_indicators(fixed, iocs)
+            if invented:
+                ungrounded |= invented
+                logger.warning("%s KQL auto-fix attempt %d invented indicators %s — rejected",
+                               kind, i + 1, sorted(invented))
+                current_err = (f"{current_err}; the previous fix invented indicator values "
+                               f"{sorted(invented)} that are NOT in the advisory — use only the "
+                               f"INDICATORS listed, or delete the filter stage")
+                continue
         rows, err2 = await execute(fixed)
         if err2 is None:
             logger.info("%s KQL auto-fix succeeded on attempt %d", kind, i + 1)
+            if on_query:
+                on_query(fixed)
             return rows, None
         current_err = str(err2)
-    return [], f"syntax error (auto-fix failed after {attempts} attempts): {current_err[:100]}"
+    # Don't call every failure a SYNTAX error. Azure returns the same generic 400
+    # ("The request had some invalid properties") for a reference to a column that
+    # does not exist, which is a SCHEMA problem, not a grammar one — and the Gemini
+    # fixer cannot solve it, because it does not know the table's columns either, so
+    # it burns both attempts rewriting a query whose syntax was already fine.
+    # DEMO-110712: the agent queried Netskope_Alerts_CL for `dlp_file_s` (no such
+    # column; the real ones are dlp_profile_s / dlp_rule_s / dlp_rule_severity_s /
+    # dlp_incident_id_s), and the run reported "syntax error", which sent the
+    # investigation looking for a malformed query that never existed. Naming the
+    # likely cause is what makes the next failure diagnosable.
+    # A grounding rejection is not a schema problem — say so, or the next person
+    # debugging this goes looking for a column that was never wrong.
+    if ungrounded:
+        return [], (f"auto-fix rejected after {attempts} attempts: the repair kept inventing "
+                    f"indicators not in the advisory ({sorted(ungrounded)}); "
+                    f"original error: {str(err)[:100]}")
+    _e = current_err.lower()
+    _kind = ("query failed — possibly an unknown column/table for this schema"
+             if ("invalid properties" in _e or "could not be resolved" in _e
+                 or "unknown function" in _e or "failed to resolve" in _e)
+             else "query failed")
+    return [], (f"{_kind} (auto-fix failed after {attempts} attempts): "
+                f"{current_err[:140]}")
 
 
 # ---------------------------------------------------------------------------
@@ -980,6 +1480,9 @@ async def run_mde_query(
     kql: str,
     token: str,
     timeout: int = 60,
+    iocs: dict | None = None,
+    on_query=None,
+    autofix: bool = True,
 ) -> tuple[list[dict], str | None]:
     """Execute one KQL query against MDE Advanced Hunting.
 
@@ -1015,6 +1518,8 @@ async def run_mde_query(
 
     rows, err = await _execute(kql)
     if err is None:
+        if on_query:
+            on_query(kql)
         return rows, None
 
     # Non-syntax errors (auth, timeout) — don't bother fixing
@@ -1023,7 +1528,9 @@ async def run_mde_query(
         return [], err
 
     # Syntax error — ask Gemini to fix and retry once
-    return await _autofix_loop(kql, err, _execute, "MDE")
+    if not autofix:
+        return [], err
+    return await _autofix_loop(kql, err, _execute, "MDE", iocs=iocs, on_query=on_query)
 
 
 # ---------------------------------------------------------------------------
@@ -1086,20 +1593,89 @@ def filter_false_positives(rows: list[dict]) -> tuple[list[dict], list[dict]]:
 # Programmatic fallback IOC queries (syntax-safe, no Gemini dependency)
 # ---------------------------------------------------------------------------
 
+_HASH_LEN = {32: "md5", 40: "sha1", 64: "sha256"}
+
+
+def _classify_ioc_key(key: str) -> str:
+    """Map an IOC dict key to a canonical kind.
+
+    Producers disagree on key names: the Cyble service emits "domains"/"ipv4"/
+    "sha256", while OTX passes its own type strings straight through
+    ("URL", "IPv4", "FileHash-SHA256"). Matching on an exact lowercase literal
+    silently dropped most of them, so classify structurally instead.
+    Returns one of: domain, ip, md5, sha1, sha256, "" (unrecognized).
+    """
+    k = re.sub(r"[^a-z0-9]", "", (key or "").lower())
+    if "sha256" in k:
+        return "sha256"
+    if "sha1" in k:
+        return "sha1"
+    if "md5" in k:
+        return "md5"
+    if k in ("hash", "hashes", "filehash", "filehashes"):
+        return "hash"  # kind decided per-value by length
+    if any(t in k for t in ("domain", "url", "hostname", "host", "fqdn")):
+        return "domain"
+    if k.startswith("ip") or k.endswith("ip") or k.endswith("ips") or "ipaddress" in k:
+        return "ip"
+    return ""
+
+
 def build_ioc_fallback_queries(iocs: dict) -> list[str]:
     """Build simple, guaranteed-valid KQL queries directly from an IOC dict.
 
-    Used as a safety net when Gemini-generated KQL has syntax errors — ensures
-    IOC presence in the environment is always checked regardless of KQL quality.
+    Used as a safety net when Gemini-generated KQL has syntax errors or is
+    missing entirely — ensures IOC presence in the environment is always
+    checked regardless of KQL quality.
+
+    Values are refanged before being embedded: feeds ship "hxxps://evil[.]com",
+    which matches nothing in telemetry.
     """
     queries: list[str] = []
 
-    # Domains / URLs / hostnames
+    buckets: dict[str, list[str]] = {"domain": [], "ip": [], "md5": [], "sha1": [], "sha256": []}
+    for key, values in (iocs or {}).items():
+        kind = _classify_ioc_key(key)
+        if not kind:
+            continue
+        for v in (values or []):
+            if not (isinstance(v, str) and v.strip()):
+                continue
+            if kind == "hash":
+                resolved = _HASH_LEN.get(len(v.strip()))
+                if resolved:
+                    buckets[resolved].append(v.strip())
+                continue
+            buckets[kind].append(v.strip())
+
+    # ── Domains / URLs / hostnames ──────────────────────────────────────────
     domains: list[str] = []
-    for key in ("domains", "domain", "urls", "url", "hostnames", "hostname"):
-        for v in (iocs.get(key) or []):
-            if isinstance(v, str) and v and not _domain_is_fp(v):
-                domains.append(v)
+    for v in buckets["domain"]:
+        host = _strip_to_host(v)
+        if not host:
+            continue
+        if _domain_is_fp(host):
+            continue
+        refanged = _refang(v)
+        # A real path segment after the host — not the scheme's "//", a bare
+        # trailing "/", or a query string ("https://api.github.com/" is the host).
+        _rest = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", "", refanged)
+        has_path = bool(_rest.partition("/")[2].split("?", 1)[0].split("#", 1)[0].strip("/"))
+        if is_hosting_suffix_only(host) or is_shared_service_host(host):
+            # A platform host (workers.dev, api.github.com, ably.net) sweeps
+            # every tenant or user of that service rather than the attacker —
+            # see _HOSTING_SUFFIXES / _SHARED_SERVICE_DOMAINS. Only the full
+            # URL, which names the attacker's repo/bucket/paste, is hunted.
+            if has_path:
+                domains.append(refanged)
+            else:
+                logger.warning("Dropping shared platform host from fallback IOC query: %s", v)
+            continue
+        # Hunt the hostname, and the full URL too when the IOC carried a path —
+        # MDE's RemoteUrl holds either form depending on the data source.
+        domains.append(host)
+        if has_path:
+            domains.append(refanged)
     domains = list(dict.fromkeys(domains))[:15]  # dedupe, cap
     if domains:
         quoted = ", ".join(f'"{d}"' for d in domains)
@@ -1110,12 +1686,16 @@ def build_ioc_fallback_queries(iocs: dict) -> list[str]:
             "| project Timestamp, DeviceName, RemoteUrl, RemoteIP, ActionType, InitiatingProcessFileName"
         )
 
-    # IPs
+    # ── IPs ─────────────────────────────────────────────────────────────────
     ips: list[str] = []
-    for key in ("ips", "ip_addresses", "ip", "c2_ips"):
-        for v in (iocs.get(key) or []):
-            if isinstance(v, str) and v and not _is_private_ip(v):
-                ips.append(v)
+    for v in buckets["ip"]:
+        ip = _refang(v).strip("[]")
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            continue  # CIDR ranges and malformed values break `in (...)`
+        if not _is_private_ip(ip):
+            ips.append(ip)
     ips = list(dict.fromkeys(ips))[:15]
     if ips:
         quoted = ", ".join(f'"{ip}"' for ip in ips)
@@ -1126,20 +1706,19 @@ def build_ioc_fallback_queries(iocs: dict) -> list[str]:
             "| project Timestamp, DeviceName, RemoteIP, RemoteUrl, ActionType, InitiatingProcessFileName"
         )
 
-    # SHA256 file hashes
-    hashes: list[str] = []
-    for key in ("sha256", "sha256_hashes", "file_hashes", "hashes"):
-        for v in (iocs.get(key) or []):
-            if isinstance(v, str) and len(v) == 64:
-                hashes.append(v)
-    hashes = list(dict.fromkeys(hashes))[:10]
-    if hashes:
+    # ── File hashes ─────────────────────────────────────────────────────────
+    for column, kind in (("SHA256", "sha256"), ("SHA1", "sha1"), ("MD5", "md5")):
+        hashes = [h for h in buckets[kind] if len(h) == {"sha256": 64, "sha1": 40, "md5": 32}[kind]
+                  and re.fullmatch(r"[0-9a-fA-F]+", h)]
+        hashes = list(dict.fromkeys(hashes))[:10]
+        if not hashes:
+            continue
         quoted = ", ".join(f'"{h}"' for h in hashes)
         queries.append(
             "DeviceFileEvents\n"
             "| where Timestamp > ago(30d)\n"
-            f"| where SHA256 in~ ({quoted})\n"
-            "| project Timestamp, DeviceName, FileName, FolderPath, SHA256, InitiatingProcessFileName"
+            f"| where {column} in~ ({quoted})\n"
+            f"| project Timestamp, DeviceName, FileName, FolderPath, {column}, InitiatingProcessFileName"
         )
 
     return queries
@@ -1203,35 +1782,42 @@ async def hunt_with_kql(
 
     blocks = extract_kql_blocks(kql_analysis)
     if not blocks:
-        logger.info("No KQL blocks found in analysis")
-        return result
+        # Don't return yet — no KQL is precisely when the programmatic IOC
+        # fallback below matters. Only give up if there are no IOCs either.
+        logger.info("No KQL blocks found in analysis (falling back to IOC queries)")
+        if not iocs:
+            return result
 
     mde_token = await get_access_token()
 
     query_errors: list[str] = []
     for kql in blocks[:max_queries]:
-        first_token = ""
-        for line in kql.splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith("//") or stripped.startswith("let "):
-                continue
-            first_token = stripped.split()[0]
-            break
+        # Strip let declarations before looking for the table name — a multi-line
+        # `let x = dynamic([...])` would otherwise route on a continuation line.
+        _, _body = _split_lets(kql)
+        first_token = _first_table_token(_body)
         # _CL custom-log tables (e.g. Netskope_Alerts_CL) live in the Sentinel
         # workspace, not MDE — route them to Log Analytics.
         use_sentinel = first_token in SENTINEL_TABLE_SCHEMA or first_token.endswith("_CL")
 
         result["queries_run"] += 1
-        kql_reason = _extract_kql_reason(kql)
+        # The query that actually runs may be an auto-fixed rewrite of this one.
+        # Report the rewrite, not the original: DEMO-113069's Match Reason column
+        # showed `has_any (ioc_domains)` for rows produced by a repaired query
+        # that hunted something else entirely, which made the hits unexplainable.
+        executed = {"kql": kql}
+        _note = lambda q: executed.__setitem__("kql", q)  # noqa: E731
 
         if use_sentinel:
-            rows, err = await run_sentinel_query(kql, timeout=per_query_timeout)
+            rows, err = await run_sentinel_query(kql, timeout=per_query_timeout,
+                                                 iocs=iocs, on_query=_note)
         else:
             if not mde_token:
                 result["queries_errored"] += 1
                 query_errors.append("MDE credentials not configured or token acquisition failed")
                 continue
-            rows, err = await run_mde_query(kql, mde_token, timeout=per_query_timeout)
+            rows, err = await run_mde_query(kql, mde_token, timeout=per_query_timeout,
+                                            iocs=iocs, on_query=_note)
 
         if err:
             result["queries_errored"] += 1
@@ -1239,12 +1825,17 @@ async def hunt_with_kql(
             continue
         if not rows:
             continue
+        ran = executed["kql"]
+        kql_reason = _extract_kql_reason(ran)
+        if ran != kql:
+            logger.info("Query %d was auto-fixed; reporting the executed query",
+                        result["queries_run"])
         real, fps = filter_false_positives(rows)
         for row in real:
             row["_query_idx"] = result["queries_run"]
             row["_table"] = first_token
             row["_kql_reason"] = kql_reason
-            row["_kql_query"] = kql[:500]
+            row["_kql_query"] = ran[:500]
         result["real_hits"].extend(real)
         result["fp_hits"].extend(fps)
         if real:
@@ -1266,19 +1857,24 @@ async def hunt_with_kql(
             if not mde_token:
                 break
             result["queries_run"] += 1
-            kql_reason = _extract_kql_reason(kql)
-            rows, err = await run_mde_query(kql, mde_token, timeout=per_query_timeout)
+            executed = {"kql": kql}
+            rows, err = await run_mde_query(
+                kql, mde_token, timeout=per_query_timeout, iocs=iocs,
+                on_query=lambda q: executed.__setitem__("kql", q),
+            )
             if err:
                 result["queries_errored"] += 1
                 continue
             if not rows:
                 continue
+            ran = executed["kql"]
+            kql_reason = _extract_kql_reason(ran)
             real, fps = filter_false_positives(rows)
             for row in real:
                 row["_query_idx"] = result["queries_run"]
                 row["_table"] = "ioc-fallback"
                 row["_kql_reason"] = kql_reason
-                row["_kql_query"] = kql[:500]
+                row["_kql_query"] = ran[:500]
             result["real_hits"].extend(real)
             result["fp_hits"].extend(fps)
             if real:
@@ -1297,15 +1893,12 @@ async def hunt_with_kql(
 # DataAnonymizer — strips tenant identifiers before sending to Gemini
 # ---------------------------------------------------------------------------
 
-# Company brand to scrub from displayed telemetry — set SANITIZER_COMPANY_NAME
-# (e.g. "acme") to strip your org's name; left unset, only the generic patterns run.
-_COMPANY_NAME = os.getenv("SANITIZER_COMPANY_NAME", "").strip().lower()
-_COMPANY_PATTERNS = [p for p in [
-    re.compile(rf"\b{re.escape(_COMPANY_NAME)}[a-z0-9\-\.]*\b", re.IGNORECASE) if _COMPANY_NAME else None,
+_BRAND_PATTERNS = [
+    re.compile(r"\bacme[a-z0-9\-\.]*\b", re.IGNORECASE),
     re.compile(r"\b[A-Z][a-z]+\.[A-Z][a-z]+\b"),           # FirstName.LastName pattern
     re.compile(r"\b(?:10|172|192)\.(?:\d{1,3}\.){2}\d{1,3}\b"),  # private IPs
     re.compile(r"\bDEVICE-[A-Z0-9\-]+\b"),
-] if p is not None]
+]
 
 _FIELD_ANONYMIZE = frozenset([
     "DeviceName", "AccountName", "AccountUpn", "InitiatingProcessAccountName",
@@ -1343,9 +1936,9 @@ class DataAnonymizer:
             elif k in ("RemoteIP", "LocalIP", "DestinationIPAddress", "SourceIPAddress"):
                 out[k] = self._replace(v, self._ip_map, "IP-{n}")
             else:
-                # scrub any remaining company/PII-like patterns
+                # scrub any remaining acme-like patterns
                 s = v
-                for pat in _COMPANY_PATTERNS:
+                for pat in _BRAND_PATTERNS:
                     s = pat.sub("[REDACTED]", s)
                 out[k] = s
         return out

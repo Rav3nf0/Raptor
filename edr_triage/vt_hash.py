@@ -5,12 +5,15 @@ GET https://www.virustotal.com/api/v3/files/{sha256}
 from __future__ import annotations
 
 import logging
+import re
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
 _VT_BASE = "https://www.virustotal.com/api/v3"
+# VT's /files/{id} takes MD5, SHA1 or SHA256. Upwind reports MD5 only.
+FILE_HASH_RE = re.compile(r"^(?:[a-fA-F0-9]{32}|[a-fA-F0-9]{40}|[a-fA-F0-9]{64})$")
 
 
 async def check_hash(sha256: str, api_key: str) -> dict:
@@ -27,7 +30,7 @@ async def check_hash(sha256: str, api_key: str) -> dict:
     """
     empty = {"detections": 0, "total": 0, "verdict": "unknown", "malicious_names": [], "vt_link": ""}
 
-    if not api_key or not sha256 or len(sha256) != 64:
+    if not api_key or not sha256 or not FILE_HASH_RE.match(sha256):
         return empty
 
     try:

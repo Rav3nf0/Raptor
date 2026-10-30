@@ -19,9 +19,13 @@ or thin, and each bound and reached a correct AUTO_CLOSED_FP when re-run later.
 
 Deliberately narrow:
   * ONE attempt per ticket (retriaged_at must be unset), so this can never loop;
-  * unresolved tickets only, so it cannot disturb anything already scored — a re-triage
-    clears verdict_match, and doing that to a scored row would pull it out of the
-    accuracy denominator until the closure poller catches up;
+  * not yet SCORED (l2_resolved_at unset), so it cannot disturb anything already
+    counted in accuracy — a re-triage clears verdict_match, and doing that to a scored
+    row would pull it out of the denominator until the closure poller catches up. The
+    earlier L1->L2 handoff stamp (l1_resolved_at) does NOT block this: verdict_match
+    isn't set until L2 resolution, and l1_*/l2_* fields survive a re-triage untouched
+    (edr_triage/pipeline.py::_save_shadow_result), so re-triaging between handoff and
+    final resolution is safe and is in fact the common case for this alert family;
   * blank-bound only (no device AND no command), which is the signature of the failure —
     a ticket that bound something is not this problem and is left alone;
   * agent-failure shadows skipped: an ai_error row holds the playbook's fallback verdict,
@@ -84,8 +88,15 @@ async def find_blank_shadows(limit: int = MAX_PER_CYCLE) -> list:
     for s in rows:
         if getattr(s, "retriaged_at", None):
             continue                                  # its one attempt is spent
-        if getattr(s, "l2_resolved_at", None) or getattr(s, "l1_resolved_at", None):
-            continue                                  # resolved — never touch a scored row
+        if getattr(s, "l2_resolved_at", None):
+            continue                                  # scored — never touch a resolved row
+        # l1_resolved_at alone (the L1->L2 handoff stamp) is NOT a scoring event —
+        # verdict_match stays None until l2_resolved_at is set (jira_closure_poller.py),
+        # and _save_shadow_result already preserves every l1_*/l2_* field across a
+        # re-triage. Excluding on it too meant this retry never got a chance to run
+        # on this alert family at all: L1 routinely hands off well inside the 35-minute
+        # ingestion window (e.g. DEMO-109599 at 15 minutes), so by the time real evidence
+        # would have landed, the ticket already looked "resolved" and was skipped.
         if getattr(s, "ai_error", None):
             continue                                  # infra failure, not a binding gap
         if (getattr(s, "alert_name", "") or "").strip().lower() not in ELIGIBLE_ALERT_NAMES:

@@ -1,4 +1,4 @@
-"""Shared Jira HTTP client builder used across the app."""
+"""Shared Jira HTTP client builder used by both brand_intel and edr_triage."""
 from __future__ import annotations
 
 import httpx

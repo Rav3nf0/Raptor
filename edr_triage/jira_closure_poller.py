@@ -6,12 +6,16 @@ Two-stage memory write:
   Stage 2 — L2 resolves: status = "FALSE POSITIVE" / "RESOLVED" / "CLOSED"
     → enriches Stage-1 memory (or writes fresh if no prior escalation)
     → sets verdict_match against L2 verdict, not L1 escalation
-
   (unscored) — status = "AWAITING MORE INPUTS": refreshes a stale pending-quarantine
     caption if one already exists; never resolves, never touched otherwise
 
-JQL: project = <project> AND status in ("FALSE POSITIVE","RESOLVED","CLOSED",
-     "L2 ANALYSIS REQUIRED","AWAITING MORE INPUTS") AND updated >= -5m
+JQL: project = SIM AND status in ("FALSE POSITIVE","RESOLVED","CLOSED",
+     "L2 ANALYSIS REQUIRED","AWAITING MORE INPUTS") AND updated >= -{lookback}m
+     (lookback > interval on purpose — see run_forever)
+
+Stage 2 does NOT depend on Stage 1 having been observed: whether a ticket went to L2
+is also read back off the comment thread (`_thread_shows_l2`), so a poll that misses
+the L2-status window costs a refresh, not the L2 provenance.
 """
 from __future__ import annotations
 
@@ -43,15 +47,54 @@ _JIRA_TO_TRIAGE: dict[str, str] = {
 
 _SKIP_STATES = frozenset(["NO RESPONSE"])
 
+# A ticket an analyst closed as a duplicate of another. NOT in _TERMINAL_STATES and NOT
+# in _JIRA_TO_TRIAGE: closing as Duplicate is not a verdict — the analyst never said
+# false positive or true positive, they said "see the other ticket" — so it must never
+# be scored as an AI hit or miss.
+#
+# But it DOES have to be stamped as resolved, and until now it was not polled at all.
+# The consequence was a phantom open alert that manufactured misses in every OTHER
+# alert family. check_concurrent_alerts (entity_graph/query.py) treats a sibling as
+# still-open unless the poller stamped a resolution, so a Duplicate-closed ticket
+# counted as an open concurrent alert for its full 24h window, forever. DEMO-111177
+# (Netskope DLP, nico.bhatt, closed Duplicate, no stamps) is why DEMO-111178 — a Root
+# Privilege Escalation whose commands the agent had correctly read as benign `id`
+# queries with prior business justification — was escalated to L2 anyway on the
+# concurrent-alert safety rule, and scored a miss when both L1 and L2 closed it FP.
+#
+# DLP fans out into many tickets and ~a third of them are closed Duplicate, so the
+# phantom siblings cluster on exactly the high-volume actors who also appear in other
+# families. Splitting DLP out of the headline does not touch this: the misses it causes
+# land in the NON-DLP bucket.
+_DUPLICATE_STATE = "DUPLICATE"
+
 # AWAITING MORE INPUTS is L1's business-justification loop, not a resolution — a
-# ticket can sit here for days (escalated, L2 asked the actor, waited days for a
-# reply) while its underlying shadow gets re-triaged and ai_triage_class moves on.
-# It used to be a _SKIP_STATES entry, so the JQL below never even fetched it and the
-# pending-quarantine caption froze at whatever the AI said the moment it first
-# escalated — an L2 reviewing the queue saw "AI: NEEDS_L2" long after the AI's
+# ticket can sit here for days (DEMO-108035: escalated, L2 asked the actor, waited
+# 4 days for a reply) while its underlying shadow gets re-triaged and ai_triage_class
+# moves on. It used to be a _SKIP_STATES entry, so the JQL below never even fetched
+# it and the pending-quarantine caption froze at whatever the AI said the moment it
+# first escalated — an L2 reviewing the queue saw "AI: NEEDS_L2" long after the AI's
 # current read had moved to REQUEST_JUSTIFICATION. Fetched and refreshed (never
 # scored — see _refresh_awaiting_inputs_memory) exactly like L2 ANALYSIS REQUIRED.
 _AWAITING_INPUTS_STATE = "AWAITING MORE INPUTS"
+
+
+def _thread_shows_l2(attributed_comment: str) -> bool:
+    """True when the attributed comment thread contains an L2 analyst's comment.
+
+    A DURABLE, retroactive L2 signal: it is re-derivable from the ticket at any time,
+    unlike `l1_handoff_at`, which is only ever stamped while the ticket is SITTING in
+    "L2 Analysis required" and a poll happens to catch it there. Miss that window and
+    the fact that a ticket went to L2 is lost permanently — the status has moved on, so
+    _handle_l2_handoff can never fire for it again.
+
+    `_extract_all_comments` tags each human comment `[<role> — <name>]` from the analyst
+    role registry, so an L2 who commented is recorded in the thread itself. Accepts the
+    hyphen form too — the tag is written with an em dash, but a re-ingested/normalised
+    thread can carry the ASCII one.
+    """
+    t = attributed_comment or ""
+    return "[L2 —" in t or "[L2 -" in t
 
 
 async def _alert_under_test(alert_name: str) -> bool:
@@ -79,6 +122,13 @@ async def poll_once(lookback_minutes: int = 5) -> int:
                      "shadow accuracy will not be scored. Set JIRA_URL.")
         return 0
 
+    # Held Root Privesc tickets whose blocker is still open after the hold window → L2.
+    try:
+        from edr_triage.concurrency_hold import expire_holds
+        await expire_holds(cfg)
+    except Exception as exc:
+        logger.error("closure_poller: expire_holds failed: %s", exc)
+
     tickets = await _fetch_recently_closed(cfg, lookback_minutes)
     if not tickets:
         return 0
@@ -97,7 +147,7 @@ async def poll_once(lookback_minutes: int = 5) -> int:
 
 
 async def _fetch_recently_closed(cfg, lookback_minutes: int) -> list[dict]:
-    states = list(_TERMINAL_STATES) + [_AWAITING_INPUTS_STATE]
+    states = list(_TERMINAL_STATES) + [_AWAITING_INPUTS_STATE, _DUPLICATE_STATE]
     jql = (
         f'project = {cfg.jira_project_key} '
         f'AND status in ({", ".join(repr(s) for s in states)}) '
@@ -122,7 +172,7 @@ async def _fetch_recently_closed(cfg, lookback_minutes: int) -> list[dict]:
             for _ in range(_MAX_CLOSURE_PAGES):
                 body: dict = {
                     "jql": jql,
-                    "fields": ["summary", "status", "assignee", "comment", "updated"],
+                    "fields": ["summary", "status", "assignee", "comment", "updated", "labels"],
                     "maxResults": 100,
                 }
                 if next_token:
@@ -154,8 +204,9 @@ async def rescore_one(jira_key: str) -> dict:
     window wide enough to include it returns more than the cap and truncates before it.
     A re-triage clears verdict_match, so a row in that position drops OUT of the
     accuracy denominator and stays out — an exclusion, which is exactly the thing the
-    metric must never do. Such a ticket otherwise needs a human to comment on it just
-    to drag its `updated` back into the window.
+    metric must never do. DEMO-106604 needed a human to comment on the ticket just to
+    drag its `updated` back into the window; DEMO-106078 and DEMO-108928 are still stuck
+    there.
 
     Fetches the issue by key (no search, no window, no cap) and hands it to the SAME
     _process_closed_ticket the poller uses, with the SAME field set — so this re-scores
@@ -179,7 +230,7 @@ async def rescore_one(jira_key: str) -> dict:
             resp = await client.get(
                 f"/rest/api/3/issue/{key}",
                 # Same fields the search requests, so the handlers see identical input.
-                params={"fields": "summary,status,assignee,comment,updated"},
+                params={"fields": "summary,status,assignee,comment,updated,labels"},
             )
             if resp.status_code == 404:
                 return {"ok": False, "jira_key": key, "error": "no such Jira ticket"}
@@ -225,6 +276,13 @@ async def _process_closed_ticket(ticket: dict) -> bool:
             logger.error("closure_poller: _process_closed_ticket(%s) failed: %s", jira_key, exc)
             return False
 
+    if status_name == _DUPLICATE_STATE:
+        try:
+            return await _mark_duplicate_resolved(jira_key, fields)
+        except Exception as exc:
+            logger.error("closure_poller: _mark_duplicate_resolved(%s) failed: %s", jira_key, exc)
+            return False
+
     if status_name in _SKIP_STATES:
         return False
     if status_name not in _TERMINAL_STATES:
@@ -243,14 +301,24 @@ async def _process_closed_ticket(ticket: dict) -> bool:
                 return False
             resolved = await _handle_l2_resolution(jira_key, fields, final_class, analyst_id, analyst_name)
             if resolved:
+                # A human just reached a terminal verdict (FP or TP) on this ticket —
+                # resolve any open page for it. Safe no-op if none was ever triggered
+                # (see lib.pagerduty_client.resolve_event); best-effort, same as
+                # _retrigger_dependents below, so a PagerDuty outage never masks this
+                # ticket's own successful resolution.
+                try:
+                    from lib.pagerduty_client import resolve_event
+                    await resolve_event(jira_key)
+                except Exception as exc:
+                    logger.error("closure_poller: resolve_event(%s) failed: %s", jira_key, exc)
                 # This ticket just closed — anything the concurrency gate blocked
                 # specifically because THIS one was open has nothing else watching for
-                # that to change (a ticket blocked on a sibling's still-open status sat
-                # at NEEDS_L2 with no mechanism to revisit it once the sibling closed).
-                # Best-effort: never let a dependent failure mask this ticket's own
-                # successful resolution.
+                # that to change (DEMO-109502/DEMO-109453: a ticket blocked on a sibling's
+                # still-open status sat at NEEDS_L2 with no mechanism to revisit it once
+                # the sibling closed). Best-effort: never let a dependent failure mask
+                # this ticket's own successful resolution.
                 try:
-                    await _retrigger_dependents(jira_key)
+                    await _retrigger_dependents(jira_key, final_class)
                 except Exception as exc:
                     logger.error("closure_poller: _retrigger_dependents(%s) failed: %s", jira_key, exc)
             return resolved
@@ -259,7 +327,7 @@ async def _process_closed_ticket(ticket: dict) -> bool:
         return False
 
 
-async def _retrigger_dependents(jira_key: str) -> None:
+async def _retrigger_dependents(jira_key: str, final_class: str = "") -> None:
     """A ticket just resolved — re-triage any OTHER ticket the concurrency gate blocked
     specifically because THIS one was open (ShadowResult.blocked_by_concurrent_keys
     contains jira_key).
@@ -282,15 +350,25 @@ async def _retrigger_dependents(jira_key: str) -> None:
     from edr_triage.jira_poller import (
         parse_mde_alert_id, parse_description_fields,
         parse_sentinel_incident_url, parse_sentinel_alert_id, _adf_to_text,
+        build_upwind_ticket,
     )
     from edr_triage.pipeline import _process_ticket
     from edr_triage.store import _col as _store_col
     from lib.mde_client import get_access_token
 
     cfg = get_edr_config()
+    from edr_triage import concurrency_hold as _ch
     for dep in dependents:
         dep_key = dep.jira_key
         try:
+            if final_class != "AUTO_CLOSED_FP" and await _ch.is_held(dep_key, cfg):
+                # Held behind a ticket that did NOT close False Positive — possibly a true
+                # positive, so this one goes to a person, never back through the model.
+                logger.info("%s closed %s — held %s goes to L2", jira_key, final_class, dep_key)
+                await _ch.release_to_l2(dep_key, f"{jira_key}, which it was held behind, was "
+                                        f"closed as {final_class or 'something other than False Positive'}",
+                                        cfg)
+                continue
             logger.info(
                 "%s closed — re-triaging %s (was blocked on it via the concurrent-alerts gate)",
                 jira_key, dep_key,
@@ -320,8 +398,12 @@ async def _retrigger_dependents(jira_key: str) -> None:
             sentinel_url = parse_sentinel_incident_url(description)
             alert_name = parsed.get("alert_name", dep_fields.get("summary", ""))
             existing_comments, _, _ = _extract_all_comments(dep_fields, bot_email=cfg.jira_email or "")
+            upwind_ticket = None if alert_id else build_upwind_ticket(
+                dep_key, dep_fields, description, existing_comments)
 
-            if alert_id:
+            if upwind_ticket:
+                dep_ticket = upwind_ticket
+            elif alert_id:
                 dep_ticket = {
                     "jira_key": dep_key, "alert_id": alert_id, "alert_name": alert_name,
                     "description": description, "created_at": dep_fields.get("created", ""),
@@ -361,19 +443,20 @@ async def _refresh_awaiting_inputs_memory(jira_key: str, fields: dict) -> bool:
     doesn't already exist. It exists solely so a ticket sitting here for days
     doesn't leave its pending-quarantine caption frozen at whatever the AI said the
     moment it was first escalated, while the underlying shadow moves on underneath
-    it (re-triaged from NEEDS_L2 to REQUEST_JUSTIFICATION, caption still read
-    "AI: NEEDS_L2" because this status used to be skipped outright).
+    it (DEMO-108035: re-triaged from NEEDS_L2 to REQUEST_JUSTIFICATION, caption still
+    read "AI: NEEDS_L2" because this status used to be skipped outright).
 
     REOPENED-AFTER-RESOLUTION is the other case handled here. A ticket can be
     resolved (verdict_match set, a memory written) and later moved BACK to
     AWAITING MORE INPUTS — not just via a genuine re-triage (which already clears
-    verdict_match itself), but via a plain Jira reopen: a ticket caught in a bulk
-    close intended for an unrelated alert burst (a copy-pasted resolution comment and
-    AUTO_CLOSED_FP verdict landing on it), then reopened once the mistake was caught —
-    but nothing had ever cleared the stale verdict_match or the now-wrong memory, so
-    both sat there permanently captioned with someone else's resolution. A resolved
-    verdict is only ever valid while the ticket STAYS resolved; seeing it back in this
-    state at all means that resolution no longer holds, regardless of why.
+    verdict_match itself), but via a plain Jira reopen: DEMO-109508 was caught in a
+    bulk close intended for an unrelated Netskope-alert burst (same copy-pasted
+    "re-enablement of the CASB rule" comment and AUTO_CLOSED_FP verdict landed on
+    it), then reopened once the mistake was caught — but nothing had ever cleared
+    the stale verdict_match or the now-wrong memory, so both sat there permanently
+    captioned with someone else's resolution. A resolved verdict is only ever valid
+    while the ticket STAYS resolved; seeing it back in this state at all means that
+    resolution no longer holds, regardless of why.
     """
     from entity_graph.models import ShadowResult
     shadow = await (
@@ -383,6 +466,26 @@ async def _refresh_awaiting_inputs_memory(jira_key: str, fields: dict) -> bool:
     )
     if not shadow:
         return False
+
+    # Record that L1 ASKED THE USER. Stamped once, never cleared, and set BEFORE every
+    # early return below — including the `l1_handoff_at is None` one, because L1 asking
+    # is a decision whether or not they later escalated.
+    #
+    # This was the one L1 decision nothing recorded. l1_triage_class is only ever set by
+    # _handle_l2_handoff (-> NEEDS_L2) or by the terminal-close branch (-> final class),
+    # so "L1 opened the business-justification loop" left no trace at all. The agent's
+    # REQUEST_JUSTIFICATION verdict could therefore never be scored as agreeing with L1
+    # even when both made the identical call — a systematic undercount landing entirely
+    # on the RJ path (21 scored RJ misses; DLP alone had 31 of 264 rows at RJ).
+    #
+    # Still does NOT score anything: verdict_match and l1/l2 stay untouched here, exactly
+    # as before. This is a timestamp, read later by the l1_agreement metric.
+    from datetime import datetime as _dt
+    if getattr(shadow, "l1_awaiting_inputs_at", None) is None:
+        shadow.l1_awaiting_inputs_at = _dt.utcnow()
+        await shadow.save()
+        logger.info("AWAITING MORE INPUTS %s — recorded L1's justification request", jira_key)
+
     if shadow.verdict_match is not None:
         shadow.verdict_match = None
         await shadow.save()
@@ -398,7 +501,7 @@ async def _refresh_awaiting_inputs_memory(jira_key: str, fields: dict) -> bool:
         )
     if shadow.l1_handoff_at is None:
         return False
-    from edr_triage.classifier import classify as _classify_hs
+    from edr_triage.classifier import memory_alert_type as _classify_hs
     cfg = get_edr_config()
     l1_comment, _, _ = _extract_all_comments(fields, bot_email=cfg.jira_email or "")
     alert_type = _classify_hs(shadow.alert_name)
@@ -440,7 +543,7 @@ async def _handle_l2_handoff(jira_key: str, fields: dict, analyst_id: str, analy
         # the review queue reading "AI: AUTO_CLOSED_FP" long after the agent had
         # re-triaged to NEEDS_L2. Stale provenance on a queue an analyst is using to
         # adjudicate AI-vs-human splits is worse than no provenance.
-        from edr_triage.classifier import classify as _classify_hs
+        from edr_triage.classifier import memory_alert_type as _classify_hs
         _at = _classify_hs(shadow.alert_name)
         if _at != "skip":
             await _write_l2_handoff_memory(shadow, l1_comment, _at)
@@ -456,13 +559,203 @@ async def _handle_l2_handoff(jira_key: str, fields: dict, analyst_id: str, analy
 
     logger.info("L2 handoff %s: analyst=%s", jira_key, analyst_name)
 
-    from edr_triage.classifier import classify
+    from edr_triage.classifier import memory_alert_type as classify
     alert_type = classify(shadow.alert_name)
     if alert_type == "skip":
         return True
 
     await _write_l2_handoff_memory(shadow, l1_comment, alert_type)
     return True
+
+
+async def _mark_duplicate_resolved(jira_key: str, fields: dict) -> bool:
+    """Stamp a Duplicate-closed ticket as resolved WITHOUT scoring it.
+
+    Two things are deliberately separate here:
+
+      * RESOLUTION is stamped, so check_concurrent_alerts stops counting this ticket as
+        an open concurrent alert. That is the bug fix — see _DUPLICATE_STATE.
+      * The VERDICT is left alone. l1_triage_class and verdict_match stay untouched, so
+        the row is not added to the accuracy denominator and no existing score is
+        altered. Closing as Duplicate is not a determination, and inventing one would
+        put a verdict the analyst never gave into the metric.
+
+    Idempotent: an already-stamped ticket is left as-is and reports no work done.
+    """
+    from datetime import datetime
+    from entity_graph.models import ShadowResult
+
+    shadow = await (
+        ShadowResult.find(ShadowResult.jira_key == jira_key)
+        .sort(-ShadowResult.created_at).first_or_none()
+    )
+    if shadow is None:
+        # Closed as Duplicate before triage ever ran — there is no row to stamp, and
+        # nothing counts it as concurrent either. Nothing to do.
+        logger.debug("Duplicate %s: no shadow row (closed before triage)", jira_key)
+        return False
+
+    if shadow.l1_resolved_at is not None or shadow.l2_resolved_at is not None:
+        return False
+
+    assignee = fields.get("assignee") or {}
+    analyst_id = assignee.get("accountId", "") or assignee.get("emailAddress", "")
+
+    now = datetime.utcnow()
+    shadow.l1_resolved_at = now
+    shadow.l1_analyst_id = analyst_id or "unknown"
+    # Why it resolved, not just that it did. l1_resolved_at alone is ambiguous: a row
+    # carrying it with verdict_match still None is indistinguishable from one still
+    # awaiting a human, so these were reported as "pending review" indefinitely. This
+    # marker lets the report say "resolved as duplicate, never scoreable" instead —
+    # transparency about what the denominator excludes, not a change to any score.
+    shadow.duplicate_at = now
+    # check_concurrent_alerts counts a sibling as open unless l2_resolved_at is set, OR
+    # l1_resolved_at is set with NO l1_handoff_at. A ticket that reached L2 and was then
+    # closed as Duplicate therefore needs the L2 stamp as well, or l1_resolved_at alone
+    # would not exclude it and the phantom-open sibling would survive this fix.
+    if shadow.l1_handoff_at is not None:
+        shadow.l2_resolved_at = now
+    await shadow.save()
+
+    logger.info("Duplicate %s: stamped resolved (not scored) — analyst=%s, via_l2=%s",
+                jira_key, analyst_id or "unknown", shadow.l1_handoff_at is not None)
+    return True
+
+
+async def _mark_autonomous_resolved(shadow, jira_key: str) -> bool:
+    """A ticket RAPTOR closed itself: stamp it resolved, record NO verdict, write NO memory.
+
+    Mirrors _mark_duplicate_resolved. Resolution is stamped so check_concurrent_alerts
+    stops counting the ticket as open, and returning True lets the dispatcher re-trigger
+    anything this ticket was blocking. The verdict is left alone: no human has decided
+    anything, so there is nothing to score and nothing to learn — the autoclose report's
+    reopen signal is what reviews these. If a human later reopens and closes it, that
+    close is attributed to them and scored normally (l2_resolved_at stays unset here
+    unless the ticket had already been handed to L2).
+
+    Idempotent: an already-stamped ticket reports no work done.
+    """
+    from datetime import datetime
+
+    if shadow.autonomous_closed_at is not None and shadow.l1_resolved_at is not None:
+        return False
+    now = datetime.utcnow()
+    if shadow.autonomous_closed_at is None:
+        shadow.autonomous_closed_at = now
+    if shadow.l1_resolved_at is None:
+        shadow.l1_resolved_at = now
+    if shadow.l1_handoff_at is not None and shadow.l2_resolved_at is None:
+        shadow.l2_resolved_at = now
+    await shadow.save()
+    logger.info("Autonomous close %s: stamped resolved (not scored, no memory) — ai=%s",
+                jira_key, shadow.ai_triage_class)
+    return True
+
+
+_ZERO_RESULT_RE = re.compile(r"^\s*0\s+(?:rows?|events?)\b", re.I)
+
+
+def _tool_call_corroborates(result: str) -> bool:
+    """True when a STORED (already-summarized) tool-call result is an actual,
+    informative answer rather than an error or a genuinely empty hunt/query.
+
+    Conservative on purpose: entity-context and VT-style calls always corroborate
+    once they complete — "not seen before" and "0/91 clean" are both real, definitive
+    answers, not a failure to find something. A hunt/query returning literally "0
+    rows"/"0 events" does not — there's nothing there to corroborate with. Anything
+    unrecognized falls through to True as well UNLESS it starts with "ERROR" — the
+    bias here is toward NOT flagging a close as thin on a false negative, since the
+    two things that must never be silently missed are an actual error and a hunt that
+    came back with nothing at all; everything else reads as it says.
+    """
+    r = (result or "").strip()
+    if not r or r.upper().startswith("ERROR"):
+        return False
+    return not _ZERO_RESULT_RE.match(r)
+
+
+def _rj_close_is_thin(shadow) -> str:
+    """Why an RJ-verdict ticket's closure rests on thin evidence, or "" if it doesn't.
+
+    Scope decision: L1 closing a WELL-EVIDENCED single-actor RJ ticket directly is
+    fine (e.g. DEMO-109425 — 5 tool calls, several returning real data) — this is not
+    a blanket "every RJ needs L2" rule. What must route to L2 is a close where the
+    justification is the ONLY thing supporting it. Either prong below is sufficient:
+
+      1. An actor on a multi-actor incident was never addressed by this ask — a
+         justification from one actor cannot cover another's separate activity
+         (DEMO-109720). Reuses agent_core.loop._unaddressed_actors against the
+         persisted actor_hosts/reasoning; no `actor_justification_hits` is available
+         at close time (that's only computed live, during the agent run), so this
+         check is slightly more conservative here than at triage time — consistent
+         with biasing toward L2 rather than away from it.
+      2. Fewer than the same _CORROBORATING_HUNTS_REQUIRED tool calls the agent's own
+         auto-close gate already requires returned real data.
+    """
+    from agent_core.loop import _unaddressed_actors, _CORROBORATING_HUNTS_REQUIRED
+
+    _evidence_stub = {"actor_hosts": getattr(shadow, "actor_hosts", None) or []}
+    _unaddressed = _unaddressed_actors(_evidence_stub, shadow.ai_reasoning or "")
+    if _unaddressed:
+        return (f"multi-actor incident — actor(s) {', '.join(_unaddressed)} were never "
+                "addressed by this justification request")
+
+    _calls = getattr(shadow, "ai_tool_calls", None) or []
+    _corroborating = sum(
+        1 for tc in _calls
+        if isinstance(tc, dict) and _tool_call_corroborates(tc.get("result", ""))
+    )
+    if _corroborating < _CORROBORATING_HUNTS_REQUIRED:
+        return (f"only {_corroborating} tool call(s) returned real data — the "
+                "justification is the only thing actually supporting this close")
+    return ""
+
+
+async def _route_thin_rj_to_l2(jira_key: str, fields: dict, shadow, justification: str,
+                               reason: str) -> None:
+    """A REQUEST_JUSTIFICATION ticket closed on thin evidence — route to L2 instead of
+    letting the close stand. Reuses chase_reply_poller's exact pattern (comment +
+    allowlist-gated transition) rather than reimplementing it: same target status,
+    same safety property — the transition is keyed on the DESTINATION status, not a
+    transition name that could be silently repointed by an unrelated workflow edit.
+
+    One-time ROUTING correction, not enforcement: _handle_l2_handoff stamps
+    l1_handoff_at, so this cannot fire twice on the same ticket — an L1 who disagrees
+    and closes it again will have that close stand. That is intentional under the
+    "only when evidence is thin" scope decision: it forces the thin case to be SEEN by
+    L2 once; it does not overrule a human twice.
+
+    Note: this stamps shadow.l1_triage_class = "NEEDS_L2" via _handle_l2_handoff even
+    though L1 actually attempted a direct FP/TP close, not a genuine escalation — a
+    minor provenance inaccuracy (affects L1 analyst-quality scoring only, never
+    verdict_match) accepted in exchange for reusing the existing, already-idempotent
+    handoff path rather than duplicating its memory-writing/classification logic.
+    """
+    from edr_triage.chase_reply_poller import _transition_to
+    from edr_triage.jira_handler import add_comment
+
+    cfg = get_edr_config()
+    packet = (
+        "*RAPTOR — thin-evidence justification, routed to L2*\n\n"
+        f"*Why this wasn't accepted as a direct close:* {reason}.\n\n"
+        + (f"*Business justification on file:*\n{{quote}}{justification}{{quote}}\n\n"
+           if justification else "")
+        + "*Status of this evidence:* UNVERIFIED SELF-REPORT, and it is the ONLY thing "
+        "supporting this close — there is no independent technical corroboration on "
+        "record. Re-validate before closing.\n\n"
+        f"*Ticket moved to L2 Analysis required.* RAPTOR has not closed or resolved "
+        f"{jira_key} and cannot — it may only route. The verdict is L2's.\n\n"
+        "[RAPTOR — automated thin-evidence RJ routing]"
+    )
+    await add_comment(jira_key, packet, cfg)
+    moved = await _transition_to(jira_key, "L2 Analysis required", cfg)
+    logger.info("thin-RJ routing %s: reason=%r transitioned=%s", jira_key, reason, moved)
+
+    assignee = fields.get("assignee") or {}
+    analyst_id = assignee.get("accountId", "") or assignee.get("emailAddress", "") or "unknown"
+    analyst_name = assignee.get("displayName", analyst_id)
+    await _handle_l2_handoff(jira_key, fields, analyst_id, analyst_name)
 
 
 async def _handle_l2_resolution(
@@ -491,6 +784,47 @@ async def _handle_l2_resolution(
         logger.debug("L2 resolution %s — alert '%s' is under test, skipping scoring",
                      jira_key, shadow.alert_name)
         return False
+
+    # Who made the terminal transition. RAPTOR's own closes land on False Positive just
+    # like a human's, and this handler used to treat them identically: it recorded the
+    # bot's FP as the L1 verdict, scored verdict_match=True (the AI agreeing with
+    # itself), and wrote a CURATED "analyst" memory at ~0.80 confidence. That memory then
+    # came back through entity recall as a prior verdict, so the next day's close cited
+    # it — the self-reinforcing precedent in the AWS credential-abuse family (by DEMO-114642
+    # every "prior occurrence" was a RAPTOR auto-close). `None` = could not be established:
+    # proceed exactly as before, so a Jira hiccup never drops a real human verdict.
+    from edr_triage.jira_handler import last_status_author
+    _closer = await last_status_author(jira_key, ("false positive", "closed", "resolved"), cfg)
+    if _closer and _closer == (cfg.jira_email or "").lower():
+        if not shadow:
+            # No row to stamp — and the no-shadow branch below would write an "L1-only"
+            # memory from what is really RAPTOR's own close.
+            return False
+        return await _mark_autonomous_resolved(shadow, jira_key)
+    # Same for a ticket Claude closed in bulk from an operator's account: an AI close,
+    # not that operator's verdict, so it is stamped resolved but never scored or learned.
+    from edr_triage.config import BULK_CLOSE_LABEL
+    if BULK_CLOSE_LABEL in (fields.get("labels") or []):
+        if not shadow:
+            return False
+        return await _mark_autonomous_resolved(shadow, jira_key)
+
+    # A REQUEST_JUSTIFICATION ticket closing directly (never through L2) is fine when
+    # well-evidenced — this is NOT a blanket "every RJ needs L2" rule, only ones that
+    # rest on the justification alone. See _rj_close_is_thin.
+    # `l1_handoff_at is None` is what makes this fire at most once — but that stamp is
+    # lost whenever a poll misses the L2-status window (see went_through_l2 below), and
+    # a lost stamp here does not just mis-label provenance: it transitions a ticket L2
+    # has already closed back into "L2 Analysis required". The thread is checked too so
+    # the one-shot guarantee rests on a signal that survives a missed poll.
+    if (shadow and shadow.ai_triage_class == "REQUEST_JUSTIFICATION"
+            and shadow.l1_handoff_at is None
+            and not _thread_shows_l2(comment)
+            and final_class in ("AUTO_CLOSED_FP", "AUTO_CLOSED_TP")):
+        _thin = _rj_close_is_thin(shadow)
+        if _thin:
+            await _route_thin_rj_to_l2(jira_key, fields, shadow, justification, _thin)
+            return False
 
     if shadow:
         # Re-score an already-resolved ticket ONLY when its verdict_match was cleared —
@@ -539,7 +873,19 @@ async def _handle_l2_resolution(
             logger.debug("L2 resolution %s — already resolved, skipping", jira_key)
             return False
 
-        went_through_l2 = shadow.l1_handoff_at is not None
+        # Fall back to the comment thread when the handoff stamp is missing. The stamp
+        # requires a poll to land inside the (single, 5-minute) window in which the
+        # ticket sat in "L2 ANALYSIS REQUIRED" with a fresh `updated`; the JQL lookback
+        # equals the poll interval and the sleep runs AFTER the work, so every cycle
+        # leaves an uncovered gap the width of its own processing time and a one-off
+        # transition can fall straight through it. DEMO-111116 was escalated by L1 at
+        # 17:07 on 2026-08-31, untouched until L2 closed it FP the next morning: with
+        # the stamp missed, close-time took the no-L2 branch and wrote a memory reading
+        # "L1: AUTO_CLOSED_FP" with no l2_comment, credited the L2 as the L1 analyst,
+        # and scored no escalation precision for the L1 who actually escalated.
+        # `_write_direct_memory` already reads L2 off the thread this way; this puts the
+        # shadow path on the same durable signal.
+        went_through_l2 = shadow.l1_handoff_at is not None or _thread_shows_l2(comment)
 
         shadow.l2_triage_class = final_class
         shadow.l2_analyst_id = analyst_id or "unknown"
@@ -621,7 +967,7 @@ async def _handle_l2_resolution(
                 was_correct=(final_class == "AUTO_CLOSED_TP"),
             )
 
-        from edr_triage.classifier import classify
+        from edr_triage.classifier import memory_alert_type as classify
         alert_type = classify(shadow.alert_name)
         if alert_type == "skip":
             return False
@@ -648,12 +994,29 @@ async def _handle_l2_resolution(
             await _write_verdict_memory(shadow, final_class, analyst_id,
                                         l1_comment=comment, alert_type=alert_type,
                                         justification=justification)
+
+        # Reinforce / contradict existing memories — but only on a HUMAN verdict.
+        # Status alone cannot say who closed it: RAPTOR's own autonomous closes land on
+        # False Positive too, and feeding those back would let every close reinforce the
+        # memory that produced it. Unknown closer -> skip; never assume human.
+        try:
+            from edr_triage.classifier import alert_subtype
+            from entity_graph.memory import reconcile_human_verdict
+            if _closer and _closer != (cfg.jira_email or "").lower():
+                _rec = await reconcile_human_verdict(
+                    [alert_type, alert_subtype(shadow.alert_name)],
+                    shadow.user_name or "", shadow.device_name or "", final_class, jira_key)
+                if _rec["refreshed"] or _rec["demoted"]:
+                    logger.info("memory reconcile %s (%s by %s): %s",
+                                jira_key, final_class, _closer, _rec)
+        except Exception as exc:
+            logger.warning("memory reconcile skipped for %s: %s", jira_key, exc)
     else:
         if not comment.strip():
             logger.debug("Skipping %s — no ShadowResult and no comment", jira_key)
             return False
         summary = (fields.get("summary") or "").strip()
-        from edr_triage.classifier import classify
+        from edr_triage.classifier import memory_alert_type as classify
         alert_type = classify(summary)
         if alert_type in ("generic", "skip"):
             logger.debug("Skipping %s — no ShadowResult and alert_type=%s (%s)", jira_key, alert_type, summary[:60])
@@ -763,14 +1126,14 @@ def _extract_all_comments(fields: dict, bot_email: str = "") -> tuple[str, str, 
         # one: it is evidence the justification loop ran, and never on its own a reason
         # to close anything.
         #
-        # role == "user" alone counts, not just the keyword regex: an actor once replied
-        # with a full explanation (a baseline-scope change that broke an existing MFA
-        # bypass, requiring a second one) after L2 asked "can you confirm this activity"
-        # — never once saying the word "justification", so the regex alone missed it and
-        # a genuinely-settled REQUEST_JUSTIFICATION scored as a miss. Anyone who isn't a
-        # registered L1/L2 analyst commenting on a ticket IS the justification loop
-        # completing, by construction — the specific phrasing was never the thing that
-        # mattered.
+        # role == "user" alone counts, not just the keyword regex: DEMO-108035's actor
+        # replied with a full explanation (a Microsoft Graph baseline-scope change that
+        # broke an existing MFA bypass, requiring a second one) after L2 asked "can you
+        # confirm this activity" — he never once said the word "justification", so the
+        # regex alone missed it and a genuinely-settled REQUEST_JUSTIFICATION scored as
+        # a miss. Anyone who isn't a registered L1/L2 analyst commenting on a ticket IS
+        # the justification loop completing, by construction — the specific phrasing was
+        # never the thing that mattered.
         if role == "user" or _JUSTIFICATION_PROVIDED_RE.search(_fold_punct(text)):
             just_parts.append(f"[{role} — {display}] {text}")
 
@@ -886,6 +1249,8 @@ async def _write_l2_handoff_memory(shadow, l1_comment: str, alert_type: str) -> 
             l1_comment=l1_comment,
             actor=shadow.user_name or "",
             device=shadow.device_name or "",
+            actors=[g.get("actor", "") for g in (getattr(shadow, "actor_hosts", None) or [])
+                    if isinstance(g, dict) and g.get("actor")],
         )
 
 
@@ -930,13 +1295,13 @@ async def _write_verdict_memory(shadow, l1_triage_class: str, analyst_id: str,
     # comment truncation below and is surfaced first on recall. The label makes clear
     # it is NOT a basis for auto-closing a future occurrence.
     #
-    # 200 chars cut the substance out of most real justifications, keeping only a head
-    # fragment plus the concluding verdict sentence (a hardening-audit explanation —
-    # config/logs only — was replaced by "...we are required to provid … Therefore, we
-    # are classifying this as a false positive", losing exactly the content a future
-    # similar alert needs). This is the one piece of context specifically meant to
-    # inform reasoning on a NEXT occurrence, so it gets real budget instead of the
-    # comment-log truncation.
+    # 200 chars cut the substance out of most real justifications, keeping only a
+    # head fragment plus the concluding verdict sentence (DEMO-108122: Sravan's actual
+    # explanation — a SQL Server hardening audit script, config/logs only — was
+    # replaced by "...we are required to provid … Therefore, we are classifying this
+    # as a false positive", losing exactly the content a future similar alert needs).
+    # This is the one piece of context specifically meant to inform reasoning on a
+    # NEXT occurrence, so it gets real budget instead of the comment-log truncation.
     _just = (f"[PRIOR BUSINESS JUSTIFICATION — context only, re-validate each occurrence, "
              f"NOT exculpatory on its own]: {verdict_aware_truncate(justification, 800)}\n"
              if justification else "")
@@ -983,6 +1348,8 @@ async def _write_verdict_memory(shadow, l1_triage_class: str, analyst_id: str,
             l1_comment=l1_comment,
             actor=shadow.user_name or "",
             device=shadow.device_name or "",
+            actors=[g.get("actor", "") for g in (getattr(shadow, "actor_hosts", None) or [])
+                    if isinstance(g, dict) and g.get("actor")],
         )
 
 
@@ -1126,7 +1493,7 @@ async def _write_direct_memory(jira_key: str, summary: str, final_class: str,
     from entity_graph.graph import upsert_entity
     from edr_triage.store import get_alert_by_jira_key
 
-    went_l2 = "[L2 —" in attributed_comment or "[L2 -" in attributed_comment
+    went_l2 = _thread_shows_l2(attributed_comment)
     verdict_line = (
         f"L2: {final_class} (escalated by L1)" if went_l2 else f"L1: {final_class}"
     )
@@ -1134,7 +1501,7 @@ async def _write_direct_memory(jira_key: str, summary: str, final_class: str,
     # survives truncation and surfaces on recall, labelled so it never drives auto-close.
     # Same 800-char budget as _write_verdict_memory — this is the one field meant to
     # inform reasoning on a FUTURE similar alert, so it gets real room instead of the
-    # comment-log truncation.
+    # comment-log truncation (DEMO-108122).
     _just = (f"[PRIOR BUSINESS JUSTIFICATION — context only, re-validate each occurrence, "
              f"NOT exculpatory on its own]: {verdict_aware_truncate(justification, 800)}\n"
              if justification else "")
@@ -1182,11 +1549,25 @@ async def _write_direct_memory(jira_key: str, summary: str, final_class: str,
 
 
 async def run_forever(interval_seconds: int = 300) -> None:
-    """Run the closure poller in a loop. Called from main app startup."""
-    logger.info("Jira closure poller started (interval=%ds)", interval_seconds)
+    """Run the closure poller in a loop. Called from main app startup.
+
+    The lookback deliberately EXCEEDS the interval. `sleep` runs after `poll_once`, so
+    consecutive polls are `interval + work` apart while each looks back a fixed window —
+    with the two equal, every cycle leaves an uncovered gap as wide as its own
+    processing time, and `_retrigger_dependents` runs full re-triages inside a cycle, so
+    that is seconds to minutes, not milliseconds. A status transition landing in the gap
+    is never seen, and for the L2 handoff that loss is permanent (DEMO-111116). Overlap
+    is the cheap side of the trade and is safe: every handler is idempotent — the
+    handoff re-stamp is guarded (`l1_handoff_at is not None` → refresh only), the
+    resolution early-returns on an already-scored row, and the awaiting-inputs and
+    duplicate paths only refresh/stamp.
+    """
+    lookback_minutes = max(5, (interval_seconds // 60) * 3)
+    logger.info("Jira closure poller started (interval=%ds, lookback=%dm)",
+                interval_seconds, lookback_minutes)
     while True:
         try:
-            await poll_once()
+            await poll_once(lookback_minutes=lookback_minutes)
         except Exception as exc:
             logger.error("Closure poller cycle failed: %s", exc)
         await asyncio.sleep(interval_seconds)

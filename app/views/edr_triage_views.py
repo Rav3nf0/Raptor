@@ -18,7 +18,7 @@ import logging
 import os
 import re
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Body
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Body, Request
 from fastapi.responses import HTMLResponse
 
 logger = logging.getLogger(__name__)
@@ -135,14 +135,14 @@ _test_state: dict = {"running": False, "results": None, "started_at": None, "fin
 _synthetic_state: dict = {"running": False, "result": None, "error": None}
 
 _SYNTHETIC_TICKET = {
-    "jira_key":   "DEMO-9001",
+    "jira_key":   "TEST-AGENT-001",
     "alert_id":   "da637000000000000_test",
     "alert_name": "Suspicious PowerShell encoded command execution",
-    "description": "MDE Alert: Suspicious PowerShell encoded command execution\nDevice: WKSTN-4471\nUser: alice.chen@example.com",
+    "description": "MDE Alert: Suspicious PowerShell encoded command execution\nDevice: TEST-DEVICE-AGENTLOOP\nUser: test.user@example.com",
     "severity":   "Medium",
     "tactics":    "Execution",
-    "device_name": "WKSTN-4471",
-    "user_name":  "alice.chen@example.com",
+    "device_name": "TEST-DEVICE-AGENTLOOP",
+    "user_name":  "test.user@example.com",
     "incident_url": "",
     "is_sentinel": False,
     "observe_only": False,
@@ -209,13 +209,26 @@ async def edr_run_ticket(
     background_tasks: BackgroundTasks,
     force: bool = False,
     force_agent: bool = False,
+    temperature: float | None = None,
+    stream_progress: bool = False,
 ):
     """Fetch a real Jira ticket and run it through the full pipeline (dry_run=True).
 
-    force=true       clears the dedup record so a previously-processed ticket reruns.
-    force_agent=true runs the agent loop (Bedrock/Mistral) for THIS ticket even when
-                     USE_AGENT_LOOP is globally off — realistic single-ticket test.
+    force=true            clears the dedup record so a previously-processed ticket reruns.
+    force_agent=true      runs the agent loop (Bedrock/Mistral) for THIS ticket even when
+                          USE_AGENT_LOOP is globally off — realistic single-ticket test.
+    temperature=N         pin sampling temperature for THIS run only, leaving every other
+                          alert on the deployed BEDROCK_TEMPERATURE. This is how a
+                          temperature change gets measured (scripts/verdict_stability.py)
+                          without a global config flip that would hit live traffic.
+                          Omit it and behaviour is identical to before.
+    stream_progress=true  write live step-by-step progress to Mongo as the agent works,
+                          pollable via GET /api/edr-triage/progress/{jira_key} — for
+                          watching ONE ticket run in real time. Omit it (default false)
+                          and behaviour is identical to before this existed.
     """
+    if temperature is not None and not 0.0 <= temperature <= 1.0:
+        return {"status": "error", "detail": "temperature must be between 0.0 and 1.0"}
     if _ticket_run_state["running"]:
         return {"status": "already_running", "jira_key": _ticket_run_state["jira_key"]}
     if force:
@@ -234,8 +247,10 @@ async def edr_run_ticket(
         running=True, jira_key=jira_key, result=None, error=None,
         started_at=_dt.datetime.utcnow().isoformat(), finished_at=None,
     )
-    background_tasks.add_task(_run_ticket_bg, jira_key, force_agent)
-    return {"status": "started", "jira_key": jira_key, "force": force, "force_agent": force_agent}
+    background_tasks.add_task(_run_ticket_bg, jira_key, force_agent, temperature, stream_progress)
+    return {"status": "started", "jira_key": jira_key, "force": force,
+            "force_agent": force_agent, "temperature": temperature,
+            "stream_progress": stream_progress}
 
 
 @router.get("/api/edr-triage/shadows")
@@ -416,6 +431,7 @@ async def edr_agent_probe(background_tasks: BackgroundTasks):
     result: dict = {}
     try:
         import agent_tools.virustotal  # noqa
+        import agent_tools.abuseipdb   # noqa
         import agent_tools.mde         # noqa
         import agent_tools.sentinel    # noqa
         import agent_tools.scg         # noqa
@@ -506,6 +522,7 @@ async def edr_shadow_result(jira_key: str):
             # from the API — the question DEMO-107416 raised.
             "user_name": getattr(shadow, "user_name", ""),
             "additional_users": getattr(shadow, "additional_users", []) or [],
+            "actor_hosts": getattr(shadow, "actor_hosts", []) or [],
             "device_name": getattr(shadow, "device_name", ""),
             "ai_triage_class": shadow.ai_triage_class,
             "ai_confidence": shadow.ai_confidence,
@@ -519,6 +536,26 @@ async def edr_shadow_result(jira_key: str):
             "safety_block_reason": getattr(shadow, "safety_block_reason", ""),
             "pre_safety_class": getattr(shadow, "pre_safety_class", ""),
             "verdict_match": getattr(shadow, "verdict_match", None),
+            # Which alert this row is for. Absent until now, so "what family is this?"
+            # meant cross-referencing the /shadows listing for a single ticket.
+            "alert_name": getattr(shadow, "alert_name", ""),
+            # How the DLP evidence was bound, and the event identity derived from it.
+            # "alert" = the alert's own matched rows; "window_sweep" = the fallback,
+            # whose rows are NOT established to be this alert's. The two are otherwise
+            # indistinguishable from the outside — a sweep narrowed by user_hint returns
+            # one user and one event, exactly like a correct bind — which is what made
+            # DEMO-110937's wrong user (bound jules.menon; the alert was about
+            # v-zane.kaur) impossible to diagnose from the API.
+            "dlp_bind_source": getattr(shadow, "dlp_bind_source", ""),
+            "dlp_bind_alert_id": getattr(shadow, "dlp_bind_alert_id", ""),
+            "dlp_bound_users": getattr(shadow, "dlp_bound_users", []) or [],
+            # Asset ownership. On the READ path as well as the write one — dlp_bind_source
+            # and finding_group_id were both added to the model and the writer but not
+            # here, and came back None from an endpoint that returns a curated dict.
+            "asset_tribe": getattr(shadow, "asset_tribe", "") or "",
+            "asset_owners": getattr(shadow, "asset_owners", []) or [],
+            "finding_group_id": getattr(shadow, "finding_group_id", ""),
+            "duplicate_of": getattr(shadow, "duplicate_of", ""),
             "created_at": shadow.created_at.isoformat(),
             "retriaged_at": _iso(getattr(shadow, "retriaged_at", None)),
             # Human verdict + closure stamps. These decide whether the
@@ -530,6 +567,10 @@ async def edr_shadow_result(jira_key: str):
             "l1_analyst_id": getattr(shadow, "l1_analyst_id", None),
             "l1_resolved_at": _iso(getattr(shadow, "l1_resolved_at", None)),
             "l1_handoff_at": _iso(getattr(shadow, "l1_handoff_at", None)),
+            # When L1 opened the business-justification loop. The only record that L1
+            # chose to ASK rather than escalate or close, and what lets an agent
+            # REQUEST_JUSTIFICATION be scored as agreeing with L1.
+            "l1_awaiting_inputs_at": _iso(getattr(shadow, "l1_awaiting_inputs_at", None)),
             "l2_triage_class": getattr(shadow, "l2_triage_class", None),
             "l2_resolved_at": _iso(getattr(shadow, "l2_resolved_at", None)),
         }
@@ -565,6 +606,203 @@ async def edr_blank_retriage(apply: bool = False):
     out["min_age_minutes"] = MIN_AGE_MINUTES
     out["max_per_cycle"] = MAX_PER_CYCLE
     return out
+
+
+@router.get("/api/edr-triage/gate-retriage")
+async def edr_gate_retriage(apply: bool = False):
+    """Tickets a deterministic safety gate escalated on an evidence gap (multi-host,
+    grounding-check, concurrency-check-missing, evidence-floor, hunt-errored) and are now
+    past the placeholder age window.
+
+    READ-ONLY unless apply=true — mirrors GET /api/edr-triage/blank-retriage exactly.
+    Shows exactly what the background sweep would re-triage, so the eligible RATE is
+    visible even while EDR_GATE_RETRIAGE is off — this is the measurement step the
+    rollout plan calls for before enabling real spend.
+    """
+    from edr_triage.gate_retriage import (
+        sweep_once, GATE_RETRIAGE_MIN_AGE_MINUTES, MAX_PER_CYCLE, RETRY_ELIGIBLE_KINDS,
+    )
+    out = await sweep_once(dry_run=not apply)
+    out["min_age_minutes"] = GATE_RETRIAGE_MIN_AGE_MINUTES
+    out["max_per_cycle"] = MAX_PER_CYCLE
+    out["retry_eligible_kinds"] = sorted(RETRY_ELIGIBLE_KINDS)
+    return out
+
+
+@router.get("/api/edr-triage/autoclose-report")
+async def edr_autoclose_report(lookback_days: int = 30):
+    """Every ticket RAPTOR closed BY ITSELF, and whether a human overturned it.
+
+    Distinct from /fp-report, and the distinction is the point. `fp-report` covers what
+    the agent RECOMMENDED — in copilot phase a human still did the closing, so those
+    tickets were all reviewed by someone before they closed. This endpoint covers the
+    subset RAPTOR actually closed, which is the only subset nobody looked at first. That
+    is why it exists: the accepted safety position is not that RAPTOR never closes
+    wrongly, but that an occasional wrong close is tolerable BECAUSE L2 sees every close.
+
+    Attribution is by changelog author, never by label: `ai-fp` only records the agent's
+    verdict. A `-> False Positive` transition authored by the bot account is the only
+    evidence RAPTOR did the closing.
+
+    Read-only. The overturn signal is the reopen (`False Positive -> Event Analysis`),
+    which needs no label and no review click. But read `unreviewed_beyond_threshold`
+    alongside `overturned`: a reopen detects DISAGREEMENT, not diligence, so zero
+    overturns is ambiguous between "all correct" and "nobody looked".
+
+    Saved-filter equivalent for the Jira side:
+        project = SIM AND labels = "ai-fp" AND status = "False Positive"
+        ORDER BY resolutiondate DESC
+    """
+    from edr_triage.autoclose_report import poll_once
+    return await poll_once(lookback_days=lookback_days)
+
+
+@router.get("/api/edr-triage/residual-report")
+async def edr_residual_report(days: int = 7):
+    """Tickets RAPTOR left for an analyst — no close, no ask, no route — per day and family.
+
+    Recorded by pipeline._handle_residual (EDR_RESIDUAL=record), which writes nothing to
+    the ticket. Read-only."""
+    import time as _time
+    from collections import Counter, defaultdict
+    from datetime import datetime, timedelta
+
+    from edr_triage import store
+    days = max(1, min(int(days or 7), 90))
+    rows = store.list_residual(_time.time() - days * 86400)
+    by_day: Counter = Counter()
+    by_family: Counter = Counter()
+    fam_day: dict = defaultdict(Counter)
+    for r in rows:
+        d = (datetime.utcfromtimestamp(r.get("noted_at") or 0) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
+        by_day[d] += 1
+        by_family[r.get("family") or r.get("alert_name") or "?"] += 1
+        fam_day[r.get("family") or "?"][d] += 1
+    n_days = max(1, len(by_day))
+    return {
+        "days": days, "total": len(rows),
+        "per_day_avg": round(len(rows) / n_days, 1),
+        "by_day_ist": dict(sorted(by_day.items())),
+        "by_family": [{"family": f, "tickets": n, "per_day": round(n / n_days, 1)}
+                      for f, n in by_family.most_common()],
+        "recent": sorted(rows, key=lambda r: -(r.get("noted_at") or 0))[:50],
+    }
+
+
+@router.get("/api/edr-triage/fp-report")
+async def edr_fp_report(days: int = 7):
+    """Every alert the agent judged AUTO_CLOSED_FP in the window — the weekly review
+    pack for L2 and management.
+
+    WORDING MATTERS HERE and the report says it out loud: in the default `copilot`
+    phase the agent does NOT close anything. The deterministic playbook owns every
+    ticket state change and the agent's verdict is an advisory comment plus a
+    `raptor-rec-*` label. So this is "the agent RECOMMENDED false-positive", and the
+    ticket's real outcome is reported beside it. Only in `autonomous` does the agent's
+    verdict drive closure. Describing copilot output as "closed by AI" to management
+    would misstate what the system is doing.
+
+    Three groups, because they need different attention:
+      agreed     — a human reached the same verdict. The track record.
+      overturned — a human disagreed. THE ONES L2 MUST SPOT-CHECK: each is a case where
+                   the agent would have closed something a human did not consider closed.
+      pending    — not yet resolved by a human, so not yet scoreable either way.
+    """
+    from datetime import datetime, timedelta
+
+    from entity_graph.models import ShadowResult
+
+    try:
+        _cut = datetime.utcnow() - timedelta(days=max(1, days))
+        rows = await ShadowResult.find(
+            ShadowResult.ai_triage_class == "AUTO_CLOSED_FP",
+            ShadowResult.ai_error == None,          # noqa: E711
+            ShadowResult.created_at >= _cut,
+        ).sort(-ShadowResult.created_at).to_list()
+
+        agreed, overturned, pending, duplicate = [], [], [], []
+        for r in rows:
+            human = (getattr(r, "l2_triage_class", None)
+                     or getattr(r, "l1_triage_class", None) or "")
+            item = {
+                "jira_key": r.jira_key,
+                "alert_name": r.alert_name,
+                "user_name": getattr(r, "user_name", "") or "",
+                "device_name": getattr(r, "device_name", "") or "",
+                "confidence": round(getattr(r, "ai_confidence", 0.0) or 0.0, 2),
+                "phase": getattr(r, "phase", "") or "",
+                "human_verdict": human,
+                "l1_verdict": getattr(r, "l1_triage_class", None) or "",
+                "l2_verdict": getattr(r, "l2_triage_class", None) or "",
+                "verdict_match": getattr(r, "verdict_match", None),
+                "reasoning": (getattr(r, "ai_reasoning", "") or "")[:400],
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            if r.verdict_match is True:
+                agreed.append(item)
+            elif r.verdict_match is False:
+                overturned.append(item)
+            elif getattr(r, "duplicate_at", None) is not None:
+                # Resolved, but as a duplicate of another ticket — the analyst never said
+                # false positive or true positive, so this can never be scored. Its own
+                # bucket rather than `pending`, which claimed a human still had to look.
+                duplicate.append(item)
+            else:
+                pending.append(item)
+
+        _scored = len(agreed) + len(overturned)
+        _dup_keys = {it["jira_key"] for it in duplicate}
+        by_family: dict = {}
+        for it in agreed + overturned + pending + duplicate:
+            b = by_family.setdefault(it["alert_name"] or "(unknown)",
+                                     {"total": 0, "agreed": 0, "overturned": 0,
+                                      "pending": 0, "duplicate": 0})
+            b["total"] += 1
+            if it["verdict_match"] is True:
+                b["agreed"] += 1
+            elif it["verdict_match"] is False:
+                b["overturned"] += 1
+            elif it["jira_key"] in _dup_keys:
+                b["duplicate"] += 1
+            else:
+                b["pending"] += 1
+
+        return {
+            "window_days": days,
+            "generated_at": datetime.utcnow().isoformat(),
+            # The agent's own phase, so the reader knows whether these were advisory.
+            "agent_phase": _resolve_agent_phase_safe(),
+            "total_fp_verdicts": len(rows),
+            "agreed": len(agreed),
+            "overturned": len(overturned),
+            "pending_human_review": len(pending),
+            # Resolved as a duplicate of another ticket. Reported, never scored: the
+            # analyst said "see the other ticket", which is not a verdict. Previously
+            # counted in pending_human_review, which claimed a human still had to look at
+            # ~14% of all incidents that in fact were already closed.
+            "closed_as_duplicate": len(duplicate),
+            "agreement_rate": round(len(agreed) / _scored, 3) if _scored else None,
+            "by_family": [
+                {"alert_name": k, **v}
+                for k, v in sorted(by_family.items(), key=lambda kv: -kv[1]["total"])
+            ],
+            # Overturned first: it is the section that needs acting on, and a report that
+            # leads with its successes buries the one thing a reviewer must see.
+            "overturned_alerts": overturned,
+            "agreed_alerts": agreed,
+            "pending_alerts": pending,
+            "duplicate_alerts": duplicate,
+        }
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+def _resolve_agent_phase_safe() -> str:
+    try:
+        from edr_triage.pipeline import _resolve_agent_phase
+        return _resolve_agent_phase()
+    except Exception:
+        return "unknown"
 
 
 @router.get("/api/edr-triage/gate-stats")
@@ -678,6 +916,135 @@ async def edr_bedrock_models():
     return result
 
 
+@router.get("/api/edr-triage/upwind-check")
+async def edr_upwind_check(detection_id: str = "uwd-3e95ace03721d158"):
+    """Diagnose the Upwind read API step by step — which step fails, and how.
+
+    Reports config presence (lengths only, never values), then the token request and one
+    detection lookup, each with its HTTP status or the exception it raised. get_detection
+    swallows errors by design (an Upwind outage must not stop triage), so this is where the
+    actual reason is visible.
+    """
+    import base64
+    import json as _json
+    import httpx
+    from edr_triage.config import get_edr_config
+    cfg = get_edr_config()
+    out: dict = {
+        "config": {"client_id_len": len(cfg.upwind_client_id), "client_secret_len": len(cfg.upwind_client_secret),
+                   "org_id_set": bool(cfg.upwind_org_id), "api_base": cfg.upwind_api_base,
+                   "auth_url": cfg.upwind_auth_url, "verify_ssl": cfg.upwind_verify_ssl,
+                   "lookup_disabled": cfg.upwind_lookup_disabled},
+    }
+    if not (cfg.upwind_client_id and cfg.upwind_client_secret):
+        out["result"] = "not configured"
+        return out
+    base = cfg.upwind_api_base.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=20, verify=cfg.upwind_verify_ssl) as client:
+            try:
+                r = await client.post(cfg.upwind_auth_url, data={
+                    "grant_type": "client_credentials", "client_id": cfg.upwind_client_id,
+                    "client_secret": cfg.upwind_client_secret, "audience": base})
+            except Exception as exc:
+                out["token"] = {"error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+                return out
+            out["token"] = {"status": r.status_code}
+            if r.status_code != 200:
+                out["token"]["body"] = r.text[:300]
+                return out
+            tok = r.json().get("access_token", "")
+            try:
+                p = tok.split(".")[1]
+                claims = _json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)))
+                out["token"].update(org_id=claims.get("org_id"), region=claims.get("reg"),
+                                    audience=claims.get("aud"))
+            except Exception:
+                claims = {}
+            org = cfg.upwind_org_id or claims.get("org_id", "")
+            try:
+                d = await client.get(f"{base}/v1/organizations/{org}/threat-detections/{detection_id}",
+                                     headers={"Authorization": f"Bearer {tok}", "Accept": "application/json"})
+            except Exception as exc:
+                out["detection"] = {"error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+                return out
+            out["detection"] = {"status": d.status_code}
+            if d.status_code == 200:
+                body = d.json()
+                out["detection"].update(id=body.get("id"), type=body.get("type"),
+                                        events=sum(len(t.get("events") or []) for t in body.get("triggers") or []))
+            else:
+                out["detection"]["body"] = d.text[:300]
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+    return out
+
+
+def _action_allowed(action: str, perms: list[dict]) -> bool:
+    """Azure RBAC wildcard match: allowed by some actions entry and not removed by its notActions."""
+    import fnmatch
+    a = action.lower()
+    for p in perms:
+        if any(fnmatch.fnmatchcase(a, x.lower()) for x in p.get("actions") or []) and \
+                not any(fnmatch.fnmatchcase(a, x.lower()) for x in p.get("notActions") or []):
+            return True
+    return False
+
+
+@router.get("/api/edr-triage/sentinel-write-check")
+async def edr_sentinel_write_check(days: int = 14):
+    """Read-only: can RAPTOR close Sentinel incidents? (Microsoft Sentinel Responder or more)
+
+    1. Azure's effective-permissions API for RAPTOR's own service principal on the workspace
+       (any caller may read its own) -> whether incidents/write is granted.
+    2. The configured auto-close mode (EDR_SENTINEL_CLOSE) and scope.
+    3. Who closed Sentinel incidents in the last `days`, and how many carry a SIM link,
+       as evidence of what has actually happened. Writes nothing.
+    """
+    import httpx
+    from edr_triage.config import get_edr_config
+    from edr_triage.sentinel_client import _MGMT_API, _VERIFY_SSL, get_management_token
+    from lib.mde_client import _sentinel_query_url, run_sentinel_query
+    cfg = get_edr_config()
+    out: dict = {"close_mode": cfg.sentinel_close_mode, "close_scope": cfg.sentinel_close_scope}
+    qurl = _sentinel_query_url() or ""
+    ws = qurl.split("https://management.azure.com", 1)[-1].split("/api/query", 1)[0]
+    try:
+        token = await get_management_token()
+        if not token:
+            raise RuntimeError("no management token (MDE_* service-principal creds missing?)")
+        async with httpx.AsyncClient(verify=_VERIFY_SSL, timeout=30.0) as c:
+            r = await c.get(f"{_MGMT_API}{ws}/providers/Microsoft.Authorization/permissions",
+                            params={"api-version": "2022-04-01"}, headers={"Authorization": f"Bearer {token}"})
+        if r.status_code != 200:
+            out["permissions_error"] = f"HTTP {r.status_code}: {r.text[:300]}"
+        else:
+            perms = r.json().get("value") or []
+            out["can_read_incidents"] = _action_allowed("Microsoft.SecurityInsights/incidents/read", perms)
+            out["can_write_incidents"] = _action_allowed("Microsoft.SecurityInsights/incidents/write", perms)
+            out["can_comment"] = _action_allowed("Microsoft.SecurityInsights/incidents/comments/write", perms)
+            out["granted_actions"] = sorted({a for p in perms for a in p.get("actions") or []})[:40]
+    except Exception as exc:
+        out["permissions_error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+    d = max(1, min(int(days or 14), 90))
+    kql = (f"SecurityIncident | where TimeGenerated > ago({d}d) "
+           "| summarize arg_max(TimeGenerated, *) by IncidentNumber "
+           "| where Status == 'Closed' "
+           "| extend ByRaptorComment = ClassificationComment has 'SIM-' "
+           "| summarize closed = count(), with_sim_link = countif(ByRaptorComment) by ModifiedBy = tostring(ModifiedBy) "
+           "| top 15 by closed desc")
+    rows, err = await run_sentinel_query(kql)
+    out["closed_by_last_days"] = d
+    out["closed_by"] = rows if not err else []
+    if err:
+        out["closed_by_error"] = str(err)[:300]
+    if "can_write_incidents" in out:
+        out["verdict"] = ("Responder-level access is present: RAPTOR can close incidents."
+                          if out["can_write_incidents"] else
+                          "No incidents/write: RAPTOR cannot close incidents (needs Microsoft Sentinel Responder on the workspace).")
+    return out
+
+
 @router.get("/api/edr-triage/sentinel-check")
 async def edr_sentinel_check():
     """Diagnose the Log Analytics workspace config for sentinel_run_kql.
@@ -708,7 +1075,7 @@ async def edr_sentinel_check():
     # are stored under a nested object rather than flat shadow_sentinel_* keys.
     try:
         from lib.secretsmanager import SecretsManager
-        secret_name = os.getenv("AWS_SECRET_NAME", "")
+        secret_name = os.getenv("AWS_SECRET_NAME", "security/uat/deepintel")
         region = os.getenv("AWS_REGION", "ap-south-1")
         secrets = SecretsManager().get_secrets(secret_name, region)
         out["secret_name_read"] = secret_name
@@ -783,7 +1150,7 @@ async def edr_bedrock_check():
 
 @router.get("/api/edr-triage/bedrock-usage")
 async def edr_bedrock_usage(recent: int = 10):
-    """Month-to-date Bedrock token spend + budget status (the $70 guard).
+    """Month-to-date Bedrock token spend + budget status (the $90 guard).
 
     Returns the running monthly cost, the configured cap, remaining headroom,
     and the most recent per-call usage records.
@@ -942,13 +1309,63 @@ async def edr_run_ticket_status():
     return state
 
 
-async def _run_ticket_bg(jira_key: str, force_agent: bool = False) -> None:
+@router.get("/api/edr-triage/progress/{jira_key}")
+async def edr_triage_progress(jira_key: str):
+    """Live step-by-step progress for a run-ticket call made with stream_progress=true.
+
+    Mongo-backed (see TriageProgress), so this is safe to poll (every 1-2s while
+    status=="running" is a reasonable cadence) regardless of which pod behind the load
+    balancer actually served this request versus the one running the triage. Returns
+    found=False if no such ticket has ever been run with streaming on, or its progress
+    doc was cleared.
+    """
+    from entity_graph.models import TriageProgress
+    doc = await TriageProgress.find_one(TriageProgress.jira_key == jira_key)
+    if not doc:
+        return {"found": False, "jira_key": jira_key}
+    return {
+        "found": True,
+        "jira_key": jira_key,
+        "status": doc.status,
+        "steps": doc.steps,
+        "started_at": doc.started_at.isoformat(),
+        "updated_at": doc.updated_at.isoformat(),
+        "error": doc.error,
+    }
+
+
+async def _run_ticket_bg(jira_key: str, force_agent: bool = False,
+                         temperature: float | None = None,
+                         stream_progress: bool = False) -> None:
+    progress_cb = None
+    if stream_progress:
+        import datetime as _dt
+        from entity_graph.models import TriageProgress
+
+        async def _write_progress(event: str, message: str, details: dict) -> None:
+            doc = await TriageProgress.find_one(TriageProgress.jira_key == jira_key)
+            if doc is None:
+                doc = TriageProgress(jira_key=jira_key)
+            doc.steps.append({"ts": _dt.datetime.utcnow().isoformat(), "event": event,
+                              "message": message, "details": details})
+            doc.updated_at = _dt.datetime.utcnow()
+            await doc.save()
+
+        progress_cb = _write_progress
+        # One live doc per ticket — delete any leftover from a previous run rather than
+        # merging into it; this is throwaway UI state, not a record worth preserving.
+        await TriageProgress.find(TriageProgress.jira_key == jira_key).delete()
+        await TriageProgress(jira_key=jira_key, status="running",
+                             steps=[{"ts": _dt.datetime.utcnow().isoformat(),
+                                     "event": "queued", "message": "Run queued", "details": {}}]
+                             ).insert()
     try:
         import httpx
         from edr_triage.config import get_edr_config
         from edr_triage.jira_poller import (
             parse_mde_alert_id, parse_description_fields,
             parse_sentinel_incident_url, parse_sentinel_alert_id, _adf_to_text,
+            build_upwind_ticket,
         )
         from edr_triage.pipeline import _process_ticket
         from lib.mde_client import get_access_token
@@ -974,18 +1391,22 @@ async def _run_ticket_bg(jira_key: str, force_agent: bool = False) -> None:
         desc_raw = fields.get("description") or {}
         description = _adf_to_text(desc_raw) if isinstance(desc_raw, dict) else str(desc_raw or "")
 
-        # Analyst notes ALREADY on the ticket — a re-triage is exactly when these
-        # exist and matter (an analyst's full policy-change breakdown was never seen
-        # by the agent because only `description` was ever fetched).
-        from edr_triage.jira_closure_poller import _extract_all_comments
-        existing_comments, _, _ = _extract_all_comments(fields, bot_email=cfg.jira_email or "")
-
         alert_id = parse_mde_alert_id(description)
         parsed = parse_description_fields(description)
         sentinel_url = parse_sentinel_incident_url(description)
         alert_name = parsed.get("alert_name", fields.get("summary", ""))
 
-        if alert_id:
+        # Analyst notes ALREADY on the ticket — a re-triage is exactly when these
+        # exist and matter (DEMO-108035: Subodh Patil's full policy-change breakdown
+        # was never seen by the agent because only `description` was ever fetched).
+        from edr_triage.jira_closure_poller import _extract_all_comments
+        existing_comments, _, _ = _extract_all_comments(fields, bot_email=cfg.jira_email or "")
+        upwind_ticket = None if alert_id else build_upwind_ticket(
+            jira_key, fields, description, existing_comments)
+
+        if upwind_ticket:
+            ticket = upwind_ticket
+        elif alert_id:
             ticket = {
                 "jira_key":    jira_key,
                 "alert_id":    alert_id,
@@ -1020,11 +1441,16 @@ async def _run_ticket_bg(jira_key: str, force_agent: bool = False) -> None:
             }
         else:
             import datetime as _dt
+            _err = f"{jira_key} is not an MDE or Sentinel ticket — no alert ID found in description"
             _ticket_run_state.update(
-                running=False,
-                error=f"{jira_key} is not an MDE or Sentinel ticket — no alert ID found in description",
-                finished_at=_dt.datetime.utcnow().isoformat(),
+                running=False, error=_err, finished_at=_dt.datetime.utcnow().isoformat(),
             )
+            if stream_progress:
+                from entity_graph.models import TriageProgress
+                doc = await TriageProgress.find_one(TriageProgress.jira_key == jira_key)
+                if doc:
+                    doc.status, doc.error, doc.updated_at = "error", _err, _dt.datetime.utcnow()
+                    await doc.save()
             return
 
         # Run with dry_run=True so no Jira comments or transitions fire
@@ -1043,17 +1469,37 @@ async def _run_ticket_bg(jira_key: str, force_agent: bool = False) -> None:
         except Exception as exc:
             logger.warning("MDE token fetch failed for %s — proceeding without: %s", jira_key, exc)
 
-        result = await _process_ticket(ticket, token=token, cfg=dry_cfg, force_agent=force_agent)
+        # temperature_override(None) is a no-op, so an ordinary re-triage takes the
+        # exact same path as before this parameter existed.
+        from agent_core.backend import temperature_override
+        with temperature_override(temperature):
+            result = await _process_ticket(ticket, token=token, cfg=dry_cfg,
+                                           force_agent=force_agent, progress_cb=progress_cb)
         import datetime as _dt
         _ticket_run_state.update(
             running=False, result=str(result), finished_at=_dt.datetime.utcnow().isoformat(),
         )
+        if stream_progress:
+            from entity_graph.models import TriageProgress
+            doc = await TriageProgress.find_one(TriageProgress.jira_key == jira_key)
+            if doc:
+                doc.status = "done"
+                doc.updated_at = _dt.datetime.utcnow()
+                await doc.save()
     except Exception as exc:
         logger.exception("run-ticket pipeline failed for %s", jira_key)
         import datetime as _dt
         _ticket_run_state.update(
             running=False, error=str(exc), finished_at=_dt.datetime.utcnow().isoformat(),
         )
+        if stream_progress:
+            from entity_graph.models import TriageProgress
+            doc = await TriageProgress.find_one(TriageProgress.jira_key == jira_key)
+            if doc:
+                doc.status = "error"
+                doc.error = str(exc)
+                doc.updated_at = _dt.datetime.utcnow()
+                await doc.save()
 
 
 @router.post("/api/edr-triage/test", status_code=202)
@@ -1221,7 +1667,17 @@ async def edr_settings():
     them but does not write them (they take effect via deployment config).
     """
     import asyncio
-    from edr_triage.pipeline import _resolve_agent_phase
+    from edr_triage.pipeline import _resolve_agent_phase, autonomous_alert_allowlist
+
+    def _shadow_budget() -> dict:
+        """/shadow's Claude spend: its own cap, never counted against the agent budget."""
+        try:
+            from agent_core import budget
+            from agent_core.backend import shadow_llm, shadow_model_id
+            return {**budget.summary("shadow"), "enabled": shadow_llm() == "claude",
+                    "model": shadow_model_id() if shadow_llm() == "claude" else ""}
+        except Exception:
+            return {}
 
     def _budget() -> dict:
         try:
@@ -1231,12 +1687,18 @@ async def edr_settings():
             return {}
 
     b = await asyncio.to_thread(_budget)
+    sb = await asyncio.to_thread(_shadow_budget)
     return {
+        "shadow_budget":      sb,
         "use_agent_loop": os.getenv("USE_AGENT_LOOP", "true").lower() == "true",
         "agent_backend":  os.getenv("AGENT_BACKEND", "bedrock").lower(),
         # Normalized, not raw — so the legacy "live" value and any typo report as
         # the phase the pipeline will actually run (typo → shadow).
         "agent_phase":    _resolve_agent_phase(),
+        # Which alert families autonomy actually applies to. agent_phase alone is
+        # misleading once autonomy is per-family: "autonomous" with an empty allowlist
+        # runs as copilot everywhere, so the scope has to be visible next to it.
+        "autonomous_alerts": sorted(autonomous_alert_allowlist()),
         "poll_interval":  int(os.getenv("EDR_POLL_INTERVAL", "300")),
         "dry_run":        os.getenv("EDR_DRY_RUN", "false").lower() == "true",
         "aws_region":     os.getenv("AWS_REGION", "ap-south-1"),
@@ -1266,8 +1728,11 @@ async def edr_investigation_page(alert_id: str):
 
 
 @router.get("/settings", response_class=HTMLResponse, include_in_schema=False)
-async def edr_settings_page():
-    return HTMLResponse(_render_settings_page())
+async def edr_settings_page(request: Request):
+    import html as _html
+    from app.auth import _COOKIE_NAME, verify_token
+    user = verify_token(request.cookies.get(_COOKIE_NAME) or "") or "unknown"
+    return HTMLResponse(_render_settings_page().replace("__SESSION_USER__", _html.escape(user)))
 
 
 def _render_page() -> str:
@@ -1724,26 +2189,6 @@ def _render_page() -> str:
   .vt-info .a { font-size:12.5px; color:var(--text); }
   .vt-info .b { font-family:var(--font-mono); font-size:10.5px; color:var(--text-faint); margin-top:2px; }
   .cmd { background:var(--ground); border:1px solid var(--line); border-radius:6px; padding:11px 12px; font-family:var(--font-mono); font-size:11px; color:#b7c6d8; white-space:pre-wrap; word-break:break-word; line-height:1.6; }
-  /* Mock Jira panel — the exact comment/transition/labels RAPTOR posts to the ticket */
-  .jira-card { border:1px solid var(--line); border-radius:8px; overflow:hidden; background:var(--surface); }
-  .jira-head { display:flex; align-items:center; gap:10px; padding:9px 12px; border-bottom:1px solid var(--line); background:var(--surface-2); }
-  .jira-key { font-family:var(--font-mono); font-size:12px; font-weight:600; color:var(--accent); }
-  .jira-mock { font-family:var(--font-mono); font-size:9px; letter-spacing:0.06em; text-transform:uppercase; color:var(--text-faint); border:1px solid var(--line); border-radius:3px; padding:2px 6px; }
-  .jira-head .spacer { flex:1; }
-  .jira-trans { font-family:var(--font-mono); font-size:10.5px; padding:3px 9px; border:1px solid; border-radius:20px; white-space:nowrap; }
-  .jira-labels { display:flex; flex-wrap:wrap; gap:6px; padding:10px 12px 0; }
-  .jira-chip { font-family:var(--font-mono); font-size:10px; color:var(--text-dim); background:var(--surface-2); border:1px solid var(--line); border-radius:4px; padding:2px 8px; }
-  .jira-comment { padding:11px 12px 12px; }
-  .jira-comment-head { display:flex; align-items:center; gap:8px; font-size:11px; color:var(--text-dim); margin-bottom:9px; }
-  .jira-avatar { width:20px; height:20px; border-radius:50%; background:var(--accent); color:#0b0d11; font-weight:700; font-size:11px; display:flex; align-items:center; justify-content:center; }
-  .jira-comment-body { font-size:12.5px; color:var(--text); line-height:1.55; }
-  .jira-comment-body .jira-h { font-weight:600; color:var(--text); margin:11px 0 5px; font-size:12.5px; }
-  .jira-comment-body .jira-h:first-child { margin-top:0; }
-  .jira-comment-body .jira-p { margin:4px 0; color:var(--text-dim); }
-  .jira-comment-body .jira-ul { margin:4px 0 4px 2px; padding:0; list-style:none; }
-  .jira-comment-body .jira-ul li { position:relative; padding-left:14px; margin:3px 0; color:var(--text-dim); }
-  .jira-comment-body .jira-ul li::before { content:"\2022"; position:absolute; left:2px; color:var(--accent); }
-  .jira-comment-body .jira-pre { background:var(--ground); border:1px solid var(--line); border-radius:5px; padding:8px 10px; font-family:var(--font-mono); font-size:10.5px; color:var(--text-faint); white-space:pre-wrap; margin:8px 0 0; }
   .ai-block { background:var(--accent-glow); border:1px solid var(--accent-deep); border-radius:7px; padding:12px 13px; }
   .ai-block .ah { display:flex; align-items:center; gap:7px; font-family:var(--font-mono); font-size:10px; font-weight:600; letter-spacing:0.06em; text-transform:uppercase; color:var(--accent); margin-bottom:8px; }
   .ai-block .ah svg { width:12px; height:12px; }
@@ -1799,6 +2244,8 @@ def _render_page() -> str:
     <div class="glyph"><svg viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 L20 7 L17 14 C15.5 18 12 22 12 22 C12 22 8.5 18 7 14 L4 7 Z"/><path d="M12 8 L12 15 M9 11 L12 8 L15 11"/></svg></div>
     <button class="navbtn active" onclick="location.href='/edr-triage'"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3h7v7H3zM14 3h7v7h-7zM14 14h7v7h-7zM3 14h7v7H3z"/></svg><span class="tip">Triage Console</span></button>
     <button class="navbtn" onclick="location.href='/memory/quarantine'"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/></svg><span class="tip">AI Memory</span></button>
+    <button class="navbtn" onclick="location.href='/dashboard'"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12l9-9 9 9M5 10v10h14V10"/></svg><span class="tip">Dashboard</span></button>
+    <button class="navbtn" onclick="location.href='/shadow'"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><circle cx="12" cy="12" r="1" fill="currentColor"/></svg><span class="tip">Threat Hunting</span></button>
     <div class="spacer"></div>
     <button class="navbtn" onclick="location.href='/settings'"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15a3 3 0 100-6 3 3 0 000 6z"/><path d="M19 12a7 7 0 00-.1-1l2-1.6-2-3.4-2.4 1a7 7 0 00-1.7-1L14.5 2h-5l-.3 2.9a7 7 0 00-1.7 1l-2.4-1-2 3.4L3.1 11a7 7 0 000 2l-2 1.6 2 3.4 2.4-1a7 7 0 001.7 1L9.5 22h5l.3-2.9a7 7 0 001.7-1l2.4 1 2-3.4-2-1.6a7 7 0 00.1-1z"/></svg><span class="tip">Settings</span></button>
   </aside>
@@ -1837,7 +2284,8 @@ def _render_page() -> str:
             <button data-f="PENDING">Pending</button>
           </div>
           <div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg><input id="q" placeholder="Search ticket, alert, device, user…"/></div>
-          <div class="tgl on" id="obsToggle" title="Hide observe-only / skipped alerts (e.g. Netskope DLP)"><span class="sw"></span>Hide observed</div>
+          <div class="tgl on" id="obsToggle" title="Hide observe-only alert families (Netskope DLP/UBA/Failed Login/Malware, Cyble digests) and legacy OBSERVED/SKIPPED rows. View filter only — these are still triaged and still scored."><span class="sw"></span>Hide observed</div>
+          <span id="obsNote" class="mono" style="font-size:11px;color:var(--muted);align-self:center"></span>
         </div>
         <div class="q-wrap"><table class="queue"><thead><tr><th>Ticket</th><th>Alert</th><th>Device</th><th>User</th><th>Sev</th><th>Verdict</th><th>Conf</th><th>Playbook</th><th style="text-align:right">Age</th></tr></thead><tbody id="q-rows"></tbody></table></div>
         <div class="pager-bar"><span class="pi" id="pageinfo">—</span><div class="pager"><button id="prev" disabled>← Prev</button><button id="next" disabled>Next →</button></div></div>
@@ -1899,6 +2347,15 @@ function loadSpend(){
 }
 function loadPhase(){fetch('/api/edr-triage/settings').then(function(r){return r.json();}).then(function(d){var p=(d&&(d.agent_phase||d.phase))||'';var el=document.getElementById('phaseTxt');if(el&&p)el.textContent='PHASE · '+String(p).toUpperCase();}).catch(function(){});}
 
+/* The toggle hides whole alert FAMILIES (Netskope, Cyble) now, not just OBSERVED/SKIPPED
+   verdicts — so it can hide thousands of rows. Say so on the page: a queue that is
+   filtered but does not look filtered is how "where are my DLP tickets?" turns into a
+   bug report. Those rows are still triaged and still scored; only the view changes. */
+function setObsNote(n){
+  var el=document.getElementById('obsNote');if(!el)return;
+  el.textContent = (hideObserved && n) ? n.toLocaleString()+' observe-only hidden' : '';
+}
+
 function loadAlerts(){
   var tb=document.getElementById('q-rows');tb.innerHTML='<tr><td colspan="9"><div class="prev-empty" style="padding:36px">Loading…</div></td></tr>';
   var url='/api/edr-triage/alerts?limit='+PS+'&offset='+(page*PS);
@@ -1908,7 +2365,7 @@ function loadAlerts(){
   // rows already loaded.
   var sq=(document.getElementById('q')||{}).value||'';
   if(sq.trim())url+='&search='+encodeURIComponent(sq.trim());
-  fetch(url).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){total=d.total||0;curRows=d.alerts||[];renderRows();}).catch(function(e){tb.innerHTML='<tr><td colspan="9"><div class="prev-empty" style="padding:36px;color:var(--crit)">'+esc(String(e))+'</div></td></tr>';});
+  fetch(url).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(d){total=d.total||0;curRows=d.alerts||[];renderRows();setObsNote(d.observed_hidden||0);}).catch(function(e){tb.innerHTML='<tr><td colspan="9"><div class="prev-empty" style="padding:36px;color:var(--crit)">'+esc(String(e))+'</div></td></tr>';});
 }
 // Filtering is done server-side now (see loadAlerts). It used to happen here over the
 // current page only, and jira_key wasn't in the haystack — so searching a ticket key
@@ -1957,43 +2414,6 @@ function renderRows(){
 function cell(k,v,color){return '<div class="meta"><div class="mk">'+esc(k)+'</div><div class="mv"'+(color?' style="color:'+color+'"':'')+'>'+esc(v)+'</div></div>';}
 function cellFull(k,v,color){return '<div class="meta full"><div class="mk">'+esc(k)+'</div><div class="mv"'+(color?' style="color:'+color+'"':'')+'>'+esc(v)+'</div></div>';}
 function aiBlock(title,txt){return '<div class="ai-block"><div class="ah">'+SPARK+esc(title)+'</div><pre>'+esc(txt)+'</pre></div>';}
-// Render a subset of Jira wiki markup (h2./h3., * bullets, {noformat}, *bold*) to HTML.
-function wikiToHtml(s){
-  if(!s)return '';
-  function e(t){return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-  function inl(t){return e(t).replace(/\*([^*]+)\*/g,'<b>$1</b>').replace(/\[([^\|\]]+)\|[^\]]+\]/g,'$1');}
-  var lines=String(s).split('\n'),out=[],i=0,inList=false;
-  function endList(){if(inList){out.push('</ul>');inList=false;}}
-  while(i<lines.length){
-    var ln=lines[i];
-    if(ln.trim()==='{noformat}'){endList();var code=[];i++;while(i<lines.length&&lines[i].trim()!=='{noformat}'){code.push(lines[i]);i++;}i++;out.push('<pre class="jira-pre">'+e(code.join('\n'))+'</pre>');continue;}
-    var hm=ln.match(/^h[1-6]\.\s+(.*)/);
-    if(hm){endList();out.push('<div class="jira-h">'+inl(hm[1])+'</div>');i++;continue;}
-    if(ln.indexOf('* ')===0){if(!inList){out.push('<ul class="jira-ul">');inList=true;}out.push('<li>'+inl(ln.slice(2))+'</li>');i++;continue;}
-    if(!ln.trim()){endList();i++;continue;}
-    endList();out.push('<div class="jira-p">'+inl(ln)+'</div>');i++;
-  }
-  endList();return out.join('');
-}
-// The mock Jira panel — the exact comment/transition/labels RAPTOR would post
-// (dry-run: stored, not sent). Sourced from the same fields written to the ticket.
-function jiraPanel(a){
-  if(!a.l1_comment)return '';
-  var act=a.action_taken||'';
-  var tr = act==='resolved' ? {t:'→ Resolve',c:'var(--good)'}
-         : act==='event_analysis' ? {t:'→ Event Analysis',c:'var(--med)'}
-         : act==='labels_only' ? {t:'labels only',c:'var(--text-dim)'}
-         : {t:'advisory · no transition',c:'var(--text-dim)'};
-  var chips=(a.labels_applied||[]).map(function(l){return '<span class="jira-chip">'+esc(l)+'</span>';}).join('');
-  var h='<div><div class="section-label"><span class="eyebrow">Posted to Jira</span><span class="rule"></span></div>';
-  h+='<div class="jira-card"><div class="jira-head"><span class="jira-key">'+esc(a.jira_key||'—')+'</span>'
-    +'<span class="jira-mock">mock · dry-run</span><span class="spacer"></span>'
-    +'<span class="jira-trans" style="color:'+tr.c+';border-color:'+tr.c+'">'+tr.t+'</span></div>';
-  if(chips)h+='<div class="jira-labels">'+chips+'</div>';
-  h+='<div class="jira-comment"><div class="jira-comment-head"><span class="jira-avatar">R</span> RAPTOR bot · added a comment</div>'
-    +'<div class="jira-comment-body">'+wikiToHtml(a.l1_comment)+'</div></div></div></div>';
-  return h;
-}
 
 function openDrawer(id){
   if(!id)return;curAlertId=id;
@@ -2038,7 +2458,7 @@ function renderDrawer(a){
   if(a.vt_detections!=null&&a.vt_total){var p=Math.round(a.vt_detections/a.vt_total*100);var vok=a.vt_detections===0;var vc=vok?'var(--good)':'var(--crit)';
     b+='<div><div class="section-label"><span class="eyebrow">VirusTotal</span><span class="rule"></span></div><div class="vt-card"><div class="vt-ring" style="background:conic-gradient('+vc+' '+p+'%, var(--line) 0)"><b style="color:'+vc+'">'+a.vt_detections+'</b></div><div class="vt-info"><div class="a">'+a.vt_detections+' / '+a.vt_total+' engines flagged</div><div class="b">verdict: '+esc(a.vt_verdict||'—')+'</div></div></div></div>';}
   b+='<div id="traceSlot"></div>';
-  b+=jiraPanel(a);
+  if(a.l1_comment){b+='<div><div class="section-label"><span class="eyebrow">Triage comment · posted to Jira</span><span class="rule"></span></div><div class="cmd">'+esc(a.l1_comment)+'</div></div>';}
   if(reasoning){b+=aiBlock('AI reasoning · Mistral Large 3',reasoning);}
   if(a.l2_comment){b+='<div><div class="section-label"><span class="eyebrow">L2 comment / draft</span><span class="rule"></span></div><div class="cmd">'+esc(a.l2_comment)+'</div></div>';}
   document.getElementById('dBody').innerHTML=b;
@@ -2543,26 +2963,6 @@ _INVESTIGATION_TPL = r"""<!DOCTYPE html>
   .vt-info .a { font-size:12.5px; color:var(--text); }
   .vt-info .b { font-family:var(--font-mono); font-size:10.5px; color:var(--text-faint); margin-top:2px; }
   .cmd { background:var(--ground); border:1px solid var(--line); border-radius:6px; padding:11px 12px; font-family:var(--font-mono); font-size:11px; color:#b7c6d8; white-space:pre-wrap; word-break:break-word; line-height:1.6; }
-  /* Mock Jira panel — the exact comment/transition/labels RAPTOR posts to the ticket */
-  .jira-card { border:1px solid var(--line); border-radius:8px; overflow:hidden; background:var(--surface); }
-  .jira-head { display:flex; align-items:center; gap:10px; padding:9px 12px; border-bottom:1px solid var(--line); background:var(--surface-2); }
-  .jira-key { font-family:var(--font-mono); font-size:12px; font-weight:600; color:var(--accent); }
-  .jira-mock { font-family:var(--font-mono); font-size:9px; letter-spacing:0.06em; text-transform:uppercase; color:var(--text-faint); border:1px solid var(--line); border-radius:3px; padding:2px 6px; }
-  .jira-head .spacer { flex:1; }
-  .jira-trans { font-family:var(--font-mono); font-size:10.5px; padding:3px 9px; border:1px solid; border-radius:20px; white-space:nowrap; }
-  .jira-labels { display:flex; flex-wrap:wrap; gap:6px; padding:10px 12px 0; }
-  .jira-chip { font-family:var(--font-mono); font-size:10px; color:var(--text-dim); background:var(--surface-2); border:1px solid var(--line); border-radius:4px; padding:2px 8px; }
-  .jira-comment { padding:11px 12px 12px; }
-  .jira-comment-head { display:flex; align-items:center; gap:8px; font-size:11px; color:var(--text-dim); margin-bottom:9px; }
-  .jira-avatar { width:20px; height:20px; border-radius:50%; background:var(--accent); color:#0b0d11; font-weight:700; font-size:11px; display:flex; align-items:center; justify-content:center; }
-  .jira-comment-body { font-size:12.5px; color:var(--text); line-height:1.55; }
-  .jira-comment-body .jira-h { font-weight:600; color:var(--text); margin:11px 0 5px; font-size:12.5px; }
-  .jira-comment-body .jira-h:first-child { margin-top:0; }
-  .jira-comment-body .jira-p { margin:4px 0; color:var(--text-dim); }
-  .jira-comment-body .jira-ul { margin:4px 0 4px 2px; padding:0; list-style:none; }
-  .jira-comment-body .jira-ul li { position:relative; padding-left:14px; margin:3px 0; color:var(--text-dim); }
-  .jira-comment-body .jira-ul li::before { content:"\2022"; position:absolute; left:2px; color:var(--accent); }
-  .jira-comment-body .jira-pre { background:var(--ground); border:1px solid var(--line); border-radius:5px; padding:8px 10px; font-family:var(--font-mono); font-size:10.5px; color:var(--text-faint); white-space:pre-wrap; margin:8px 0 0; }
   .ai-block { background:var(--accent-glow); border:1px solid var(--accent-deep); border-radius:7px; padding:12px 13px; }
   .ai-block .ah { display:flex; align-items:center; gap:7px; font-family:var(--font-mono); font-size:10px; font-weight:600; letter-spacing:0.06em; text-transform:uppercase; color:var(--accent); margin-bottom:8px; }
   .ai-block .ah svg { width:12px; height:12px; }
@@ -2677,41 +3077,6 @@ var ENTSVG='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-wi
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function rgba(hex,a){var n=parseInt(hex.slice(1),16);return 'rgba('+((n>>16)&255)+','+((n>>8)&255)+','+(n&255)+','+a+')';}
 var VCOL={AUTO_CLOSED_FP:'#46B87A',AUTO_CLOSED_TP:'#E8913A',NEEDS_L2:'#6C93C0',URGENT:'#F05552',PENDING:'#8E96A4',OBSERVED:'#59616E',SKIPPED:'#59616E',PROCESSING:'#8E96A4'};
-// Render a subset of Jira wiki markup (h2./h3., * bullets, {noformat}, *bold*) to HTML.
-function wikiToHtml(s){
-  if(!s)return '';
-  function e(t){return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-  function inl(t){return e(t).replace(/\*([^*]+)\*/g,'<b>$1</b>').replace(/\[([^\|\]]+)\|[^\]]+\]/g,'$1');}
-  var lines=String(s).split('\n'),out=[],i=0,inList=false;
-  function endList(){if(inList){out.push('</ul>');inList=false;}}
-  while(i<lines.length){
-    var ln=lines[i];
-    if(ln.trim()==='{noformat}'){endList();var code=[];i++;while(i<lines.length&&lines[i].trim()!=='{noformat}'){code.push(lines[i]);i++;}i++;out.push('<pre class="jira-pre">'+e(code.join('\n'))+'</pre>');continue;}
-    var hm=ln.match(/^h[1-6]\.\s+(.*)/);
-    if(hm){endList();out.push('<div class="jira-h">'+inl(hm[1])+'</div>');i++;continue;}
-    if(ln.indexOf('* ')===0){if(!inList){out.push('<ul class="jira-ul">');inList=true;}out.push('<li>'+inl(ln.slice(2))+'</li>');i++;continue;}
-    if(!ln.trim()){endList();i++;continue;}
-    endList();out.push('<div class="jira-p">'+inl(ln)+'</div>');i++;
-  }
-  endList();return out.join('');
-}
-function jiraPanel(a){
-  if(!a.l1_comment)return '';
-  var act=a.action_taken||'';
-  var tr = act==='resolved' ? {t:'→ Resolve',c:'var(--good)'}
-         : act==='event_analysis' ? {t:'→ Event Analysis',c:'var(--med)'}
-         : act==='labels_only' ? {t:'labels only',c:'var(--text-dim)'}
-         : {t:'advisory · no transition',c:'var(--text-dim)'};
-  var chips=(a.labels_applied||[]).map(function(l){return '<span class="jira-chip">'+esc(l)+'</span>';}).join('');
-  var h='<div class="fp-sect" style="margin-top:0"><div class="section-label"><span class="eyebrow">Posted to Jira</span><span class="rule"></span></div>';
-  h+='<div class="jira-card"><div class="jira-head"><span class="jira-key">'+esc(a.jira_key||'—')+'</span>'
-    +'<span class="jira-mock">mock · dry-run</span><span class="spacer"></span>'
-    +'<span class="jira-trans" style="color:'+tr.c+';border-color:'+tr.c+'">'+tr.t+'</span></div>';
-  if(chips)h+='<div class="jira-labels">'+chips+'</div>';
-  h+='<div class="jira-comment"><div class="jira-comment-head"><span class="jira-avatar">R</span> RAPTOR bot · added a comment</div>'
-    +'<div class="jira-comment-body">'+wikiToHtml(a.l1_comment)+'</div></div></div></div>';
-  return h;
-}
 function cell(k,v,color,full){return '<div class="meta'+(full?' full':'')+'"><div class="mk">'+esc(k)+'</div><div class="mv"'+(color?' style="color:'+color+'"':'')+'>'+esc(v)+'</div></div>';}
 function jiraLink(k){return '<a class="jl" href="https://jira.example.com/browse/'+encodeURIComponent(k)+'" target="_blank" rel="noopener" onclick="event.stopPropagation()">'+esc(k)+' \u2197</a>';}
 function metaJira(jk){return '<div class="meta"><div class="mk">Jira ticket</div><div class="mv">'+(jk?jiraLink(jk):'<span style="color:var(--text-faint)">not raised</span>')+'</div></div>';}
@@ -2875,7 +3240,7 @@ function render(a,sh){
   }
   // columns: comment/reasoning | provenance/entities/VT
   var left='';
-  if(a.l1_comment){left+=jiraPanel(a);}
+  if(a.l1_comment){left+='<div class="fp-sect" style="margin-top:0"><div class="section-label"><span class="eyebrow">Triage comment · posted to Jira</span><span class="rule"></span></div><div class="cmd">'+esc(a.l1_comment)+'</div></div>';}
   if(reasoning){left+='<div class="fp-sect"'+(a.l1_comment?'':' style="margin-top:0"')+'><div class="ai-block"><div class="ah">'+SPARK+'AI reasoning · Mistral Large 3</div>'+reasonHTML(reasoning)+'</div></div>';}
   if(a.l2_comment){left+='<div class="fp-sect"><div class="section-label"><span class="eyebrow">L2 comment / draft</span><span class="rule"></span></div><div class="cmd">'+esc(a.l2_comment)+'</div></div>';}
   var right='<div class="fp-sect" style="margin-top:0"><div class="section-label"><span class="eyebrow">Provenance</span><span class="rule"></span></div><div class="meta-grid">'
@@ -3360,26 +3725,6 @@ def _render_settings_page() -> str:
   .vt-info .a { font-size:12.5px; color:var(--text); }
   .vt-info .b { font-family:var(--font-mono); font-size:10.5px; color:var(--text-faint); margin-top:2px; }
   .cmd { background:var(--ground); border:1px solid var(--line); border-radius:6px; padding:11px 12px; font-family:var(--font-mono); font-size:11px; color:#b7c6d8; white-space:pre-wrap; word-break:break-word; line-height:1.6; }
-  /* Mock Jira panel — the exact comment/transition/labels RAPTOR posts to the ticket */
-  .jira-card { border:1px solid var(--line); border-radius:8px; overflow:hidden; background:var(--surface); }
-  .jira-head { display:flex; align-items:center; gap:10px; padding:9px 12px; border-bottom:1px solid var(--line); background:var(--surface-2); }
-  .jira-key { font-family:var(--font-mono); font-size:12px; font-weight:600; color:var(--accent); }
-  .jira-mock { font-family:var(--font-mono); font-size:9px; letter-spacing:0.06em; text-transform:uppercase; color:var(--text-faint); border:1px solid var(--line); border-radius:3px; padding:2px 6px; }
-  .jira-head .spacer { flex:1; }
-  .jira-trans { font-family:var(--font-mono); font-size:10.5px; padding:3px 9px; border:1px solid; border-radius:20px; white-space:nowrap; }
-  .jira-labels { display:flex; flex-wrap:wrap; gap:6px; padding:10px 12px 0; }
-  .jira-chip { font-family:var(--font-mono); font-size:10px; color:var(--text-dim); background:var(--surface-2); border:1px solid var(--line); border-radius:4px; padding:2px 8px; }
-  .jira-comment { padding:11px 12px 12px; }
-  .jira-comment-head { display:flex; align-items:center; gap:8px; font-size:11px; color:var(--text-dim); margin-bottom:9px; }
-  .jira-avatar { width:20px; height:20px; border-radius:50%; background:var(--accent); color:#0b0d11; font-weight:700; font-size:11px; display:flex; align-items:center; justify-content:center; }
-  .jira-comment-body { font-size:12.5px; color:var(--text); line-height:1.55; }
-  .jira-comment-body .jira-h { font-weight:600; color:var(--text); margin:11px 0 5px; font-size:12.5px; }
-  .jira-comment-body .jira-h:first-child { margin-top:0; }
-  .jira-comment-body .jira-p { margin:4px 0; color:var(--text-dim); }
-  .jira-comment-body .jira-ul { margin:4px 0 4px 2px; padding:0; list-style:none; }
-  .jira-comment-body .jira-ul li { position:relative; padding-left:14px; margin:3px 0; color:var(--text-dim); }
-  .jira-comment-body .jira-ul li::before { content:"\2022"; position:absolute; left:2px; color:var(--accent); }
-  .jira-comment-body .jira-pre { background:var(--ground); border:1px solid var(--line); border-radius:5px; padding:8px 10px; font-family:var(--font-mono); font-size:10.5px; color:var(--text-faint); white-space:pre-wrap; margin:8px 0 0; }
   .ai-block { background:var(--accent-glow); border:1px solid var(--accent-deep); border-radius:7px; padding:12px 13px; }
   .ai-block .ah { display:flex; align-items:center; gap:7px; font-family:var(--font-mono); font-size:10px; font-weight:600; letter-spacing:0.06em; text-transform:uppercase; color:var(--accent); margin-bottom:8px; }
   .ai-block .ah svg { width:12px; height:12px; }
@@ -3455,6 +3800,8 @@ def _render_settings_page() -> str:
     <div class="glyph"><svg viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 L20 7 L17 14 C15.5 18 12 22 12 22 C12 22 8.5 18 7 14 L4 7 Z"/><path d="M12 8 L12 15 M9 11 L12 8 L15 11"/></svg></div>
     <button class="navbtn" onclick="location.href='/edr-triage'"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3h7v7H3zM14 3h7v7h-7zM14 14h7v7h-7zM3 14h7v7H3z"/></svg><span class="tip">Triage Console</span></button>
     <button class="navbtn" onclick="location.href='/memory/quarantine'"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/></svg><span class="tip">AI Memory</span></button>
+    <button class="navbtn" onclick="location.href='/dashboard'"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12l9-9 9 9M5 10v10h14V10"/></svg><span class="tip">Dashboard</span></button>
+    <button class="navbtn" onclick="location.href='/shadow'"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><circle cx="12" cy="12" r="1" fill="currentColor"/></svg><span class="tip">Threat Hunting</span></button>
     <div class="spacer"></div>
     <button class="navbtn active" onclick="location.href='/settings'"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15a3 3 0 100-6 3 3 0 000 6z"/><path d="M19 12a7 7 0 00-.1-1l2-1.6-2-3.4-2.4 1a7 7 0 00-1.7-1L14.5 2h-5l-.3 2.9a7 7 0 00-1.7 1l-2.4-1-2 3.4L3.1 11a7 7 0 000 2l-2 1.6 2 3.4 2.4-1a7 7 0 001.7 1L9.5 22h5l.3-2.9a7 7 0 001.7-1l2.4 1 2-3.4-2-1.6a7 7 0 00.1-1z"/></svg><span class="tip">Settings</span></button>
   </aside>
@@ -3472,6 +3819,7 @@ def _render_settings_page() -> str:
       <section class="panel">
         <div class="panel-head"><h2>AI spend</h2><span class="ro-pill"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>read-only</span><div class="spacer"></div><span class="lock-note">Budget set by AGENT_MONTHLY_BUDGET_USD</span></div>
         <div class="sec-pad"><div class="spendrow"><span class="big" id="spendBig">—</span><span class="cap" id="spendCap"></span></div><div class="bigtrack"><i id="spendFill"></i></div></div>
+        <div class="sec-pad" style="border-top:1px solid var(--line,rgba(255,255,255,.06))"><div class="spendrow"><span class="cap" style="min-width:150px">/shadow · Claude (Opus)</span><span class="big" id="sSpendBig" style="font-size:20px">—</span><span class="cap" id="sSpendCap"></span></div><div class="bigtrack"><i id="sSpendFill"></i></div><div class="cap" style="margin-top:6px">Separate cap, SHADOW_CLAUDE_MONTHLY_BUDGET_USD. Never counted against the agent budget above.</div></div>
       </section>
       <section class="panel">
         <div class="panel-head"><h2>Triage rules</h2><span class="count" id="rc">—</span><div class="spacer"></div><span class="lock-note">Custom rules matched before built-in patterns</span></div>
@@ -3483,6 +3831,10 @@ def _render_settings_page() -> str:
           <button class="btn primary" onclick="addRule()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>Add rule</button>
         </div>
         <div class="q-wrap"><table class="queue"><thead><tr><th>Pattern</th><th>Match</th><th>Playbook</th><th>Note</th><th></th></tr></thead><tbody id="r-rows"></tbody></table></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h2>Session</h2><div class="spacer"></div><span class="lock-note">Signed in as __SESSION_USER__ · sessions expire after 8 h</span></div>
+        <div class="sec-pad"><form method="POST" action="/logout" style="margin:0"><button class="btn" type="submit"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>Sign out</button></form></div>
       </section>
     </div></div>
   </div>
@@ -3511,6 +3863,9 @@ function loadSettings(){
     var cap=d.budget_usd,mtd=d.month_to_date_usd||0;
     if(cap==null){document.getElementById('spendBig').textContent='—';document.getElementById('spendCap').textContent='no budget set';}
     else{document.getElementById('spendBig').textContent='$'+(+mtd).toFixed(2);document.getElementById('spendCap').textContent='of $'+(+cap).toFixed(0)+' this month';var p=cap>0?Math.min(100,(mtd/cap)*100):0;var f=document.getElementById('spendFill');f.style.width=p+'%';f.style.background=p>=100?'var(--crit)':p>=80?'var(--med)':'var(--accent)';}
+    var sb=d.shadow_budget||{},scap=sb.budget_usd,smtd=sb.month_to_date_usd||0;
+    if(scap==null){document.getElementById('sSpendBig').textContent='—';document.getElementById('sSpendCap').textContent='unavailable';}
+    else{document.getElementById('sSpendBig').textContent='$'+(+smtd).toFixed(2);document.getElementById('sSpendCap').textContent='of $'+(+scap).toFixed(0)+' this month · '+(sb.enabled?((sb.calls_this_month||0)+' calls'):'off (SHADOW_LLM is not claude)');var sp=scap>0?Math.min(100,(smtd/scap)*100):0;var sf=document.getElementById('sSpendFill');sf.style.width=sp+'%';sf.style.background=sp>=100?'var(--crit)':sp>=80?'var(--med)':'var(--accent)';}
   }).catch(function(){document.getElementById('cfg').innerHTML='<div class="prev-empty" style="grid-column:1/-1;color:var(--crit)">Failed to load settings</div>';});
 }
 function loadRules(){

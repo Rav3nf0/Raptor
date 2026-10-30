@@ -2,11 +2,29 @@
 from __future__ import annotations
 
 from typing import Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class TriagedAlert(BaseModel):
     """A fully triaged MDE alert record stored in MongoDB."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _none_is_empty_text(cls, data):
+        """A text field given None is stored as "" instead of failing validation.
+
+        This record is built LAST, after the comment and labels are already on the
+        ticket, from values gathered all over the pipeline — several of them via
+        `dict.get(key, "")`, which still returns None when the key is present with a
+        null value. DEMO-115740 (2026-10-05): an MDE alert whose evidence had
+        `"sha256": null` crashed here on every run, so the record was never saved and
+        the claim was retried until RAPTOR gave up.
+        """
+        if isinstance(data, dict):
+            for name, field in cls.model_fields.items():
+                if data.get(name, 0) is None and field.annotation in (str, "str"):
+                    data[name] = ""
+        return data
 
     # Jira + MDE identifiers
     jira_key: str

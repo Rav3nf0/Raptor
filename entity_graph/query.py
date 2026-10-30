@@ -63,13 +63,34 @@ def _justification_applies(m, alert_type: str, device_name: str, user_name: str)
     than proof: the dataset holds only 9 TPs in total, all on other hosts.)
     """
     m_actor = (getattr(m, "actor", "") or "").strip().lower()
+    m_actors = {(a or "").strip().lower() for a in (getattr(m, "actors", None) or [])}
     m_device = (getattr(m, "device", "") or "").strip().lower()
     m_type = (getattr(m, "alert_type", "") or "").strip().lower()
-    if not (m_actor and m_device and m_type):
+    if not ((m_actor or m_actors) and m_type):
         return False
-    if m_actor != (user_name or "").strip().lower():
+    _u = (user_name or "").strip().lower()
+    if m_actor != _u and _u not in m_actors:
         return False
-    if m_device != (device_name or "").strip().lower():
+    # Device must MATCH — which for a device-less alert family means both sides absent,
+    # not "one side present". Requiring m_device to be non-empty made this unreachable
+    # for Netskope DLP: measured 2026-09-01, 0 of 264 DLP shadow rows carry a
+    # device_name at all, because a DLP hit is CASB activity on a cloud app, not
+    # something that happens on a host.
+    #
+    # The cost of that was not neutral. The justification itself was still surfaced by
+    # entity recall, but it rendered with the stored "re-validate each occurrence"
+    # caption — and per the note in _memory_summary the model obeys that caption and
+    # asks the person to re-explain. So every DLP alert by someone who had ALREADY
+    # given a business justification was told to go and ask again: 31 of those 264 rows
+    # are REQUEST_JUSTIFICATION, and 7 of the 40 scored DLP misses are the agent asking
+    # for a justification on a ticket a human then closed FP.
+    #
+    # The empty-side hazard the old guard was written for is handled by the actor and
+    # type checks above, which are unchanged and strict: a ('', '', 'netskope') memory
+    # has no actor and is already rejected, so it cannot match anything. What passes
+    # here is still only the SAME named person on the SAME alert type inside the window.
+    _d = (device_name or "").strip().lower()
+    if m_device != _d:
         return False
     if m_type != (alert_type or "").strip().lower():
         return False
@@ -91,7 +112,7 @@ def _memory_summary(m, limit: int = 500, justification_applies: bool = False) ->
        business justification to `content`. This rendered `l1_comment or content`,
        and l1_comment is essentially always populated (the L1 thread), so `content`
        was never reached and the justification was never shown — on any alert, for
-       any entity. DEMO-108171 asked sam.rivera for a justification he had already
+       any entity. DEMO-108171 asked morgan.diaz for a justification he had already
        given on DEMO-105519/106643: seven memories were recalled for that host and
        user, two of them carrying his answer, and the agent saw none of it. It is
        pulled out and rendered FIRST so it also survives the character cap.
@@ -116,16 +137,22 @@ def _memory_summary(m, limit: int = 500, justification_applies: bool = False) ->
             # Same actor, same device, same alert type, inside the window — so the
             # stored "re-validate each occurrence" caption is answering a question the
             # match has already settled, and the model obeys it: DEMO-108171 read the
-            # caption and asked sam.rivera to re-justify work he had justified on
+            # caption and asked morgan.diaz to re-justify work he had justified on
             # the same host, for the same alert, that same day. Swap the caption for
             # what the match actually establishes. Still evidence the model weighs,
             # not an instruction to close — every gate downstream is unchanged.
             _body = just.split("]:", 1)[1].strip() if "]:" in just else just
             _days = max(0, (datetime.utcnow() - m.created_at).days)
             _when = "today" if _days == 0 else f"{_days}d ago"
+            # Name only what the match actually established. On a device-less family
+            # (Netskope DLP carries no host at all) claiming "SAME device" would be
+            # asserting a correspondence that was never checked, in the one line the
+            # model is most likely to lean on.
+            _same = ("SAME actor, SAME device, SAME alert type"
+                     if (getattr(m, "device", "") or "").strip()
+                     else "SAME actor, SAME alert type (this alert family has no host)")
             just = (
-                f"[APPLICABLE PRIOR JUSTIFICATION — SAME actor, SAME device, SAME alert "
-                f"type, given {_when}"
+                f"[APPLICABLE PRIOR JUSTIFICATION — {_same}, given {_when}"
                 + (f" on {m.jira_key}" if getattr(m, "jira_key", "") else "")
                 + f", within the {_JUSTIFICATION_WINDOW_DAYS}d window. This covers the "
                   "activity in hand: do NOT ask this user to justify it again. Weigh it "
@@ -135,8 +162,44 @@ def _memory_summary(m, limit: int = 500, justification_applies: bool = False) ->
     return f"{just}\n{verdict}".strip() if just else verdict
 
 
+_MEM_ALERT_NAME_RE = re.compile(r"Alert '([^']+)'|'([^']+)' escalated")
+_INVOLVING_RE = re.compile(r"\s+involving\s+(one user|multiple users)\s*$", re.I)
+
+
+def _memory_alert_name(m) -> str:
+    """The alert name a memory was written about, from its caption ("" if absent)."""
+    hit = _MEM_ALERT_NAME_RE.search(getattr(m, "content", "") or "")
+    return (hit.group(1) or hit.group(2)).strip() if hit else ""
+
+
+def _same_alert(m, alert_name: str) -> bool | None:
+    """True/False when both alert names are known, None when it cannot be told."""
+    mine = _INVOLVING_RE.sub("", (alert_name or "").strip()).lower()
+    theirs = _INVOLVING_RE.sub("", _memory_alert_name(m)).lower()
+    if not mine or not theirs:
+        return None
+    return mine == theirs
+
+
+def _relevance_label(m, alert_name: str) -> str:
+    """Say whether a recalled memory is about THIS alert or only about the same entity.
+
+    DEMO-116466 (a privileged sign-in failure spike) leaned on "DLP/CASB alerts for
+    sana.bedi were closed as FP" — a verdict about a different kind of alert
+    recalled because it shared a user. It tells you something about the person, nothing
+    about whether this alert is benign.
+    """
+    same = _same_alert(m, alert_name)
+    if same is True:
+        return "[SAME alert as this one] "
+    if same is False:
+        return (f"[DIFFERENT alert: '{_cap(_memory_alert_name(m), 70)}' — about this entity, "
+                "says nothing about whether THIS alert is benign] ")
+    return ""
+
+
 async def get_entity_context(entity_type: str, value: str, alert_type: str = "",
-                             device_name: str = "", user_name: str = "") -> dict:
+                             device_name: str = "", user_name: str = "", alert_name: str = "") -> dict:
     """Return full context for an entity: history, tags, memories, related alerts."""
     entity = await get_entity(entity_type, value)
     if not entity:
@@ -156,9 +219,13 @@ async def get_entity_context(entity_type: str, value: str, alert_type: str = "",
             In(SCGMemory.entity_ids, [entity_id]),
             SCGMemory.confidence >= 0.5,
             In(SCGMemory.tier, [MemoryTier.curated, MemoryTier.golden]),
-        ).sort(-SCGMemory.confidence).limit(3).to_list()
+        ).sort(-SCGMemory.confidence, -SCGMemory.created_at).limit(12).to_list()
+        # Memories about THIS alert first: the top 3 by confidence alone were often other
+        # alert families entirely (a DLP close recalled for a sign-in spike). Stable sort,
+        # so confidence order holds within each group.
+        memories = sorted(memories, key=lambda m: 0 if _same_alert(m, alert_name) else 1)[:3]
         memory_summaries = [
-            f"[{m.tier.value}|{m.source}] "
+            f"[{m.tier.value}|{m.source}] {_relevance_label(m, alert_name)}"
             f"{_memory_summary(m, justification_applies=_justification_applies(m, alert_type, device_name, user_name))} "
             f"(conf={m.confidence:.2f})"
             for m in memories
@@ -166,7 +233,29 @@ async def get_entity_context(entity_type: str, value: str, alert_type: str = "",
     except Exception:
         memory_summaries = []
 
-    return {
+    # A SHARED account's history is the fleet's history, not this actor's. `root`,
+    # SYSTEM, svc-* and friends appear on every host, so their alert_count and
+    # risk_score are the sum of every unrelated event that ever ran under that name —
+    # presenting them as this entity's record hands the model a maximum-risk actor for
+    # what is really "a daemon did something somewhere".
+    #
+    # DEMO-109417 is the cost: a macOS "Files Copied to USB Drives" alert whose user field
+    # carried the PROCESS account. The agent made two tool calls — the device came back
+    # risk 10.0 / 2 alerts, and `root` came back **risk 100.0 / 176 alerts**. It escalated
+    # at 0.75 on a low-risk device with a maximum-risk actor. Both L1 and L2 closed it FP.
+    #
+    # This is the THIRD time the same lesson has been learned. get_precedents already
+    # guards it (DEMO-106632: "root@ five different boxes showing up as precedent for each
+    # other"), and the concurrency gate was fixed for it later — entity recall never was.
+    # _is_generic_account already exists and `root` is the first name in its list; this
+    # just applies it at the remaining call site.
+    #
+    # The numbers are NOT hidden — the model still needs to know the alert names a
+    # service account, and suppressing the row entirely would replace a misleading
+    # signal with a missing one. They are relabelled so they cannot be read as this
+    # actor's track record, and the caption says why.
+    _shared = entity_type == "user" and _is_generic_account(value)
+    out = {
         "entity_type": entity_type,
         "value": value,
         "found": True,
@@ -178,10 +267,27 @@ async def get_entity_context(entity_type: str, value: str, alert_type: str = "",
         "source_systems": entity.source_systems,
         "memories": memory_summaries,
     }
+    if _shared:
+        out["shared_account"] = True
+        out["fleet_alert_count"] = entity.alert_count
+        out["fleet_risk_score"] = round(entity.risk_score, 1)
+        # Zeroed for THIS entity, because none of that history is attributable to it.
+        out["alert_count"] = 0
+        out["risk_score"] = 0.0
+        out["note"] = (
+            f"'{value}' is a SHARED/built-in account, not a person. Its "
+            f"{entity.alert_count} prior alerts and risk score of "
+            f"{round(entity.risk_score, 1)} are the FLEET-WIDE totals for everything that "
+            "has ever run under that name on any host — they say nothing about this event "
+            "and are not evidence of risk here. Identify the actual acting principal "
+            "(the device's user, the session owner) before weighing actor history."
+        )
+    return out
 
 
 async def get_multi_entity_context(entities: list[tuple[str, str]], alert_type: str = "",
-                                   device_name: str = "", user_name: str = "") -> str:
+                                   device_name: str = "", user_name: str = "",
+                                   alert_name: str = "") -> str:
     """Return a formatted context block for multiple entities (for OSCAR O-step prompt).
 
     `alert_type`/`device_name`/`user_name` describe the alert being triaged RIGHT NOW —
@@ -194,17 +300,78 @@ async def get_multi_entity_context(entities: list[tuple[str, str]], alert_type: 
         if not value:
             continue
         ctx = await get_entity_context(entity_type, value, alert_type=alert_type,
-                                       device_name=device_name, user_name=user_name)
+                                       device_name=device_name, user_name=user_name,
+                                       alert_name=alert_name)
         if not ctx.get("found"):
             sections.append(f"- {entity_type} {value!r}: first seen, no prior history")
             continue
-        parts = [f"- {entity_type} {value!r}: {ctx['alert_count']} prior alerts, risk={ctx['risk_score']}"]
+        if ctx.get("shared_account"):
+            # Never render a shared account's fleet totals as this actor's history — see
+            # get_entity_context. Say what it is instead, so the model looks for the real
+            # acting principal rather than reading risk=100 off a daemon.
+            parts = [f"- {entity_type} {value!r}: SHARED/built-in account — no actor "
+                     f"history applies. {ctx.get('note', '')}"]
+        else:
+            parts = [f"- {entity_type} {value!r}: {ctx['alert_count']} prior alerts, risk={ctx['risk_score']}"]
         if ctx.get("tags"):
             parts.append(f"  tags: {', '.join(ctx['tags'])}")
         for m in ctx.get("memories", []):
             parts.append(f"  memory: {m}")
         sections.append("\n".join(parts))
     return "\n".join(sections) if sections else "No prior context found for entities in this alert."
+
+
+async def get_multi_actor_justification_status(actor_hosts: list[dict], alert_type: str) -> dict[str, dict]:
+    """For a multi-actor incident, which actors already have an applicable justification.
+
+    `actor_hosts` is the paired [{"actor","hosts","commands"}] structure built in
+    edr_triage/pipeline.py — one group per distinct actor on the incident. Reuses the
+    exact same entity fetch and `_justification_applies` matching `get_entity_context`
+    already does for the single primary actor; the only difference is this checks
+    EACH of the actor's OWN hosts (not just one device_name) and loops over multiple
+    actors instead of one. No new matching logic, no auto-close — same as
+    `_justification_applies`, this only tells the caller a precedent EXISTS; it never
+    authorizes skipping the ask on its own.
+
+    Returns {actor.lower(): {"jira_key": ..., "device": <matched host>, "summary": ...}}
+    for actors with an applicable hit. Actors with none are simply absent from the
+    dict — DEMO-109720's insufficient-context case (an unresolved actor) is also just
+    absent, since there is nothing to look up.
+    """
+    hits: dict[str, dict] = {}
+    for group in (actor_hosts or []):
+        if not isinstance(group, dict):
+            continue
+        actor = (group.get("actor") or "").strip()
+        hosts = [h for h in (group.get("hosts") or []) if h]
+        if not actor or not hosts:
+            continue
+        try:
+            entity = await get_entity("user", actor)
+        except Exception:
+            entity = None
+        if not entity:
+            continue
+        try:
+            memories = await SCGMemory.find(
+                In(SCGMemory.entity_ids, [str(entity.id)]),
+                SCGMemory.confidence >= 0.5,
+                In(SCGMemory.tier, [MemoryTier.curated, MemoryTier.golden]),
+            ).sort(-SCGMemory.confidence, -SCGMemory.created_at).to_list()
+        except Exception:
+            continue
+        for m in memories:
+            matched_host = next(
+                (h for h in hosts if _justification_applies(m, alert_type, h, actor)), None,
+            )
+            if matched_host:
+                hits[actor.lower()] = {
+                    "jira_key": getattr(m, "jira_key", ""),
+                    "device": matched_host,
+                    "summary": _memory_summary(m, justification_applies=True),
+                }
+                break
+    return hits
 
 
 async def get_playbook_memories(alert_type: str, limit: int = 5) -> list[dict]:
@@ -228,7 +395,7 @@ async def get_playbook_memories(alert_type: str, limit: int = 5) -> list[dict]:
             SCGMemory.scope == "playbook",
             SCGMemory.confidence >= 0.5,
             In(SCGMemory.tier, [MemoryTier.curated, MemoryTier.golden]),
-        ).sort(-SCGMemory.confidence).limit(limit).to_list()
+        ).sort(-SCGMemory.confidence, -SCGMemory.created_at).limit(limit).to_list()
         return [
             {
                 "content": m.content,
@@ -243,6 +410,7 @@ async def get_playbook_memories(alert_type: str, limit: int = 5) -> list[dict]:
                 "confidence": round(m.confidence, 2),
                 "tier": m.tier.value,
                 "jira_key": m.jira_key,
+                "source": m.source,
             }
             for m in memories
         ]
@@ -283,6 +451,28 @@ def _matching_command(precedent_text: str, command_lines: list | None) -> str:
     return ""
 
 
+STANDING_CONTEXT_SOURCE = "admin_context_import"
+_STANDING_CONTEXT_CAP = 3000
+
+
+async def get_standing_context(alert_type: str) -> str:
+    """The security team's own written context for an alert type (POST
+    /api/memory/playbook-context), or "". Shown whole: it is a curated note, not a
+    precedent, and the precedent cap of 500 characters cut its exclusions off."""
+    if not alert_type:
+        return ""
+    try:
+        m = await SCGMemory.find_one(
+            SCGMemory.alert_type == alert_type,
+            SCGMemory.scope == "playbook",
+            SCGMemory.source == STANDING_CONTEXT_SOURCE,
+        )
+    except Exception as exc:
+        logger.error("get_standing_context(%s) failed: %s", alert_type, exc)
+        return ""
+    return _cap((m.content or "") if m else "", _STANDING_CONTEXT_CAP)
+
+
 async def get_playbook_precedents_block(alert_type: str, exclude_jira: str = "",
                                         limit: int = 3, command_lines: list | None = None) -> str:
     """Bounded, curated-only precedent block for the agent's opening context.
@@ -293,11 +483,16 @@ async def get_playbook_precedents_block(alert_type: str, exclude_jira: str = "",
     token cost and limit anchoring/poisoning; the accompanying prompt marks it
     CONTEXT ONLY.
     """
-    mems = await get_playbook_memories(alert_type, limit=limit + 2)
-    mems = [m for m in mems if m.get("jira_key") != exclude_jira][:limit]
+    standing = await get_standing_context(alert_type)
+    mems = await get_playbook_memories(alert_type, limit=limit + 3)
+    mems = [m for m in mems if m.get("jira_key") != exclude_jira
+            and m.get("source") != STANDING_CONTEXT_SOURCE][:limit]
+    head = ([f"Standing context for '{alert_type}' written by the security team "
+             "(CONTEXT ONLY — it never clears an alert by itself; anything it lists as NOT "
+             f"routine still escalates):\n{standing}"] if standing else [])
     if not mems:
-        return ""
-    lines = [
+        return "\n".join(head)
+    lines = head + [
         f"How analysts have previously RESOLVED '{alert_type}' alerts "
         "(curated precedents — CONTEXT ONLY; do NOT let these shortcut your own investigation):"
     ]
@@ -471,12 +666,12 @@ async def check_concurrent_alerts(device_name: str = "", user_name: str = "",
                 {"$or": [{"l1_handoff_at": {"$ne": None}}, {"l1_resolved_at": None}]},
                 # Exclude siblings that THIS GATE escalated and nothing else — otherwise
                 # the gate reads its own output back as evidence and the escalations
-                # become self-sustaining. Measured on one DBA's SSM sessions: six sibling
-                # tickets were six-for-six pre_safety_class=AUTO_CLOSED_FP overridden by
-                # "Concurrent open alerts", each held open only by the others, with no
-                # independent danger signal anywhere in the set. The loop also grows —
-                # every new host that DBA touches adds another member, and none of them
-                # can ever resolve itself.
+                # become self-sustaining. Measured on one DBA's SSM sessions: DEMO-108702,
+                # 108679, 108667, 108631, 108518 and 108514 were SIX FOR SIX
+                # pre_safety_class=AUTO_CLOSED_FP overridden by "Concurrent open alerts",
+                # each held open only by the others, with no independent danger signal
+                # anywhere in the set. The loop also grows — every new host that DBA
+                # touches adds another member, and none of them can ever resolve itself.
                 #
                 # NARROW ON PURPOSE. Only concurrency-gate escalations are discounted. A
                 # sibling the MODEL escalated on its own merits still counts, and so does
@@ -506,11 +701,154 @@ async def check_concurrent_alerts(device_name: str = "", user_name: str = "",
                         # and siblings can match on user across hosts.
                         "device_name": getattr(r, "device_name", "") or "",
                         "created_at": r.created_at.isoformat() if getattr(r, "created_at", None) else "",
+                        # Handed to L2 and not yet resolved (l2_resolved_at is already
+                        # filtered to None above). Not a burst duplicate: a human looked
+                        # at the same activity and was not satisfied. See agent_core.loop.
+                        # Deliberately NOT l1_awaiting_inputs_at — that is stamped whoever
+                        # moved the ticket, and RAPTOR's own user chase moves tickets there,
+                        # so bot-chased burst siblings would deadlock each other again.
+                        "human_held": bool(getattr(r, "l1_handoff_at", None)),
                     })
     except Exception as exc:
+        # Raise, never "0 concurrent": that answer reads as a passed precondition for
+        # auto-close (it hid the 7feb2c3 schema bug). Every caller already turns an
+        # exception into a failed check — scg wrapper → error → critical-tool gate; loop
+        # prefetch → not seeded; uba_guard → others=None.
         logger.error("check_concurrent_alerts failed: %s", exc)
+        raise
     return {
         "concurrent_count": len(open_alerts),
         "open_alerts": open_alerts,
         "open_alert_details": details,
     }
+
+
+# Alert families that ARE a named-malware detection on the host. A device that produced
+# one of these recently is not a clean baseline for judging its other alerts.
+MALWARE_ALERT_RE = re.compile(
+    r"malware was (detected|prevented)|An active .* malware|Netskope -Malware", re.I)
+_MALWARE_LOOKBACK_DAYS = 30
+
+
+# A person's own answer, as a verdict memory records it: the relayed chase reply carries
+# the PRIOR BUSINESS JUSTIFICATION prefix (jira_closure_poller._write_verdict_memory), and
+# L2 writes "as per (the) confirmation from user". The CASB re-enablement template is not
+# one — nobody was asked (DEMO-115919 was cleared on exactly those).
+_USER_ANSWER_RE = re.compile(
+    r"PRIOR BUSINESS JUSTIFICATION|confirmation from (?:the )?user|as (?:per|confirmed by) "
+    r"(?:the )?user|user (?:has )?confirmed|\[user —"
+    r"|(?:provided|shared|gave|given) (?:a |the |his |her |their )?(?:business )?justification", re.I)
+
+
+async def dlp_user_justification(user: str) -> dict | None:
+    """The person's own earlier answer on a DLP ticket a human closed, or {} if none.
+
+    {"jira_key", "text"}. None when the lookup fails (the caller treats that as none). The
+    record must name this person in its own text: verdict memories have been bound to the
+    wrong account (DEMO-113085's Investor Grievances answer sits on someone else).
+    """
+    u = (user or "").strip().lower()
+    if not u:
+        return {}
+    local = u.split("@")[0]
+    try:
+        rows = await SCGMemory.find(
+            {"alert_type": "netskope_dlp", "tier": {"$ne": "archived"},
+             "$or": [{"actor": {"$regex": f"^{re.escape(u)}$", "$options": "i"}},
+                     {"actors": {"$regex": f"^{re.escape(u)}$", "$options": "i"}}]},
+        ).sort("-created_at").limit(30).to_list()
+    except Exception as exc:
+        logger.warning("dlp_user_justification(%s) failed: %s", u, exc)
+        return None
+    for m in rows:
+        text = f"{m.content or ''} {m.l1_comment or ''} {m.l2_comment or ''} {m.quarantine_reason or ''}"
+        low = text.lower()
+        # Slack-relayed answers name the email; one typed on the ticket carries the
+        # author's display name ("[user — Ira Chopra]").
+        if ((local in low or local.replace(".", " ") in low) and _USER_ANSWER_RE.search(text)
+                and re.search(r"AUTO_CLOSED_FP|false positive", text, re.I)):
+            flat = " ".join(text.split())
+            at = _USER_ANSWER_RE.search(flat).start()
+            at = max(flat.rfind(". ", 0, at) + 2, flat.rfind("] ", 0, at) + 2, 0)   # sentence start
+            return {"jira_key": m.jira_key, "text": flat[at:at + 300]}
+    return {}
+
+
+async def open_urgent_alerts(user_name: str = "", device_name: str = "", reference_time: str = "",
+                             exclude_jira_key: str = "", days: int = 14) -> list[dict] | None:
+    """URGENT tickets on this user or device from the last `days` that no human has closed.
+
+    An account or host under an open compromise question is not a clean baseline:
+    DEMO-117913 auto-closed theo.malik's sign-in spike while DEMO-117523 (wrong
+    passwords, then a success from a new IP, URGENT) was still with L2 three days on —
+    past the 24h concurrency window. Shared accounts match nothing (every host has root).
+    None when the lookup fails; the caller treats that as "cannot rule it out".
+    """
+    user = (user_name or "").strip().lower()
+    host = (device_name or "").strip().lower().split(".")[0]
+    who = []
+    if user and not _is_generic_account(user):
+        who.append({"user_name": {"$regex": f"^{re.escape(user)}$", "$options": "i"}})
+    if host:
+        who.append({"device_name": {"$regex": f"^{re.escape(host)}(\\.|$)", "$options": "i"}})
+    if not who:
+        return []
+    ref = datetime.utcnow()
+    if reference_time:
+        try:
+            _r = datetime.fromisoformat(str(reference_time).replace("Z", "+00:00"))
+            ref = (_r.replace(tzinfo=None) - (_r.utcoffset() or timedelta(0))) if _r.tzinfo else _r
+        except (TypeError, ValueError):
+            pass
+    try:
+        q = [{"$or": who}, {"ai_triage_class": "URGENT"},
+             {"created_at": {"$gte": ref - timedelta(days=days), "$lte": ref}},
+             {"l2_resolved_at": None}, {"l1_resolved_at": None}]
+        if exclude_jira_key:
+            q.append({"jira_key": {"$ne": exclude_jira_key}})
+        rows = await ShadowResult.find(*q).sort("-created_at").limit(5).to_list()
+    except Exception as exc:
+        logger.warning("open_urgent_alerts(%s, %s) failed: %s", user, host, exc)
+        return None
+    return [{"jira_key": r.jira_key, "alert_name": r.alert_name,
+             "created_at": r.created_at.isoformat() if r.created_at else ""} for r in rows]
+
+
+async def recent_malware_alerts(device_name: str, reference_time: str = "",
+                                exclude_jira_key: str = "",
+                                days: int = _MALWARE_LOOKBACK_DAYS) -> list[dict] | None:
+    """Named-malware tickets on this device in the `days` before the alert.
+
+    Feeds the gate that refuses an AUTO_CLOSED_FP on a host with recent malware.
+    r009mrahaitwd had three Sality detections (a file infector, from a binary on an IT
+    file share) and a CustomEnterpriseBlock hit, and RAPTOR still auto-closed two
+    PowerShell alerts on it, citing that very history as "confirmed legitimate".
+
+    Matches on the short hostname so FQDN and bare forms meet. Any outcome counts —
+    a detection a human closed as authorised is still a detection on the host. Returns
+    None when the lookup fails; the caller treats that as "cannot rule it out".
+    """
+    host = (device_name or "").strip().lower().split(".")[0]
+    if not host:
+        return []
+    ref = datetime.utcnow()
+    if reference_time:
+        try:
+            _r = datetime.fromisoformat(str(reference_time).replace("Z", "+00:00"))
+            ref = (_r.replace(tzinfo=None) - (_r.utcoffset() or timedelta(0))) if _r.tzinfo else _r
+        except (TypeError, ValueError):
+            pass
+    try:
+        q = [
+            {"device_name": {"$regex": f"^{re.escape(host)}(\\.|$)", "$options": "i"}},
+            {"alert_name": {"$regex": MALWARE_ALERT_RE.pattern, "$options": "i"}},
+            {"created_at": {"$gte": ref - timedelta(days=days), "$lte": ref}},
+        ]
+        if exclude_jira_key:
+            q.append({"jira_key": {"$ne": exclude_jira_key}})
+        rows = await ShadowResult.find(*q).sort("-created_at").limit(10).to_list()
+    except Exception as exc:
+        logger.warning("recent_malware_alerts(%s) failed: %s", host, exc)
+        return None
+    return [{"jira_key": r.jira_key, "alert_name": r.alert_name,
+             "created_at": r.created_at.isoformat() if r.created_at else ""} for r in rows]

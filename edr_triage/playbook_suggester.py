@@ -83,7 +83,7 @@ async def _llm_suggest(alert_name: str, alert_type: str, rows: list[ShadowResult
     """Ask on-prem Ollama for a structured suggestion. Returns None on failure."""
     import httpx
 
-    base_url = (os.getenv("LOCAL_LLM_URL") or os.getenv("OLLAMA_URL", "http://localhost:11434")).rstrip("/")
+    base_url = (os.getenv("LOCAL_LLM_URL") or os.getenv("OLLAMA_URL", "http://localhost:80")).rstrip("/")
     model = os.getenv("LOCAL_LLM_MODEL") or os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
     prompt = _SUGGEST_PROMPT.format(
         alert_name=alert_name, alert_type=alert_type,

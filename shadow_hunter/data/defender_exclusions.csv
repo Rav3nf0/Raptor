@@ -1,0 +1,7 @@
+Timestamp,DeviceName,InitiatingProcessAccountName,RegistryKey,RegistryValueName,RegistryValueData,InitiatingProcessFileName,InitiatingProcessCommandLine
+Apr 17 2026 10:22:00,wks-18.corp.example.com,liam.osei,HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths,C:\Windows\Temp,0,powershell.exe,powershell.exe Set-MpPreference -ExclusionPath 'C:\Windows\Temp'
+Apr 17 2026 15:55:00,srv-05.corp.example.com,administrator,HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Processes,update.exe,0,cmd.exe,cmd.exe /c reg add "HKLM\...\Exclusions\Processes" /v update.exe /t REG_DWORD /d 0
+Apr 18 2026 02:30:00,wks-05.corp.example.com,hana.oyelaran,HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Extensions,.hta,0,wscript.exe,wscript.exe C:\Users\Public\setup.vbs
+Apr 18 2026 00:48:00,wks-24.corp.example.com,svc_node,HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths,C:\ProgramData\agent,0,cmd.exe,cmd.exe /c powershell Add-MpPreference -ExclusionPath 'C:\ProgramData\agent'
+Apr 18 2026 03:10:00,wks-01.corp.example.com,gus.lindqvist,HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Extensions,.ps1,0,powershell.exe,powershell.exe -enc QWRkLU1wUHJlZmVyZW5jZSAtRXhjbHVzaW9uRXh0ZW5zaW9uIC5wczE=
+Apr 18 2026 04:05:00,wks-18.corp.example.com,liam.osei,HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Processes,svchost32.exe,0,powershell.exe,powershell.exe Add-MpPreference -ExclusionProcess svchost32.exe

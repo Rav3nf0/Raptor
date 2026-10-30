@@ -7,7 +7,7 @@ from typing import Any
 _SUSPICIOUS = {
     "alert_name":     "Kali Linux user agent detected on EC2 instance",
     "device_name":    "ip-10-212-21-50",
-    "account_name":   "prod",
+    "account_name":   "acme-prod",
     "event_name":     "ssm:DescribeParameters",
     "instance_id":    "i-04a2ce810d6b72956",
     "session_issuer": "ecs-task-role",
@@ -22,12 +22,12 @@ _SUSPICIOUS = {
 }
 _BENIGN = {
     "alert_name":     "SSM Session Manager activity",
-    "device_name":    "db-test-restore-01",
-    "account_name":   "nonprod",
+    "device_name":    "acme-db-test-restore-01",
+    "account_name":   "acme-nonprod",
     "event_name":     "ssm:StartSession",
     "instance_id":    "i-0abc123456",
-    "session_issuer": "dba-role",
-    "user_arn":       "arn:aws:sts::123:assumed-role/dba-role/dba@example.com",
+    "session_issuer": "acme-dba-role",
+    "user_arn":       "arn:aws:sts::123:assumed-role/acme-dba-role/dba@example.com",
     "user_name":      "dba@example.com",
     "access_key_id":  "ASIAEX2",
     "source_ip":      "10.220.9.50",
@@ -38,8 +38,8 @@ _BENIGN = {
 }
 _NEEDS_REVIEW = {
     "alert_name":     "Unusual API call from EC2 instance",
-    "device_name":    "app-prod-api-12",
-    "account_name":   "prod",
+    "device_name":    "acme-prod-api-12",
+    "account_name":   "acme-prod",
     "event_name":     "iam:ListRoles",
     "instance_id":    "i-0prod12345",
     "session_issuer": "ec2-instance-role",
@@ -55,13 +55,13 @@ _NEEDS_REVIEW = {
 _SIM101839_MOCK_CLOUDTRAIL = {
     "alert_name":     "Root Privilege Escalation",
     "device_name":    "ip-10-0-1-50",
-    "account_name":   "prod",
+    "account_name":   "acme-prod",
     "event_name":     "ssm:StartSession",
     "instance_id":    "i-04a2ce810d6b72956",
     "session_issuer": "SSMServiceRole",
     "user_arn":       "arn:aws:sts::123456789012:assumed-role/SSMServiceRole/ops@example.com",
     "user_name":      "ops@example.com",
-    "access_key_id":  "ASIAEXAMPLE01234",
+    "access_key_id":  "ASIAEXAMPLE1234",
     "source_ip":      "10.220.9.96",
     "ip_geo":         "Mumbai (Corporate VPN)",
     "mfa_status":     "ENABLED",
@@ -86,7 +86,7 @@ async def run_suite() -> dict:
     # ── 1. Ollama connectivity ────────────────────────────────────────────────
     try:
         import httpx
-        url = os.getenv("LOCAL_LLM_URL", "http://localhost:11434")
+        url = os.getenv("LOCAL_LLM_URL", "http://localhost:80")
         async with httpx.AsyncClient(timeout=10.0) as c:
             r = await c.get(url.rstrip("/") + "/api/tags")
             r.raise_for_status()
@@ -177,7 +177,7 @@ async def run_suite() -> dict:
         "alertLink\nhttps://security.microsoft.com/alerts/sn1043af19-69a3-4126-b7ca-50fdd94a4bf8?tid=xyz\n"
         "Alert Display Name\nRoot Privilege Escalation\n"
         "IncidentURl\nhttps://portal.azure.com/#asset/Microsoft_Azure_Security_Insights/Incident/"
-        "subscriptions/00000000/providers/Microsoft.SecurityInsights/Incidents/abc123\n"
+        "subscriptions/6d763960/providers/Microsoft.SecurityInsights/Incidents/abc123\n"
     )
     checks.append(_p(parse_mde_alert_id(sn_desc) is None,
                      "jira_sn_alert_rejected_as_mde", str(parse_mde_alert_id(sn_desc))))

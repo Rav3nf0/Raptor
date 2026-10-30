@@ -1,0 +1,67 @@
+{
+  "type": "doc",
+  "version": 1,
+  "content": [
+    {
+      "type": "table",
+      "content": [
+        {
+          "type": "tableRow",
+          "content": [
+            {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Incident description"}]}]},
+            {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Bulk download detected"}]}]}
+          ]
+        },
+        {
+          "type": "tableRow",
+          "content": [
+            {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Severity"}]}]},
+            {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Medium"}]}]}
+          ]
+        },
+        {
+          "type": "tableRow",
+          "content": [
+            {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "IncidentURl"}]}]},
+            {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "https://portal.azure.com/#blade/.../Incidents/123"}]}]}
+          ]
+        },
+        {
+          "type": "tableRow",
+          "content": [
+            {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "alertLink"}]}]},
+            {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "https://example/alert/1"}]}]}
+          ]
+        },
+        {
+          "type": "tableRow",
+          "content": [
+            {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Tactics"}]}]},
+            {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Exfiltration"}]}]}
+          ]
+        },
+        {
+          "type": "tableRow",
+          "content": [
+            {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Alert Display Name"}]}]},
+            {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Netskope - Suspicious Bulk Download Detection"}]}]}
+          ]
+        },
+        {
+          "type": "tableRow",
+          "content": [
+            {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Involved Users"}]}]},
+            {"type": "tableHeader", "content": [{"type": "paragraph", "content": []}]}
+          ]
+        },
+        {
+          "type": "tableRow",
+          "content": [
+            {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "DLP Profile"}]}]},
+            {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "n/a"}]}]}
+          ]
+        }
+      ]
+    }
+  ]
+}

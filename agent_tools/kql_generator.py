@@ -153,7 +153,8 @@ def _deterministic_fallback(intent: str, source: str, device: str, account: str,
     },
 )
 async def hunt_query(intent: str, source: str, device: str = "", account: str = "", upn: str = "",
-                     sha256: str = "", ip: str = "", url: str = "", window_hours: int = 24) -> dict:
+                     sha256: str = "", ip: str = "", url: str = "", window_hours: int = 24,
+                     alert_time: str = "") -> dict:
     from lib.mde_client import (
         preflight_kql, _sanitize_kql_columns, run_mde_query, run_sentinel_query, get_access_token,
     )
@@ -173,6 +174,13 @@ async def hunt_query(intent: str, source: str, device: str = "", account: str = 
         w = 24
     engine = ("Microsoft Defender Advanced Hunting (Device* tables)" if source == "mde"
               else "Microsoft Sentinel Log Analytics")
+    # Centred on the alert (alert_time is loop-injected), like every other hunt_*. ago(Nh)
+    # counts back from NOW: DEMO-117744 was triaged at 04:53 UTC with window_hours=1, so the
+    # 03:52 upload it was looking for sat a minute outside the window and the agent reported
+    # "query failed … file and bucket unknown".
+    from agent_tools.hunt import _alert_anchor, _MDE_DAYS, _SENTINEL_DAYS
+    anchor, anchor_note = _alert_anchor(alert_time, _MDE_DAYS if source == "mde" else _SENTINEL_DAYS)
+    time_line, anchor = T._window(time_field, w, anchor)
 
     prompt = (
         f"Write a {engine} KQL query for this hunt:\n\"{intent}\"\n\n"
@@ -180,7 +188,7 @@ async def hunt_query(intent: str, source: str, device: str = "", account: str = 
         "Rules:\n"
         "- Return ONLY the KQL, no explanation, no markdown fences\n"
         "- Start with a valid table name (never a comment or backticks)\n"
-        f"- Add a time filter: | where {time_field} > ago({w}h)\n"
+        f"- Add this time filter exactly as written: {time_line}\n"
         "- End with | take 50\n"
         f"- For entity values use ONLY these placeholder tokens, UNQUOTED, exactly as written: {ph_list}\n"
         "  example: | where DeviceName =~ <DEVICE>\n"
@@ -188,45 +196,32 @@ async def hunt_query(intent: str, source: str, device: str = "", account: str = 
     )
     raw, gerr = await _gemini_generate(prompt)
     if gerr:
-        # Gemini is the KQL author for this tool; when it's down (429/5xx exhausted) don't
-        # just bounce the agent to hand-written raw KQL — first try a DETERMINISTIC builder
-        # from the intent + the entities we already hold. Builders run locally (no LLM), so
-        # this removes the Gemini dependency for the common hunts even when the model is out.
-        # This is the DEMO-106557 case: an "executions" hunt on a device, Gemini 429 →
-        # falls through to mde_process instead of a false-escalating errored hunt.
-        fb = _deterministic_fallback(intent, source, device, account, upn, sha256, ip, url, w)
-        if fb:
-            fb_kql, fb_kind, fb_label = fb
-            try:
-                if fb_kind == "mde":
-                    token = await get_access_token()
-                    if token:
-                        rows, err = await run_mde_query(fb_kql, token)
-                    else:
-                        rows, err = None, "MDE token unavailable"
-                else:
-                    rows, err = await run_sentinel_query(fb_kql)
-                if not err and rows is not None:
-                    return {"rows": rows, "count": len(rows), "kql": fb_kql,
-                            "note": f"Gemini unavailable ({gerr}); ran deterministic builder "
-                                    f"{fb_label} instead — result is authoritative, treat as a normal hunt."}
-            except Exception as exc:
-                logger.warning("hunt_query deterministic fallback failed: %s", exc)
-        # No builder fit (or it errored) → let the agent know the raw free-write fallback is legit.
-        return {"error": f"hunt_query unavailable: {gerr}. Fall back to raw KQL via "
-                         f"mde_advanced_hunt/sentinel_run_kql if you cannot use another hunt_* tool.",
-                "rows": []}
+        return await _fallback_or_error(f"Gemini unavailable ({gerr})", intent, source, device,
+                                        account, upn, sha256, ip, url, w)
 
-    # Substitute placeholders with safely-quoted local values (entities never went to Gemini).
-    kql = raw
-    for token, val in avail.items():
-        kql = kql.replace(token, T._lit(val))
-    leftover = _TOKEN_RE.findall(kql)
-    if leftover:
-        return {"error": f"generated query used unfilled placeholder(s) {sorted(set(leftover))} — "
-                         "rephrase the intent or provide those entities as params", "rows": []}
+    kql, err = _fill_and_sanitize(raw, avail)
+    if err == "rejected":
+        # The sanitizer refuses a query whose `where` names a column it doesn't know,
+        # because dropping that filter would silently widen the hunt. It used to hand
+        # back None, which preflight then reported as "empty KQL after stripping
+        # comments" — so every such hunt failed with an error that named nothing
+        # (log-ingestion triage, 9-13 Oct). Say which columns, and ask Gemini once more.
+        bad = _unknown_where_cols(raw)
+        raw2, gerr2 = await _gemini_generate(
+            prompt + f"\nYour previous query filtered on column(s) that do not exist: "
+                     f"{', '.join(sorted(bad)) or 'unknown'}. Use ONLY the tables and columns "
+                     "listed above.\n")
+        kql, err = _fill_and_sanitize(raw2, avail) if not gerr2 else (None, "rejected")
+        if err == "rejected":
+            return await _fallback_or_error(
+                f"the generated query filtered on column(s) not in the known schema "
+                f"({', '.join(sorted(bad)) or 'unknown'}) and was refused rather than run "
+                "with the filter removed", intent, source, device, account, upn, sha256, ip, url, w)
+    if err:
+        return {"error": err, "rows": []}
 
-    kql = _sanitize_kql_columns(kql)          # prune any hallucinated columns
+    if anchor:
+        kql = _force_window(kql, time_field, time_line)
     cleaned, pf_err = preflight_kql(kql)       # strip + lint
     if pf_err:
         return {"error": f"{pf_err} (Gemini-generated)", "rows": [], "kql": kql}
@@ -240,4 +235,87 @@ async def hunt_query(intent: str, source: str, device: str = "", account: str = 
         rows, err = await run_mde_query(cleaned, token)
     if err:
         return {"error": err, "rows": [], "kql": cleaned}
-    return {"rows": rows, "count": len(rows), "kql": cleaned}
+    out = {"rows": rows, "count": len(rows), "kql": cleaned}
+    if anchor:
+        out["anchored_on"] = anchor
+    if anchor_note:
+        out["anchor_note"] = anchor_note
+    return out
+
+
+_AGO_FILTER = r"\|\s*where\s+{f}\s*(?:>=?|between)\s*(?:ago\([^)]*\)|\([^|]*\))"
+
+
+def _force_window(kql: str, time_field: str, time_line: str) -> str:
+    """Make the anchored window the query's time filter, whatever the generator wrote.
+
+    A model asked for an exact line still sometimes writes `ago(Nh)`; replacing it keeps the
+    hunt on the alert. With no time filter at all, the line goes straight after the table."""
+    pat = re.compile(_AGO_FILTER.format(f=re.escape(time_field)), re.I)
+    if pat.search(kql):
+        return pat.sub(time_line.replace("\\", "\\\\"), kql, count=1)
+    if time_line in kql:
+        return kql
+    first, _, rest = kql.partition("\n")
+    return f"{first}\n{time_line}\n{rest}" if rest else f"{first}\n{time_line}"
+
+
+def _unknown_where_cols(kql: str) -> set[str]:
+    """Columns a `where` stage names that no known schema has (what the sanitizer refuses)."""
+    from lib.mde_client import _invalid_cols
+    declared = set(re.findall(r"^\s*let\s+([A-Za-z_]\w*)\s*=", kql or "", re.MULTILINE))
+    bad: set[str] = set()
+    for line in (kql or "").splitlines():
+        st = line.strip()
+        if st.startswith("|") and st.lstrip("|").strip().lower().startswith("where"):
+            bad |= _invalid_cols(st) - declared
+    return bad
+
+
+def _fill_and_sanitize(raw: str, avail: dict) -> tuple[str | None, str | None]:
+    """Substitute placeholders locally, then prune invented columns.
+    Returns (kql, None), (None, "rejected") when the sanitizer refuses it, or (None, error)."""
+    from lib.mde_client import _sanitize_kql_columns
+    from lib import kql_templates as T
+    kql = raw or ""
+    for token, val in avail.items():
+        kql = kql.replace(token, T._lit(val))
+    leftover = _TOKEN_RE.findall(kql)
+    if leftover:
+        return None, (f"generated query used unfilled placeholder(s) {sorted(set(leftover))} — "
+                      "rephrase the intent or provide those entities as params")
+    clean = _sanitize_kql_columns(kql)
+    if clean is None:
+        return None, "rejected"
+    return clean, None
+
+
+async def _fallback_or_error(reason: str, intent: str, source: str, device: str, account: str,
+                             upn: str, sha256: str, ip: str, url: str, w: int) -> dict:
+    """Gemini gave no usable query (down, or refused by the sanitizer): try a deterministic
+    builder for this intent + entities, else tell the agent why.
+
+    Builders run locally (no LLM), so the common hunts survive without Gemini. This is the
+    DEMO-106557 case: an "executions" hunt on a device, Gemini 429 -> mde_process instead of
+    a false-escalating errored hunt.
+    """
+    from lib.mde_client import run_mde_query, run_sentinel_query, get_access_token
+    fb = _deterministic_fallback(intent, source, device, account, upn, sha256, ip, url, w)
+    if fb:
+        fb_kql, fb_kind, fb_label = fb
+        try:
+            if fb_kind == "mde":
+                token = await get_access_token()
+                rows, err = (await run_mde_query(fb_kql, token)) if token else (None, "MDE token unavailable")
+            else:
+                rows, err = await run_sentinel_query(fb_kql)
+            if not err and rows is not None:
+                return {"rows": rows, "count": len(rows), "kql": fb_kql,
+                        "note": f"Generated query not usable ({reason}); ran deterministic builder "
+                                f"{fb_label} instead — result is authoritative, treat as a normal hunt."}
+        except Exception as exc:
+            logger.warning("hunt_query deterministic fallback failed: %s", exc)
+    # No builder fit (or it errored): the raw free-write tools are the legitimate next step.
+    return {"error": f"hunt_query could not run: {reason}. Fall back to raw KQL via "
+                     "mde_advanced_hunt/sentinel_run_kql if no other hunt_* tool fits.",
+            "rows": []}

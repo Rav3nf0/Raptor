@@ -139,6 +139,46 @@ async def _run_sentinel(builder, **kw) -> dict:
 
 _WINDOW = {"type": "integer", "description": "Lookback window in hours (default 24, max 168)", "default": 24}
 
+# Retention of what each runner queries: MDE Advanced Hunting keeps 30 days, Sentinel's
+# workspace keeps 180 (every table starts 2026-04-11, measured 2026-10-08).
+_MDE_DAYS, _SENTINEL_DAYS = 29, 179
+
+
+def _alert_anchor(alert_time: str, max_age_days: int) -> tuple[str, str]:
+    """(anchor, note) for a hunt centred on the alert.
+
+    `alert_time` is injected by the agent loop (agent_core/loop.py), never chosen by the
+    model, and is the alert's own timestamp. An anchor older than the table's retention
+    can only return zero rows, and zero rows reads as "clean" — so it is dropped, the
+    hunt falls back to a recent window, and the note says so in the tool result rather
+    than letting dead time pass for evidence. Unparseable values are dropped the same way.
+    """
+    if not str(alert_time or "").strip():
+        return "", ""
+    from datetime import datetime, timedelta, timezone
+    try:
+        p = datetime.fromisoformat(str(alert_time).strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return "", f"ignored unparseable alert_time={alert_time}; used a recent window"
+    if p.tzinfo is None:
+        p = p.replace(tzinfo=timezone.utc)
+    age = datetime.now(timezone.utc) - p
+    if age > timedelta(days=max_age_days) or age < timedelta(days=-1):
+        return "", (f"ignored alert_time={alert_time}: outside the {max_age_days + 1}-day "
+                    "retention — used a recent window, so these rows are NOT the ones "
+                    "around the alert")
+    return str(alert_time), ""
+
+
+async def _anchored(runner, builder, alert_time: str, max_age_days: int, **kw) -> dict:
+    anchor, note = _alert_anchor(alert_time, max_age_days)
+    res = await runner(builder, anchor_iso=anchor, **kw)
+    if anchor:
+        res["anchored_on"] = anchor
+    if note:
+        res["anchor_note"] = note
+    return res
+
 
 @register(
     name="hunt_process",
@@ -156,15 +196,23 @@ _WINDOW = {"type": "integer", "description": "Lookback window in hours (default 
         },
     },
 )
-async def hunt_process(device: str = "", process_name: str = "", window_hours: int = 24) -> dict:
-    return await _run_mde(T.mde_process, device=device, process_name=process_name, window_hours=window_hours)
+async def hunt_process(device: str = "", process_name: str = "", window_hours: int = 24,
+                       alert_time: str = "") -> dict:
+    return await _anchored(_run_mde, T.mde_process, alert_time, _MDE_DAYS,
+                           device=device, process_name=process_name, window_hours=window_hours)
 
 
 @register(
     name="hunt_network",
     description=(
         "Hunt MDE network connections (DeviceNetworkEvents) by device, remote IP, or remote URL/domain. "
-        "Use for beaconing / C2 / IOC-presence checks. Provide at least one of device / remote_ip / remote_url."
+        "Use for beaconing / C2 / IOC-presence checks, and to answer HOW something arrived on a host "
+        "when the alert names no remote address. Provide at least one of device / remote_ip / remote_url.\n"
+        "alert_time centres the window on the alert instead of ending it at now. A device-wide hunt "
+        "with no remote_ip matches far more than the 50-row cap, so without an anchor you get the "
+        "newest 50 — on a re-triage those are connections that POSTDATE the detection. Each row "
+        "carries SecondsFromAlert (negative = before the detection); read it before concluding "
+        "anything about arrival order."
     ),
     parameters={
         "type": "object",
@@ -173,11 +221,40 @@ async def hunt_process(device: str = "", process_name: str = "", window_hours: i
             "remote_ip": {"type": "string", "description": "Remote IP address (exact match)"},
             "remote_url": {"type": "string", "description": "Remote URL or domain (substring match)"},
             "window_hours": _WINDOW,
+            "alert_time": {"type": "string",
+                           "description": "Alert time (ISO 8601). Centres the window on the alert; "
+                                          "window_hours stays the TOTAL span, split either side."},
         },
     },
 )
-async def hunt_network(device: str = "", remote_ip: str = "", remote_url: str = "", window_hours: int = 24) -> dict:
-    return await _run_mde(T.mde_network, device=device, remote_ip=remote_ip, remote_url=remote_url, window_hours=window_hours)
+async def hunt_network(device: str = "", remote_ip: str = "", remote_url: str = "",
+                       window_hours: int = 24, alert_time: str = "") -> dict:
+    # An anchor outside DeviceNetworkEvents' 30d retention can only return zero rows,
+    # and zero rows reads as "this host talked to nothing" — the most dangerous possible
+    # answer to an arrival-vector question. Drop an unusable anchor and say so, rather
+    # than answering about dead time. Same guard as hunt_ip_owner, same reason.
+    _anchor, _note = alert_time, ""
+    if alert_time:
+        from datetime import datetime, timedelta, timezone
+        try:
+            _p = datetime.fromisoformat(str(alert_time).strip().replace("Z", "+00:00"))
+            if _p.tzinfo is None:
+                _p = _p.replace(tzinfo=timezone.utc)
+            _age = datetime.now(timezone.utc) - _p
+            if _age > timedelta(days=29) or _age < timedelta(days=-1):
+                _anchor = ""
+                _note = (f" (ignored alert_time={alert_time}: outside DeviceNetworkEvents' 30d "
+                         "retention — used a recent window instead, so these are today's "
+                         "connections, NOT the ones around the alert)")
+        except (TypeError, ValueError):
+            _anchor = ""
+            _note = f" (ignored unparseable alert_time={alert_time}; used a recent window)"
+    res = await _run_mde(T.mde_network, device=device, remote_ip=remote_ip,
+                         remote_url=remote_url, window_hours=window_hours,
+                         anchor_iso=_anchor)
+    if _note:
+        res["anchor_note"] = _note.strip()
+    return res
 
 
 @register(
@@ -196,8 +273,10 @@ async def hunt_network(device: str = "", remote_ip: str = "", remote_url: str = 
         },
     },
 )
-async def hunt_file(sha256: str = "", file_name: str = "", device: str = "", window_hours: int = 24) -> dict:
-    return await _run_mde(T.mde_file, sha256=sha256, file_name=file_name, device=device, window_hours=window_hours)
+async def hunt_file(sha256: str = "", file_name: str = "", device: str = "", window_hours: int = 24,
+                    alert_time: str = "") -> dict:
+    return await _anchored(_run_mde, T.mde_file, alert_time, _MDE_DAYS, sha256=sha256,
+                           file_name=file_name, device=device, window_hours=window_hours)
 
 
 @register(
@@ -235,9 +314,10 @@ async def hunt_file(sha256: str = "", file_name: str = "", device: str = "", win
     },
 )
 async def hunt_events(device: str = "", file_name: str = "", action_type: str = "",
-                      sha256: str = "", window_hours: int = 24) -> dict:
-    return await _run_mde(T.mde_events, device=device, file_name=file_name,
-                          action_type=action_type, sha256=sha256, window_hours=window_hours)
+                      sha256: str = "", window_hours: int = 24, alert_time: str = "") -> dict:
+    return await _anchored(_run_mde, T.mde_events, alert_time, _MDE_DAYS, device=device,
+                           file_name=file_name, action_type=action_type, sha256=sha256,
+                           window_hours=window_hours)
 
 
 @register(
@@ -271,9 +351,9 @@ async def hunt_events(device: str = "", file_name: str = "", action_type: str = 
     },
 )
 async def hunt_file_burst(device: str = "", window_hours: int = 24,
-                          min_files: int = 50) -> dict:
-    return await _run_mde(T.mde_file_burst, device=device,
-                          window_hours=window_hours, min_files=min_files)
+                          min_files: int = 50, alert_time: str = "") -> dict:
+    return await _anchored(_run_mde, T.mde_file_burst, alert_time, _MDE_DAYS, device=device,
+                           window_hours=window_hours, min_files=min_files)
 
 
 @register(
@@ -316,9 +396,9 @@ async def hunt_file_burst(device: str = "", window_hours: int = 24,
     },
 )
 async def hunt_script_egress(device: str = "", process_name: str = "powershell",
-                             lookback_days: int = 7) -> dict:
-    res = await _run_mde(T.mde_script_egress, device=device, process_name=process_name,
-                         lookback_days=lookback_days)
+                             lookback_days: int = 7, alert_time: str = "") -> dict:
+    res = await _anchored(_run_mde, T.mde_script_egress, alert_time, _MDE_DAYS, device=device,
+                          process_name=process_name, lookback_days=lookback_days)
     if res.get("error"):
         return res
     rows = res.get("rows") or []
@@ -347,8 +427,13 @@ async def hunt_script_egress(device: str = "", process_name: str = "powershell",
         "Resolve WHO granted a privileged role or group to WHOM, and WHICH roles "
         "(Entra AuditLogs).\n"
         "USE THIS for every privileged-group / privileged-role / 'added to Entra ID "
-        "Privileged Groups' / credential-added-to-service-principal alert. Do NOT use "
-        "hunt_query: the acting principal is genuinely absent from the alert, and a "
+        "Privileged Groups' alert. Do NOT use it for a credential-added-to-"
+        "Application/Service-Principal alert — its query only matches role/group "
+        "MEMBERSHIP operations (Add member to role/group), never credential-management "
+        "operations, so it always returns 0 rows for that alert family regardless of "
+        "whether anything is wrong; the named user on that alert is already the actor, "
+        "not a recipient to look up. Do NOT use hunt_query for role/group grants either: "
+        "the acting principal is genuinely absent from the alert, and a "
         "free-written AuditLogs query returns rows without the deciding fields — the "
         "role name is NOT in TargetResources.displayName (empty for roles), it is nested "
         "in modifiedProperties under Role.DisplayName. One ticket pulled 50 rows that way "
@@ -506,8 +591,25 @@ async def hunt_service(names=None, lookback_days: int = 30) -> dict:
         _t = int(r.get("TrustedHashes") or 0)
         _u = int(r.get("UntrustedHashes") or 0)
         _gap = int(r.get("NoCertRecord") or 0)
+        _odd = int(r.get("OddUnverifiedHashes") or 0)
         _dev = int(r.get("Devices") or 0)
-        if _u:
+        if _odd:
+            # Not every such row is an impostor: Conexant's CxAudioSvc.exe lives in
+            # C:\Windows\CxSvc on 23 devices. It is unverifiable, and that is what to say.
+            _paths = [p for p in (r.get("Paths") or []) if p]
+            _one = len({str(p).lower() for p in _paths}) == 1 and _dev >= 5
+            r["verdict"] = (
+                f"NOT VERIFIABLE — {_odd} cop{'y' if _odd == 1 else 'ies'} with no certificate "
+                "record run from outside the standard install folders (System32, Program "
+                "Files). " + (
+                    f"One consistent folder on {_dev} devices looks like a vendor's own "
+                    "install path, not an impostor — but nothing here proves the binary is "
+                    "genuine. Escalate so a person can confirm the folder belongs to the vendor."
+                    if _one else
+                    "Copies in more than one such folder, or on few devices, is how a "
+                    "renamed impostor looks. Check the paths below and escalate.")
+                + (" Trusted copies elsewhere do not vouch for these." if _t else ""))
+        elif _u:
             r["verdict"] = (f"UNTRUSTED — {_u} of {_t + _u + _gap} copies carry a signature "
                             "that does not chain to a trusted root. Check the path and "
                             "escalate.")
@@ -638,8 +740,10 @@ async def hunt_ip_owner(ip: str = "", alert_time: str = "", window_hours: int = 
         },
     },
 )
-async def hunt_logons(device: str = "", account: str = "", window_hours: int = 24) -> dict:
-    return await _run_mde(T.mde_logons, device=device, account=account, window_hours=window_hours)
+async def hunt_logons(device: str = "", account: str = "", window_hours: int = 24,
+                      alert_time: str = "") -> dict:
+    return await _anchored(_run_mde, T.mde_logons, alert_time, _MDE_DAYS,
+                           device=device, account=account, window_hours=window_hours)
 
 
 @register(
@@ -653,7 +757,15 @@ async def hunt_logons(device: str = "", account: str = "", window_hours: int = 2
         "FIRST: it is the only part that answers 'how many failed and why', and the rows "
         "are a sample that can miss failures entirely on a busy account. A large count "
         "against a benign ResultType (e.g. 70044, session expired by conditional-access "
-        "sign-in-frequency) explains a spike without any threat."
+        "sign-in-frequency) explains a spike without any threat.\n"
+        "`outcomes` covers BOTH interactive and non-interactive sign-ins (the `Table` "
+        "column says which); `rows` are interactive only. If `outcomes` shows NO failure "
+        "at all, you have NOT found what fired the alert — that is missing evidence, not "
+        "proof the alert is wrong. Do not auto-close on it.\n"
+        "`source_ips` gives, per source IP: events, failures, successes, ASN, country and a "
+        "`note`. Describe an IP only from this. Ask what a security engineer asks: did a "
+        "SUCCESS come from an IP that also produced failures, or from a network this user "
+        "doesn't normally use? The corporate Netskope egress identifies nobody."
     ),
     parameters={
         "type": "object",
@@ -664,8 +776,9 @@ async def hunt_logons(device: str = "", account: str = "", window_hours: int = 2
         "required": ["upn"],
     },
 )
-async def hunt_signin(upn: str, window_hours: int = 24) -> dict:
-    res = await _run_sentinel(T.sentinel_signin, upn=upn, window_hours=window_hours)
+async def hunt_signin(upn: str, window_hours: int = 24, alert_time: str = "") -> dict:
+    res = await _anchored(_run_sentinel, T.sentinel_signin, alert_time, _SENTINEL_DAYS,
+                          upn=upn, window_hours=window_hours)
     if res.get("error"):
         return res
     # Counts computed over the FULL window, not over the capped rows — a sign-in-failure
@@ -673,7 +786,8 @@ async def hunt_signin(upn: str, window_hours: int = 24) -> dict:
     # 50 of 1,561 rows shown, all successes, 608 failures unseen, escalated against an
     # L1+L2 FP). Additive: `rows` keeps its existing shape, so nothing that already reads
     # this tool changes behaviour.
-    summary = await _run_sentinel(T.sentinel_signin_summary, upn=upn, window_hours=window_hours)
+    summary = await _anchored(_run_sentinel, T.sentinel_signin_summary, alert_time,
+                              _SENTINEL_DAYS, upn=upn, window_hours=window_hours)
     if not summary.get("error"):
         res["outcomes"] = summary.get("rows") or []
         _fail = sum(int(r.get("Events") or 0) for r in res["outcomes"]
@@ -681,7 +795,60 @@ async def hunt_signin(upn: str, window_hours: int = 24) -> dict:
         _ok = sum(int(r.get("Events") or 0) for r in res["outcomes"]
                   if str(r.get("ResultType") or "0") in ("0", ""))
         res["outcome_totals"] = {"success": _ok, "failure": _fail}
-    return res
+    # Per source IP, labelled in code. The model used to describe IPs it never looked up
+    # (DEMO-116466: "internal (India)"); these are the facts to reason from instead.
+    ips = await _anchored(_run_sentinel, T.sentinel_signin_ips, alert_time, _SENTINEL_DAYS,
+                          upn=upn, window_hours=window_hours)
+    if not ips.get("error"):
+        _all = [_label_signin_ip(r) for r in (ips.get("rows") or [])]
+        res["source_ips"] = _all[:8]
+        if len(_all) > 8:
+            res["source_ips_more"] = f"{len(_all) - 8} more IP(s), fewer events each"
+    return _compact_signin(res)
+
+
+def _compact_signin(res: dict) -> dict:
+    """Order and trim for the model: totals, then one short line per failure reason, then
+    per-IP facts, then raw rows. Everything a sign-in spike is decided on has to fit in
+    the first ~2,500 characters the model sees (agent_core.loop._for_model); in DEMO-116466
+    the outcome table alone was 3.4 KB and the per-IP facts never arrived."""
+    out = {k: res[k] for k in ("error", "outcome_totals") if k in res}
+    if "outcomes" in res:
+        out["outcomes"] = [
+            {"Table": o.get("Table"), "ResultType": o.get("ResultType"),
+             "Events": o.get("Events"), "IPs": o.get("IPs"),
+             "Reason": str(o.get("ResultDescription") or "")[:90]}
+            for o in sorted(res["outcomes"], key=lambda o: -int(o.get("Events") or 0))]
+    for k in ("source_ips", "source_ips_more"):
+        if k in res:
+            out[k] = res[k]
+    out.update({k: v for k, v in res.items() if k not in out})
+    return out
+
+
+# Netskope's egress: Acme traffic leaves through it, so hundreds of users share it.
+_CORPORATE_EGRESS_ASNS = {"55256": "Acme corporate egress via Netskope (AS55256)"}
+
+
+def _label_signin_ip(r: dict) -> dict:
+    """Add a plain-language `note` to one per-IP sign-in row."""
+    from lib.mde_client import _is_private_ip
+    ip, asn = str(r.get("IPAddress") or ""), str(r.get("ASN") or "")
+    if asn in _CORPORATE_EGRESS_ASNS:
+        # Neutral, not reassuring: DEMO-116466's re-run read "shared egress" as "trusted by
+        # design". A stolen session routed through Netskope looks exactly like an employee.
+        note = ("corporate Netskope egress shared by hundreds of users: NOT a trust signal "
+                "either way, it cannot tell this user from anyone else behind it")
+    elif _is_private_ip(ip):
+        note = "private address (internal network or VPN)"
+    else:
+        note = f"outside network, ASN {asn or '?'}, {r.get('Country') or '?'}"
+    f_, s_ = int(r.get("Failures") or 0), int(r.get("Successes") or 0)
+    # Stated, not left to inference: the same re-run said no IP had both, while its own
+    # numbers put 386 failures and 101 successes on the two egress addresses.
+    if f_ and s_:
+        note += "; BOTH failures and successes from this IP"
+    return {"IP": ip, "Events": r.get("Events"), "Failures": f_, "Successes": s_, "note": note}
 
 
 @register(
@@ -769,7 +936,17 @@ async def hunt_ca_policy_change(actor: str = "", policy: str = "", window_hours:
         "BypassLiveId) from a real change to a person's mailbox (forwarding, delegation, "
         "external access).\n"
         "Read ExternalAccess=false as an internal admin action, and UserType=Admin with "
-        "an AppPoolName as a service component rather than a person."
+        "an AppPoolName as a service component rather than a person.\n"
+        "`KeySettings` carries the VALUE of the settings that decide risk (audit on/off, "
+        "forwarding/redirect targets, AccessRights, Trustee). Read it before calling any "
+        "audit, forwarding or permission change routine: AdminAuditLogEnabled=True is "
+        "maintenance, =False or AuditBypassEnabled=True is someone blinding the tenant, "
+        "and a forwarding address outside the company is exfiltration until proven otherwise.\n"
+        "Every PERSON named in the alert did one of its rare operations — hunt each with "
+        "user=<them> and NO operation (read-only noise such as MailItemsAccessed is left "
+        "out unless you name it) to see what they actually changed. A New-InboxRule or "
+        "Set-InboxRule that forwards, redirects, deletes or moves mail is a classic "
+        "mailbox-takeover step."
     ),
     parameters={
         "type": "object",
@@ -788,9 +965,9 @@ async def hunt_ca_policy_change(actor: str = "", policy: str = "", window_hours:
     },
 )
 async def hunt_office(operation: str = "", user: str = "", target: str = "",
-                      window_hours: int = 24) -> dict:
-    return await _run_sentinel(T.sentinel_office_activity, operation=operation, user=user,
-                               target=target, window_hours=window_hours)
+                      window_hours: int = 24, alert_time: str = "") -> dict:
+    return await _anchored(_run_sentinel, T.sentinel_office_activity, alert_time, _SENTINEL_DAYS,
+                           operation=operation, user=user, target=target, window_hours=window_hours)
 
 
 @register(
@@ -808,5 +985,7 @@ async def hunt_office(operation: str = "", user: str = "", target: str = "",
         },
     },
 )
-async def hunt_sentinel_event(host: str = "", account: str = "", window_hours: int = 24) -> dict:
-    return await _run_sentinel(T.sentinel_security_event, host=host, account=account, window_hours=window_hours)
+async def hunt_sentinel_event(host: str = "", account: str = "", window_hours: int = 24,
+                              alert_time: str = "") -> dict:
+    return await _anchored(_run_sentinel, T.sentinel_security_event, alert_time, _SENTINEL_DAYS,
+                           host=host, account=account, window_hours=window_hours)

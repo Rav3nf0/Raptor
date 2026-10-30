@@ -1,0 +1,63 @@
+rules:
+# ── Defender exclusion suppression ──────────────────────────────────────────
+# Add your central MDM / GPO service accounts below so that exclusions written
+# by those accounts are suppressed.  Any exclusion written by a user account
+# or a script host that is NOT listed here will still surface as a finding.
+#
+# Pattern:
+#   detector: defender_exclusions
+#   match:
+#     account_equals: <InitiatingProcessAccountName from Defender telemetry>
+#
+# Example entries (replace with your actual service account names):
+- name: central-mgmt-intune-svc
+  detector: defender_exclusions
+  match:
+    account_equals: svc_intune
+  reason: Intune MDM service account — exclusions are centrally managed
+  owner: security-team@corp.example.com
+- name: central-mgmt-sccm-svc
+  detector: defender_exclusions
+  match:
+    account_equals: svc_sccm
+  reason: SCCM/ConfigMgr agent account — exclusions are centrally managed
+  owner: security-team@corp.example.com
+# ────────────────────────────────────────────────────────────────────────────
+- detector: rare_external_domains
+  match:
+    indicator_matches: ^23\.
+  name: akamai-cdn-23-range
+  owner: td@example.com
+  reason: Akamai CDN 23.x ranges, noisy in rare_domains
+- detector: rare_external_domains
+  match:
+    indicator_startswith: 104.18.
+  name: cloudflare-edge-104-18
+  owner: td@example.com
+  reason: Cloudflare edge IPs
+- detector: unusual_remote_logons
+  match:
+    remote_ip_in:
+    - 192.168.75.10
+    - 192.168.75.11
+  name: jump-host-pair
+  owner: td@example.com
+  reason: Known admin jump host pair
+- detector: rare_external_domains
+  match:
+    indicator_startswith: 2405:200
+  name: ipv6-cdn-24xx
+  owner: td@example.com
+  reason: Known CDN v6 prefix
+- detector: exfil_patterns
+  match:
+    indicator_contains: sustained-connection-beacon
+  name: fp-exfil_patterns-sustained-connection-beacon-20260418
+  owner: td
+  reason: CDN traffic, confirmed benign
+- detector: suspicious_parent_child
+  match:
+    indicator_contains: chflags -r nouchg <userdir>/library/containers/com.microsoft.outlook
+  name: mac-outlook-tmp-unlock
+  owner: td@example.com
+  reason: Outlook for Mac clearing the immutable flag on its own sandbox temp folder (seen 2026-09-30)

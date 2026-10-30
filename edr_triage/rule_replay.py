@@ -344,6 +344,60 @@ def cloudtrail_row_to_dict(ev: dict) -> dict:
     return {k: v for k, v in out.items() if v}
 
 
+def _as_str_list(v) -> list[str]:
+    if isinstance(v, str):
+        try:
+            import json as _json
+            v = _json.loads(v)
+        except Exception:
+            v = [v]
+    if not isinstance(v, list):
+        v = [v] if v else []
+    return [str(x).strip() for x in v if str(x or "").strip()]
+
+
+def custom_details_cloudtrail_rows(alert_ent: dict) -> list[dict]:
+    """Root Privesc from the alert's OWN custom details — the commands and session ARNs
+    the rule recorded when it fired — one cloudtrail dict per ARN.
+
+    DEMO-116682 (2026-10-13): no compressedRec, and the rule replay came back empty
+    because the rule's query is `ago(1h)`-relative, so the last-resort ±90-min sweep of
+    every root process on the host was used. That swept in a configuration-benchmark scan
+    and Defender's log4j check (37 "commands"), so the person was asked about routine
+    `su - netra` the alert itself named exactly.
+
+    Same output shape as the rule replay (the rule's ", "-joined InitiatingCommands per
+    row), so precedents recorded from replays still compare. The lists are not paired,
+    so more than one ARN yields one row each and the caller's ambiguity check refuses to
+    pick an actor. Only for a single-host alert: with several hosts the commands cannot
+    be bound to one. Returns [] when either field is missing — the caller falls back.
+    """
+    cd = (alert_ent or {}).get("custom_details") or {}
+    if not isinstance(cd, dict):
+        return []
+    low = {str(k).lower(): v for k, v in cd.items()}
+    cmds = _as_str_list(low.get("commands"))
+    arns = list(dict.fromkeys(a for a in _as_str_list(low.get("userarn"))
+                              if a.lower().startswith("arn:")))
+    hosts = [h for h in ((alert_ent or {}).get("hosts") or []) if h]
+    if not cmds or not arns or len(hosts) != 1:
+        return []
+    lines = [c for blob in cmds for c in _split_cmds(blob)]
+    rows = []
+    for arn in arns:
+        parts = arn.split("/")
+        issuer = parts[1] if "assumed-role/" in arn and len(parts) >= 3 else ""
+        row = {"device_name": hosts[0], "user_arn": arn, "command": "; ".join(cmds),
+               "command_lines": lines, "event_name": "StartSession",
+               "source": "alert custom details"}
+        if (alert_ent or {}).get("event_time"):
+            row["time_generated"] = str(alert_ent["event_time"])
+        if issuer:
+            row["session_issuer"] = issuer
+        rows.append(row)
+    return rows
+
+
 async def decode_alert_cloudtrail_rows(
     incident_url: str,
     alert_props: dict,
@@ -379,7 +433,10 @@ async def decode_alert_cloudtrail_rows(
         # captured here. Non-CloudTrail rules likewise fall through to rule-replay.
         if not (d.get("instance_id") or d.get("session_issuer")):
             continue
-        key = (d.get("device_name", ""), d.get("instance_id", ""), d.get("command", ""))
+        # The principal is part of the key: two people running the same command on the
+        # same instance are two sessions, not one (DEMO-112299 lost the second person).
+        key = (d.get("device_name", ""), d.get("instance_id", ""), d.get("command", ""),
+               d.get("user_arn", ""))
         if key in seen:
             continue
         seen.add(key)
@@ -462,7 +519,10 @@ async def replay_alert_cloudtrail_rows(
             continue
         if not _host_match(d.get("device_name", ""), host_filter or []):
             continue
-        key = (d.get("device_name", ""), d.get("instance_id", ""), d.get("command", ""))
+        # The principal is part of the key: two people running the same command on the
+        # same instance are two sessions, not one (DEMO-112299 lost the second person).
+        key = (d.get("device_name", ""), d.get("instance_id", ""), d.get("command", ""),
+               d.get("user_arn", ""))
         if key in seen:
             continue
         seen.add(key)

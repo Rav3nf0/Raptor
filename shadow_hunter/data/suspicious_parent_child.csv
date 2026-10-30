@@ -1,0 +1,6 @@
+InitiatingProcessFileName,FileName,Count,Devices,SampleCommandLines
+outlook.exe,powershell.exe,3,"[""wks-18.corp.example.com""]","[""-enc dABoAGkAcwAgAGkAcwAgAGEAIAB0AGUAcwB0""]"
+msedge.exe,cmd.exe,2,"[""wks-06.corp.example.com""]","[""cmd.exe /c whoami && net user""]"
+teams.exe,wscript.exe,1,"[""wks-24.corp.example.com""]","[""wscript.exe C:\\Users\\Public\\payload.vbs""]"
+winword.exe,cmd.exe,4,"[""wks-05.corp.example.com"",""wks-14.corp.example.com""]","[""cmd.exe /c ipconfig /all"",""cmd.exe /c net localgroup administrators""]"
+excel.exe,powershell.exe,2,"[""srv-05.corp.example.com""]","[""powershell -NoP -NonI -W Hidden -Exec Bypass -Enc JABj""]"

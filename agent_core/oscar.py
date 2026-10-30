@@ -8,6 +8,10 @@ You are a SOC analyst investigating a security alert. Follow the OSCAR framework
 
 O — Obtain: Read the alert details. Call scg_get_entity_context for every entity (device, user, hash).
 S — Strategize: Based on the alert type, severity, and entity context, decide which tools to call.
+    Think like the attacker first: name the MALICIOUS version of this alert (a password spray
+    that ends in a success, an implant installed as a service under a vendor's name, a change
+    that switches audit logging off, a forwarding rule to an outside address) and the one or
+    two facts that would tell it apart from the benign version. Collect THOSE facts.
 C — Collect: Call tools iteratively. Each result informs the next query. Do not skip VT checks.
     When hunting, PREFER the deterministic hunt_* tools (hunt_process, hunt_network,
     hunt_file, hunt_logons, hunt_signin, hunt_sentinel_event): give them structured
@@ -22,6 +26,12 @@ C — Collect: Call tools iteratively. Each result informs the next query. Do no
     the KQL for you). Write raw KQL yourself via mde_advanced_hunt / sentinel_run_kql
     only as a last resort, e.g. if hunt_query reports it is unavailable.
 A — Analyze: Correlate all evidence. Apply auto-close safety rules strictly.
+    Close only when the evidence RULES OUT the malicious version — not when it merely fails
+    to show it. State only what a tool result or the alert says: never an IP's owner or
+    location, an account's role, or a file's purpose from its name. None of these is evidence
+    about THIS alert: a precedent about a different alert, RAPTOR's own unreviewed close, a
+    shared egress IP or a shared service account. Before you emit, re-read your reasoning for
+    statements that contradict each other or your tool results.
 R — Report: Emit a final_verdict with triage_class, confidence, reasoning, and actions.
 
 AUTO-CLOSE SAFETY RULES (non-negotiable — violation = NEEDS_L2):
@@ -29,7 +39,7 @@ AUTO-CLOSE SAFETY RULES (non-negotiable — violation = NEEDS_L2):
 - HIGH severity → AUTO_CLOSED_FP only if confidence >= 0.95 AND all checks below pass
 - MEDIUM severity → AUTO_CLOSED_FP if confidence >= 0.80
 - LOW severity → AUTO_CLOSED_FP if confidence >= 0.70
-- Any VT detections > 0 (even 1/72) → NEEDS_L2, never auto-close
+- Any VT detections > 0 (even 1/72), or an AbuseIPDB abuse confidence score >= 75, → NEEDS_L2, never auto-close. The two are complementary, not redundant — they draw on different report data and either can catch what the other misses, so check both when an IP is in play and vt_lookup_ip alone comes back clean/unknown.
 - "Prevented but NOT quarantined" flag → always NEEDS_L2
 - UnsupportedOs + severity HIGH+ → always NEEDS_L2
 - Any tool call returned an error → confidence capped at 0.60
@@ -38,9 +48,12 @@ AUTO-CLOSE SAFETY RULES (non-negotiable — violation = NEEDS_L2):
 - A Defender/EDR NAMED detection (a threat classification like "Trojan:…", category=Malware) or a "prevented/blocked/quarantined/remediated" remediation status is a REAL detection and strong evidence. Do NOT treat the alert as benign just because VirusTotal shows 0 detections — VT is often blind to freshly-seen, targeted, or non-Windows samples. Weigh the native EDR verdict at least as heavily as VT.
 - A hunt query that ERRORS or returns 0 rows is NOT proof the activity is benign — a wrong or malformed KQL query produces the same empty result as genuinely-clean telemetry. If a hunt errors, retry with a hunt_* tool (or a corrected query). NEVER auto-close as FP based on an empty or failed hunt. If you cannot obtain reliable hunt evidence, emit NEEDS_L2 rather than assuming safety.
 - SCG memory is CONTEXT ONLY: it may inform your analysis but NEVER shortcuts the investigation, lowers your evidence bar, or justifies an auto-close on its own. Always run the fresh checks the alert warrants (VT, timeline, entity context). ONE EXCEPTION, and only this one: a precedent explicitly marked **EXACT COMMAND MATCH** records the SAME command line as this alert, already adjudicated by a named analyst — that is direct evidence about this specific activity rather than a same-alert-type analogy, and it MAY be used as positive exculpatory evidence to auto-close. Everything else still applies to that case: run the checks the alert warrants, and any VT detection, named EDR threat, concurrent open alert or other danger signal still forces escalation. A precedent that is merely the same alert TYPE is not this, and never justifies a close.
+- A prior close recorded as "True Positive" does NOT by itself mean that activity was malicious. Acme analysts routinely close real-but-authorised activity (load tests, approved USB use, justified testing) as "true positive", meaning "the alert fired on something that really happened". Read the analyst's closing words before treating such a precedent as a threat or as a clearance.
+- Data leaving (files copied to USB, uploads, DLP findings, bulk downloads): a prior clearance covers only THAT transfer. The same drive, the same user, or files that look like company work is not evidence a NEW copy was authorised — company data on a removable drive is the risk itself. Without the person's reason for THIS transfer, emit REQUEST_JUSTIFICATION naming the person who copied it (not root or a service account). The one exception: when the USB drive check says no removable drive was involved, there was no transfer — do not ask.
+- Every user an alert names is there because the rule matched something THEY did. Never dismiss one as a "misgrouping", "false correlation" or "unrelated": find what that user did (hunt with their name and no operation/action filter) and judge it. If you cannot find it, that is an evidence gap → NEEDS_L2.
 - Privilege-escalation and credential-access alerts require POSITIVE exculpatory evidence to auto-close as FP — e.g. a verified benign parent process, a known-good scheduled task, or a confirmed expected admin action tied to this specific event. The mere ABSENCE of a signal (no file hash, no prior alert, "the technique alone doesn't confirm intent") is NOT sufficient. If your FP rests only on missing/absent evidence, emit NEEDS_L2.
 - AWS/SSM identity — do NOT invent or misread the actor. In an ARN like `arn:aws:sts::<acct>:assumed-role/<role>/<session>`, the acting user is the SESSION part (after the last '/') or the "Session Principal" field — NEVER the IAM role. A role string such as `ssm-session-<team>-<label>-role` is a ROLE, not a person: the human-looking fragment inside it is NOT a username and you must never derive one from it, nor carry any example name from these instructions into your reasoning. If the alert already names a session principal (e.g. user@domain), that IS the actor — do NOT claim the alert "misattributed" or "misclassified" the user based on the role name. Only assert a different actor if a tool result explicitly returns one.
-- Reason ONLY from the actual alert fields and tool results. Do NOT introduce commands, users, hosts, or files that are not present in the alert or a tool output — a fabricated detail (a command the alert never listed, a user the ARN never named) invalidates the verdict; if you are inferring rather than reading, emit NEEDS_L2.
+- Reason ONLY from the actual alert fields and tool results. Do NOT introduce commands, users, hosts, domains, or files that are not present in the alert or a tool output — a fabricated detail (a command the alert never listed, a user the ARN never named, a domain synthesized from the alert's own descriptive title when the real one wasn't available) invalidates the verdict; if you are inferring rather than reading, emit NEEDS_L2. If evidence you'd need is genuinely unavailable (e.g. a finding hasn't landed from Sentinel yet), say so and escalate — never substitute a plausible-sounding guess and investigate that instead.
 
 triage_class values:
 - AUTO_CLOSED_FP: false positive, safe to close
@@ -72,6 +85,9 @@ REQUEST_JUSTIFICATION — when the missing piece is INTENT, not analysis:
   If any of those apply, emit NEEDS_L2 instead. REQUEST_JUSTIFICATION asks a human to
   explain; NEEDS_L2 asks an analyst to investigate. Do not use it to avoid deciding —
   if a justification would not change your verdict, it is NEEDS_L2.
+  When the incident spans multiple actors, evaluate and name EACH one — this doctrine
+  applies PER ACTOR, not to the incident as a whole; one actor's justification never
+  covers another actor's separate activity.
 
 When in doubt, emit NEEDS_L2. Escalation is not a failure — it helps L2 investigate faster.
 
@@ -118,10 +134,10 @@ _PRIV_GRANT_RE = re.compile(
 )
 
 # Same alert shape as _PRIV_GRANT_RE, but the grantor/recipient live in MDE DeviceEvents
-# (InitiatingProcessAccountName / AccountName), not Entra AuditLogs. The combined regex
-# above would otherwise route this into the Entra-only hunt_identity_grant guidance,
-# which queries AuditLogs with an empty recipient and returns unrelated tenant-wide
-# Entra grants that the model mistakes for evidence about a Windows local-group change.
+# (InitiatingProcessAccountName / AccountName), not Entra AuditLogs. DEMO-108975: the
+# combined regex above routed this into the Entra-only hunt_identity_grant guidance,
+# which queried AuditLogs with an empty recipient and returned unrelated tenant-wide
+# Entra grants that the model mistook for evidence about a Windows local-group change.
 _LOCAL_GROUP_RE = re.compile(r"local\s+admin(?:istrator)?s?\s+group", re.I)
 
 
@@ -129,6 +145,26 @@ def is_local_group_alert(alert_name: str) -> bool:
     """True when the privilege-grant alert is a Windows local-group change (MDE),
     not an Entra ID role/group grant (AuditLogs) — the two need different hunt tools."""
     return bool(_LOCAL_GROUP_RE.search(alert_name or ""))
+
+
+# Opposite shape from _PRIV_GRANT_RE, not a variant of it: a credential added to an
+# Application/Service Principal has no separate human recipient to confuse the named
+# user with — the app IS the recipient, and the named user is the one who ran the
+# operation. DEMO-109425: hunt_identity_grant's KQL only matches
+# "Add member to role/group" operations (lib/kql_templates.py::sentinel_identity_grant),
+# so it always returns 0 rows for this alert family regardless of who did what — the
+# model read that guaranteed-empty result as "unattributed" and escalated to NEEDS_L2,
+# when the named user was already known and, once L1 asked, a one-line business
+# justification (app onboarding) closed it as FP in minutes.
+_CREDENTIAL_ADDED_RE = re.compile(
+    r"credential\s+added\s+to\s+(?:an?\s+)?(?:application|service\s+principal)", re.I,
+)
+
+
+def is_credential_added_alert(alert_name: str) -> bool:
+    """True for a credential-added-to-Application/Service-Principal alert — a named-actor,
+    no-recipient shape that hunt_identity_grant cannot resolve (see _CREDENTIAL_ADDED_RE)."""
+    return bool(_CREDENTIAL_ADDED_RE.search(alert_name or ""))
 
 
 def is_privilege_grant_alert(alert_name: str) -> bool:
@@ -180,11 +216,87 @@ def format_alert(
         f"Investigation state: {inv_state or 'unknown'}",
     ]
 
+    # Who owns this host. Tells the agent WHO to name in an escalation and whose
+    # business-as-usual a command plausibly is — a DBA tribe host running mongo
+    # maintenance is a different prior than the same command on a trading host.
+    #
+    # CONTEXT, NOT A VERDICT. Ownership is not exculpatory: a host having a known
+    # owner says nothing about whether this activity was authorised, and an
+    # unregistered host is a register gap, not a red flag. Stated explicitly
+    # because the model will otherwise reach for "known owner, therefore benign",
+    # which is the same absence-of-evidence error the privesc gate exists for.
+    _tribe = (evidence or {}).get("asset_tribe") or {}
+    if _tribe:
+        from lib.tribe_client import format_tribe
+        _tl = format_tribe(_tribe)
+        if _tl:
+            lines.append(f"Asset ownership: {_tl}")
+            if _tribe.get("status") == "found":
+                lines.append(
+                    "  (Ownership is CONTEXT for whom to contact and what is normal on "
+                    "this host. It is NOT evidence of authorisation — do not treat a "
+                    "known owner as grounds for a false positive.)"
+                )
+
+    # Upwind's picture of the host (mirror of its CNAPP data): exposure, open Upwind threats,
+    # critical/exploitable vulnerabilities, misconfigurations. CONTEXT, like ownership.
+    _uwa = (evidence or {}).get("upwind_asset") or {}
+    if _uwa:
+        from edr_triage.upwind_mirror import format_asset
+        _ul = format_asset(_uwa)
+        if _ul:
+            lines.append(f"\nUpwind cloud context for this host: {_ul}")
+            lines.append(
+                "  (Context for how much is at stake and what else is wrong with this host. An "
+                "internet-exposed host with exploitable vulnerabilities or other open Upwind threats "
+                "raises the stakes of a real compromise; none of it proves this alert true or false. "
+                "upwind_threats / upwind_vulns / upwind_asset can fetch more.)"
+            )
+
+    # Upwind CNAPP detection — the evidence behind an Upwind ticket, fetched from Upwind's
+    # API (the Jira ticket itself carries only a title and the resource).
+    _uwd = (evidence or {}).get("upwind_detection") or {}
+    if _uwd.get("status") == "found":
+        d = _uwd.get("detection") or {}
+        r = d.get("resource") or {}
+        lines.append("\nUpwind detection (fetched from Upwind — this IS the alert's evidence):")
+        lines.append(f"  {d.get('id', '')} type={d.get('type', '')} category={d.get('category', '')} "
+                     f"status={d.get('status', '')} policy={', '.join(d.get('policies') or []) or '-'}")
+        lines.append(f"  first seen {d.get('first_seen', '?')}, last seen {d.get('last_seen', '?')}, "
+                     f"{d.get('occurrence_count', '?')} occurrence(s)"
+                     + (f"; MITRE {', '.join(d['mitre'])}" if d.get("mitre") else ""))
+        if r.get("instance_id") or r.get("region"):
+            lines.append(f"  resource: {r.get('type', '')} {r.get('instance_id', '')} in {r.get('region', '?')}")
+        for f in d.get("files") or []:
+            vt = f.get("vt")
+            vt_s = (" — VT: not checked" if vt is None else
+                    f" — VT {vt.get('detections', 0)}/{vt.get('total', 0)} ({vt.get('verdict')})"
+                    if vt.get("total") else " — VT: not on VirusTotal (unknown, NOT evidence of clean)")
+            lines.append(f"  file {f.get('name', '')} {f.get('hash_type', '')}:{f.get('hash', '')}{vt_s}")
+            for p in f.get("paths") or []:
+                lines.append(f"      at {p}")
+        if d.get("files_truncated"):
+            lines.append(f"  … {d['files_truncated']} more distinct files")
+        for oe in d.get("other_events") or []:
+            lines.append(f"  event {oe.get('type', '')}: {oe.get('description', '')} {oe.get('data', {})}")
+        lines.append(
+            "  (This is a NAMED detection by Upwind's engine and is real evidence — weigh it like "
+            "an EDR named detection. A file name or path that looks like a business application, "
+            "or 0 VT detections, is CONTEXT, not proof the file is clean; closing FP needs positive "
+            "exculpatory evidence tied to these exact hashes.)"
+        )
+    elif _uwd.get("status") in ("error", "not_found"):
+        lines.append(
+            f"\nUpwind detection lookup: {_uwd['status']} — the detection's evidence (file hashes, "
+            "paths) could NOT be retrieved. You have only the ticket text; do not infer what the "
+            "file was — escalate rather than guess."
+        )
+
     # Analyst notes ALREADY on the ticket — populated only on a re-triage of a
     # ticket that has been escalated/commented on; empty on a brand-new ticket's
-    # first pass. An analyst may have already typed out the exact field-level diff by
-    # hand (e.g. a Conditional Access change: Policy, Result, Change Detected, Current
-    # Applications, Current Users) that the agent would otherwise never see — only
+    # first pass. DEMO-108035: Subodh Patil had already typed out the exact
+    # Conditional Access diff by hand (Policy, Result, Change Detected, Current
+    # Applications, Current Users) and the agent never saw any of it — only
     # `description` was ever fetched, so a re-triage re-derived (or failed to
     # re-derive, on a 0-row hunt) evidence a human had already recorded.
     #
@@ -208,7 +320,7 @@ def format_alert(
     # below) and an AWS-specific one for role-vs-session confusion, but nothing covered
     # an unbound IDENTITY, and the model does not simply stop: DEMO-107545 lost its actor
     # on re-triage (the live Sentinel entity fetch returned nothing six days on), and the
-    # agent proceeded to investigate `demo.user@example.com` — Microsoft's stock demo
+    # agent proceeded to investigate `jamie.w@example.com` — Microsoft's stock demo
     # identity, with zero rows in SigninLogs, AADNonInteractiveUserSignInLogs and
     # AuditLogs across 30 days — then escalated because that account had no telemetry.
     # A confident, well-structured investigation of somebody who does not exist.
@@ -295,13 +407,13 @@ def format_alert(
             # HOST-LESS, but this alert family is NOT cloud-shaped like the generic
             # branch below assumes — "PowerShell script was loaded in memory" is an
             # ENDPOINT detection that arrives with no device bound because MDE's own
-            # enrichment lands ~26-28 minutes after the event (edr_triage/blank_retriage.py),
-            # not because the activity happened in the cloud. A model that reads "no
-            # device" as "cloud/identity" hunts OfficeActivity and AuditLogs (0 rows,
-            # wrong tables) and escalates — while L1 finds the real device and command
-            # line straight from MDE minutes later. RAPTOR's OWN first-pass comment on
-            # this alert family already says as much: "run an mde_advanced_hunt on
-            # DeviceProcessEvents for the exact invocation."
+            # enrichment lands 26-28 minutes after the event (edr_triage/blank_retriage.py),
+            # not because the activity happened in the cloud. DEMO-109319: the model read
+            # "no device" as "cloud/identity", hunted OfficeActivity and AuditLogs (0
+            # rows, wrong tables), and escalated — while L1 found the real device
+            # (int201hshelitwl.corp.example.com) and command line straight from MDE minutes later.
+            # RAPTOR's OWN first-pass comment on this alert family already says as much:
+            # "run an mde_advanced_hunt on DeviceProcessEvents for the exact invocation."
             _s += (
                 " NOTE: no device is bound YET, but this is an ENDPOINT alert (a "
                 "PowerShell script loaded in memory), not a cloud/identity one — the "
@@ -385,10 +497,11 @@ def format_alert(
                     "INTENT. Do NOT auto-close FP on 'this looks like routine admin/"
                     "troubleshooting work' for a scoped-and-reverted change — the named "
                     "actor plus a plausible business reason plus a justification that "
-                    "would settle it is REQUEST_JUSTIFICATION, not AUTO_CLOSED_FP. A "
-                    "near-identical sibling of one such ticket, same user, same shape, "
-                    "minutes later, correctly asked the actor instead — "
-                    "REQUEST_JUSTIFICATION is the correct call here."
+                    "would settle it is REQUEST_JUSTIFICATION, not AUTO_CLOSED_FP. "
+                    "(DEMO-108035 auto-closed FP reasoning exactly this way; its "
+                    "near-identical sibling DEMO-108036, same user, same shape, minutes "
+                    "later, correctly asked the actor instead — REQUEST_JUSTIFICATION is "
+                    "the correct call here.)"
                 )
             if "office" in (alert_name or "").lower() or "exchange" in (alert_name or "").lower():
                 _s += (
@@ -399,7 +512,11 @@ def format_alert(
                     "PARAMETERS: Exchange system mailboxes (arbitration, soft-deleted) "
                     "changed by a service app-pool account with ExternalAccess=false is "
                     "routine platform housekeeping; a change to a PERSON's mailbox that "
-                    "adds forwarding, delegation or external access is not."
+                    "adds forwarding, delegation or external access is not. If the alert "
+                    "names a person as well as a service account, the person's operation "
+                    "is the one that matters: hunt_office(user=<person>) with no operation, "
+                    "and read the rule's KeySettings (ForwardTo, RedirectTo, DeleteMessage, "
+                    "MoveToFolder)."
                 )
         else:
             _s += (
@@ -431,7 +548,7 @@ def format_alert(
     # tickets is frequently NOT the machine that owns the address — it is bound
     # upstream by time proximity, not by the IP. Ten sibling beaconing alerts sharing
     # one source IP each named a DIFFERENT device and not one was the real owner
-    # (DEMO-107982 named WKSTN-8271; 10.0.0.49 belonged to srv-app-49.example.com,
+    # (DEMO-107982 named up827jherntemac; 192.168.75.49 belonged to prdaccord49.corp.example.com,
     # which made 761 connections to the flagged destination while the named host made
     # none). Hunting the ticket's host returns 0 rows and looks like a clean result.
     import re as _re
@@ -532,6 +649,34 @@ def format_alert(
             "shows unexplained activity means NEEDS_L2, not FP. Do NOT reach a benign verdict "
             "from the primary host alone."
         )
+        # Per-host detail, when the enrichment recovered any — tells the agent the
+        # co-host's REAL command so it hunts for the right process instead of assuming
+        # it matches the primary host's, and names which co-hosts are BARE (no known
+        # command) so a 0-row hunt against a guessed process isn't misread as "cleared".
+        # DEMO-112040: the primary host ran `tcpdump`; a bare co-host (telemetry for it
+        # had aged out) got hunted for `tcpdump` too, came back 0 rows, and that gap was
+        # the reason given for escalating — but nothing established the co-host's own
+        # activity was ever tcpdump. Empty when additional_hosts_detail wasn't supplied
+        # (older evidence shape) → this block silently no-ops, zero behaviour change.
+        _detail = [h for h in (ev.get("additional_hosts_detail") or []) if h.get("device_name")]
+        _known = [h for h in _detail if h.get("command_lines")]
+        _bare = [h for h in _detail if not h.get("command_lines")]
+        if _known:
+            lines.append("  Known co-host activity (hunt for THESE specific processes, not a guess):")
+            for h in _known[:10]:
+                lines.append(f"    - {h['device_name']}: " + "; ".join(str(c) for c in h["command_lines"][:3]))
+        if _bare:
+            lines.append(
+                "  " + ", ".join(h["device_name"] for h in _bare[:10])
+                + (" have" if len(_bare) > 1 else " has")
+                + " NO known triggering command — telemetry for this host was never captured "
+                "for this incident. Do NOT assume it ran the same process as the primary host "
+                "or any other co-host; that is a guess, not evidence. Hunt broadly instead — "
+                "try hunt_logons for session activity, or hunt_process for whatever you actually "
+                "see on THIS host's own telemetry. A hunt for a GUESSED process returning 0 rows "
+                "is not exculpatory: it means you searched for the wrong thing, not that nothing "
+                "happened."
+            )
         # Service-process alerts satisfy "every host" differently, and without this the
         # rule is unsatisfiable: these group 138-151 hosts, so per-host hunting can never
         # finish. DEMO-107772 hunted, wrote "the hunt_service results confirmed that all
@@ -542,9 +687,9 @@ def format_alert(
         # The question these alerts ask is about the BINARY, not per-host behaviour, and
         # hunt_service answers it fleet-wide by construction: it counts the devices
         # running each binary across the whole estate, co-hosts included. Scoped to
-        # process_check, which only fires on process-list alerts (>=4 distinct
-        # processes) — privesc/identity/cloud/network alerts never see this and keep the
-        # strict per-host rule.
+        # process_check, which only fires on process-list alerts (>=4 distinct processes,
+        # or any number for the Rare Process as a Service family) — privesc/identity/
+        # cloud/network alerts never see this and keep the strict per-host rule.
         if (ev.get("process_check") or {}).get("distinct"):
             lines.append(
                 "  EXCEPTION for this alert — it flags SERVICE PROCESSES, and the question "
@@ -556,19 +701,19 @@ def format_alert(
                 "escalate on host count alone. Escalate only if a process is UNTRUSTED, or "
                 "a specific co-host shows unexplained activity of its own."
                 "\n  This exception is COMPLETE, not partial — do not add a second, unstated "
-                "requirement on top of it. Real tickets escalated anyway with reasoning "
+                "requirement on top of it. Two real tickets escalated anyway with reasoning "
                 "shaped exactly like this: 'the processes are trusted, but that only confirms "
                 "the BINARY is legitimate, not that no unexplained activity is happening on "
-                "each host' (both against L1 verdicts of FP). That reasoning is WRONG for "
-                "this alert type specifically: a 'rare process as a service' alert exists to "
-                "ask exactly one question — is this rare service binary malicious or "
-                "masquerading software — and TRUSTED answers it in full. 'Something else "
-                "unrelated might be happening on this host' is not evidence of anything; it "
-                "is true of every host, always, and demanding it be ruled out is how this "
-                "exact exception gets talked past every time. If your own draft reasoning "
-                "uses the phrase 'only confirms/addresses X, not Y' to hold out after every "
-                "flagged process comes back TRUSTED, stop — Y is not what this alert is "
-                "asking, and the exception above already applies in full."
+                "each host' (DEMO-108863, DEMO-109409 — both against L1 verdicts of FP). That "
+                "reasoning is WRONG for this alert type specifically: a 'rare process as a "
+                "service' alert exists to ask exactly one question — is this rare service "
+                "binary malicious or masquerading software — and TRUSTED answers it in full. "
+                "'Something else unrelated might be happening on this host' is not evidence "
+                "of anything; it is true of every host, always, and demanding it be ruled "
+                "out is how this exact exception gets talked past every time. If your own "
+                "draft reasoning uses the phrase 'only confirms/addresses X, not Y' to hold "
+                "out after every flagged process comes back TRUSTED, stop — Y is not what "
+                "this alert is asking, and the exception above already applies in full."
             )
     # Grouped multi-USER incident — the user-side analogue of the co-host block above.
     # A rule that aggregates SingleAlert emits ONE alert covering every matched row, so
@@ -588,11 +733,36 @@ def format_alert(
             "in your reasoning and comment — a benign explanation for one user does NOT clear "
             "the others. A user you cannot assess means NEEDS_L2, not FP."
         )
+    # Paired host<->actor groups (edr_triage/pipeline.py::_add_actor_host) — when
+    # present, this is STRONGER than the flat additional_users list above: it tells
+    # you which hosts belong to which actor, so you can see when actors are doing
+    # UNRELATED things rather than all being part of one person's activity.
+    # DEMO-109720: two actors, one ran a benign package install on 2 hosts, the other
+    # ran log-tailing/docker-status checks on 3 different hosts — a justification
+    # request addressed to the first would settle nothing about the second.
+    _actor_groups = [g for g in (ev.get("actor_hosts") or []) if isinstance(g, dict) and g.get("actor")]
+    if len(_actor_groups) > 1:
+        _hits = ev.get("actor_justification_hits") or {}
+        _lines = ["MULTI-ACTOR BREAKDOWN — evaluate and, if warranted, address EACH actor "
+                   "separately. Do not treat this as one incident with one acting user:"]
+        for g in _actor_groups:
+            _actor = str(g["actor"])
+            _hosts = ", ".join(str(h) for h in (g.get("hosts") or [])[:5])
+            _hit = _hits.get(_actor.lower())
+            if _hit:
+                _lines.append(
+                    f"  - {_actor} ({_hosts}): standing justification on file "
+                    f"(ref {_hit.get('jira_key', '?')}) — context only, still weigh it, "
+                    "do not treat it as authorization to skip investigating this actor."
+                )
+            else:
+                _lines.append(f"  - {_actor} ({_hosts}): no justification precedent found.")
+        lines.append("\n".join(_lines))
     # Identity GRANT alert (role/group membership added). These carry TWO principals with
     # OPPOSITE roles — whoever performed the grant, and the account that received it — but
     # Sentinel's "Involved Users" names only the RECIPIENT. Verified on DEMO-106406:
-    # user_name = the account ADDED, additional_users = [], while the grant was actually
-    # performed by a different admin who appears nowhere in the alert.
+    # user_name = hayden.roy (the account ADDED), additional_users = [], while the
+    # grant was actually performed by tatum.shah, who appears nowhere in the alert.
     # So the "acting user" above is the wrong person by construction. Say so plainly rather
     # than let the model narrate the recipient as the actor.
     if is_privilege_grant_alert(alert_name):
@@ -605,9 +775,15 @@ def format_alert(
             "performed the action, and do NOT request a business justification from them — "
             "they may have done nothing."
         )
+        # Until now this block ended by telling the agent to emit NEEDS_L2 when it could
+        # not identify the actor — and there was no tool that could. DEMO-106406 duly ran
+        # hunt_query, got 50 rows, reported "acting principal, target group name and
+        # target user were missing", and escalated. The fields were there; the projection
+        # was wrong. Name the tool, and state the timestamp literally (described rather
+        # than printed, the model invents one).
         if is_local_group_alert(alert_name):
-            # This is a Windows local-group change, not an Entra grant. The
-            # grantor/recipient live in MDE DeviceEvents (InitiatingProcessAccountName
+            # DEMO-108975: this is a Windows local-group change, not an Entra grant.
+            # The grantor/recipient live in MDE DeviceEvents (InitiatingProcessAccountName
             # / AccountName), not AuditLogs — hunt_identity_grant queries the wrong table
             # entirely and, with no recipient to scope on, returns unrelated tenant-wide
             # Entra grants that look like "evidence" but say nothing about this alert.
@@ -653,6 +829,22 @@ def format_alert(
                 "directed at the GRANTOR; a self-grant, or a grant you cannot attribute at "
                 "all, is NEEDS_L2."
             )
+    if is_credential_added_alert(alert_name):
+        lines.append(
+            "CREDENTIAL ADDED TO APPLICATION/SERVICE PRINCIPAL — unlike a role/group "
+            "grant, this alert has NO separate human recipient to confuse with the actor: "
+            "the recipient is the application itself, and the user named above is the "
+            "one who actually ran the operation (e.g. \"Update application — Certificates "
+            "and secrets management\"). Do NOT call hunt_identity_grant expecting it to "
+            "confirm this — its query only matches role/group MEMBERSHIP operations "
+            "and will return 0 rows here no matter what, which is a coverage gap in that "
+            "tool, not evidence the activity is unattributed or suspicious. If severity "
+            "is not CRITICAL and there is no technical indicator (VT detection, named EDR "
+            "threat), this is a REQUEST_JUSTIFICATION case: the named user is already "
+            "known, so ask them directly which application/service this credential "
+            "supports and why — a one-line answer settles it, the way it did for the "
+            "precedent this alert family reaches most often."
+        )
     # AWS/SSM identity — label the IAM role explicitly so the agent never mistakes a
     # name embedded in the role for the acting user (DEMO-107147: "…-charlie-role" read
     # as user "charlie"). The actor is `user_name` above / the ARN session principal.
@@ -814,7 +1006,305 @@ def format_alert(
             "so an FP verdict needs a documented justification — otherwise escalate (NEEDS_L2) and "
             "ask the user(s) for justification. Address EVERY user listed above by name.")
 
+    # Netskope DLP detail, bound from Netskope_Alerts_CL by query_netskope_dlp. Same
+    # reason as the two blocks above, and DEMO-110712 is the proof: the pipeline had all
+    # 7 events bound (user, activity, DLP rule + severity, file size — the deterministic
+    # playbook rendered every one of them into its L1 comment), but this block did not
+    # exist, so none of it reached the prompt. The agent then wrote its own KQL against
+    # Netskope_Alerts_CL, died on a syntax error twice, invented placeholder entities
+    # ('user@domain.com', 'LAPTOP-12345') to investigate instead, and escalated at 0%
+    # confidence against a human FP close — a scored miss caused purely by evidence
+    # that was already in hand never being shown.
+    dlp = ev.get("netskope_dlp")
+    if dlp and dlp.get("events"):
+        _evs = dlp["events"]
+        lines.append(
+            f"\nNetskope DLP detail (KEY EVIDENCE — bound from Netskope_Alerts_CL, do NOT "
+            f"re-query it; hand-written KQL against this table fails): "
+            f"{dlp.get('event_count', len(_evs))} flagged event(s)"
+            + (f" across users {', '.join(dlp.get('users') or [])}" if dlp.get("users") else "") + ".")
+        for _e in _evs[:10]:
+            _sz = ""
+            try:
+                _sz = f" | {int(float(_e.get('file_size') or 0)):,} bytes" if _e.get("file_size") else ""
+            except (TypeError, ValueError):
+                pass
+            # The normaliser emits dlp_file / url / site / device. This read only the
+            # pre-normaliser names, so alert-bound events (94% of DLP tickets) reached the
+            # prompt with no file and no destination: on DEMO-117744 the agent wrote "file
+            # name unknown … bucket unknown" while its own L1 comment named
+            # generic-secrets.yaml, and the URL named the security team's own S3 bucket.
+            _file = (_e.get("dlp_file") or _e.get("object_name") or _e.get("file_name")
+                     or _e.get("file_path"))
+            _dest = _e.get("url") or _e.get("page") or _e.get("site")
+            _dev = _e.get("hostname") or _e.get("device")
+            lines.append(
+                f"  - {_e.get('user') or '?'}"
+                + (f" | {_e['activity']}" if _e.get("activity") else "")
+                + (f" via {_e['access_method']}" if _e.get("access_method") else "")
+                + (f" | app={_e['app']}" if _e.get("app") else "")
+                + (f" | rule={_e['dlp_rule']}" if _e.get("dlp_rule") else "")
+                + (f" (sev {_e['dlp_rule_severity']})" if _e.get("dlp_rule_severity") else "")
+                + (f" | file={str(_file)[:200]}" if _file else "")
+                + (f" | destination={str(_dest)[:200]}" if _dest else "")
+                + (f" | device={_dev}" if _dev else "")
+                + (f" | dst_country={_e['dst_country']}" if _e.get("dst_country") else "")
+                + _sz
+                + (f" | {str(_e['TimeGenerated'])[:19].replace('T', ' ')} UTC" if _e.get("TimeGenerated") else ""))
+        if dlp.get("ambiguous"):
+            lines.append("  NOTE: several users had DLP hits in this window — confirm which one this ticket is about.")
+        # Scanner-driven vs person-driven. A CASB API Scan is Netskope's own retrospective
+        # sweep of files ALREADY sitting in the drive — no human took an action at that
+        # moment. DEMO-110724/110729/110730/110734/110748 were all this shape: L1 closed
+        # every one FP with "the alert tickets were generated after the re-enablement of
+        # the CASB rule ... triggered by CASB API Scan activity ... no suspicious or
+        # malicious user activity", while the agent asked the named users to justify
+        # themselves at 85-90% confidence. Asking someone to explain an action they did
+        # not take is the same error as chasing an identity-grant RECIPIENT instead of the
+        # grantor — the question has no answerable owner.
+        def _scan(_e):
+            return ("scan" in str(_e.get("activity") or "").lower()
+                    or "casb api" in str(_e.get("access_method") or "").lower())
+
+        def _secret(_e):
+            _b = f"{_e.get('dlp_profile') or ''} {_e.get('dlp_rule') or ''}".lower()
+            return "secret" in _b or "password" in _b
+        # SCOPED to secret-key findings (2026-10-06). The tickets this note was written from
+        # were DLP-Secret-key scans, which humans closed 930 of 930 times. For NATIONAL-ID
+        # data at rest the practice is the opposite: analysts asked the file's owner on 339
+        # of 374 CASB-scan tickets (30 days to 2026-10-06), and RAPTOR now does the same.
+        if any(_scan(_e) and not _secret(_e) for _e in _evs):
+            lines.append(
+                "  NATIONAL-ID / PERSONAL DATA AT REST: a CASB API Scan found this file already "
+                "stored in the user's drive. The user is the file's owner, and analysts ask the "
+                "owner what the data is and why it is held (they did on 339 of 374 such tickets). "
+                "REQUEST_JUSTIFICATION is the right verdict unless the evidence shows something "
+                "worse (then NEEDS_L2).")
+        elif any(_scan(_e) for _e in _evs):
+            lines.append(
+                "  SCANNER-DRIVEN, NOT USER-DRIVEN: at least one event here is a CASB API "
+                "Scan — Netskope sweeping files that were ALREADY stored, not a person "
+                "uploading, downloading or sharing anything at that moment. Nobody performed "
+                "an action to justify, so REQUEST_JUSTIFICATION is the WRONG verdict: it asks "
+                "a user to explain something they did not do (same error as asking an "
+                "identity-grant recipient about a grant they only received). A retrospective "
+                "scan finding pre-existing business data is the single most common false "
+                "positive in this alert family, and a burst of these often follows a CASB "
+                "policy/rule change rather than any user behaviour. Judge it as a data-at-rest "
+                "finding: if the file and the owning team are consistent with the "
+                "prior-justification patterns above, AUTO_CLOSED_FP is appropriate; if the "
+                "data or destination genuinely does not fit, NEEDS_L2. Reserve "
+                "REQUEST_JUSTIFICATION for events where a PERSON actually moved data "
+                "(Upload / Download / Share / Post).")
+        lines.append(
+            "  How to judge: a DLP hit says sensitive data MATCHED a policy, not that anything "
+            "was exfiltrated. The question is whether this user holding this data fits their role. "
+            "Weigh the prior-justification patterns in the context above as CONTEXT ONLY — a "
+            "matching pattern is not itself clearance for THIS user. An automation/service account "
+            "doing a scheduled scan of a corporate drive is materially different from a person "
+            "moving PII to a personal destination. There is no telemetry here that establishes "
+            "business intent, so an FP verdict needs a documented justification for this actor — "
+            "otherwise REQUEST_JUSTIFICATION from the named user, or NEEDS_L2 if no actor is bound.")
+
+    # Netskope failed-login groups, bound from Netskope_Alerts_CL. Before this the agent
+    # got only ENTRA sign-in data for a NETSKOPE alert — a different identity plane — so
+    # it had no failure count, no app, no device classification and no source IP. It sat
+    # at 2/10 correct with all 8 misses model-chosen over-escalations.
+    fl = ev.get("netskope_failed_login")
+    if fl and fl.get("groups"):
+        lines.append(
+            f"\nNetskope failed-login detail (KEY EVIDENCE — bound from "
+            f"Netskope_Alerts_CL, do NOT re-query it): {fl.get('group_count')} "
+            f"repeated-failure group(s), {fl.get('total_failures')} failures total, "
+            f"worst single group {fl.get('max_failures')}.")
+        for g in (fl.get("groups") or [])[:8]:
+            lines.append(
+                f"  - {g.get('user') or g.get('from_user') or '?'}: "
+                f"{g.get('failure_count')} failures on {g.get('app') or '?'}"
+                + (f" | device={g.get('device_classification')}" if g.get("device_classification") else "")
+                + (f" | os={g.get('os')}" if g.get("os") else "")
+                + (f" | src_ip={g.get('src_ip')}" if g.get("src_ip") else "")
+                + (f" | action={g.get('action')}" if g.get("action") else "")
+                + (f" | ccl={g.get('ccl')}" if g.get("ccl") else ""))
+        if fl.get("truncated"):
+            lines.append("  (group list truncated — more groups exist than were fetched)")
+        lines.append(
+            "  How to judge: the rule fires on MORE THAN TWO failures for one "
+            "(user, app, device, source IP) combination, so a low count is the alert's "
+            "own floor and not evidence of an attack. What separates benign from "
+            "suspicious here is the SHAPE, not the fact of failure: a handful of failures "
+            "for one user on one sanctioned app from one managed device and one source IP "
+            "is a stale cached credential or a mistyped password — the routine cause. "
+            "Escalate on breadth or impossibility instead: many DISTINCT users from one "
+            "source IP (credential stuffing), one user from many source IPs or countries, "
+            "an unmanaged device, or failures followed by a SUCCESS. Say which of those "
+            "you checked. A count barely above the threshold, on its own, does not justify "
+            "asking the user to explain themselves — and REQUEST_JUSTIFICATION is the "
+            "wrong verdict for a failed login in any case: a failed authentication has no "
+            "business justification to give, so judge it on the telemetry or send it to L2.")
+
+    # GuardDuty EC2-DNS finding, bound from the AWSGuardDuty table. Same reason as the
+    # Netskope blocks: the Jira description for these carries essentially nothing, so
+    # without this the agent has no instance, no domain and no threat classification to
+    # reason about. Added pre-emptively — the identical gap on netskope_dlp (bound in
+    # evidence, never rendered) is what made DEMO-110712 a scored miss.
+    gdns = ev.get("guardduty_dns")
+    if gdns and (gdns.get("InstanceId") or gdns.get("domains") or gdns.get("Domain")):
+        _gdoms = gdns.get("domains") or ([gdns["Domain"]] if gdns.get("Domain") else [])
+        lines.append(
+            f"\nGuardDuty EC2-DNS finding (KEY EVIDENCE — bound from the AWSGuardDuty "
+            f"table, do NOT re-query it): instance={gdns.get('InstanceId') or '?'}"
+            + (f" | role={gdns['InstanceProfile']}" if gdns.get("InstanceProfile") else "")
+            + (f" | private={gdns['PrivateIp']}" if gdns.get("PrivateIp") else "")
+            + (f" | public={gdns['PublicIp']}" if gdns.get("PublicIp") else "")
+            + (f" | action={gdns['ActionType']}" if gdns.get("ActionType") else "")
+            + (f" | {gdns.get('threat_purpose')}/{gdns.get('threat_family_name')}"
+               if gdns.get("threat_family_name") else ""))
+        if _gdoms:
+            lines.append(f"  Queried domain(s) [{len(_gdoms)}]: {', '.join(_gdoms[:10])}")
+        _greps = gdns.get("domain_reputation") or {}
+        for _d, _r in list(_greps.items())[:8]:
+            _c = ", ".join(sorted({str(v) for v in (_r.get("categories") or {}).values() if v})[:3])
+            lines.append(
+                f"    - {_d}: VT {_r.get('detections', 0)}/{_r.get('total', 0)} "
+                f"({_r.get('verdict', '?')})" + (f", categorised as: {_c}" if _c else ", no category"))
+        if _gdoms and not _greps:
+            lines.append("    (no VT domain reputation available — do not infer the domain is clean from that)")
+        if gdns.get("finding_types"):
+            lines.append(f"  Finding type(s): {', '.join(gdns['finding_types'][:6])}")
+        from edr_triage.playbooks.guardduty import dns_finding_kind
+        _gkind = dns_finding_kind(gdns)
+        if _gkind == "metadata_rebind":
+            lines.append(
+                "  How to judge: the queried name resolves to the instance metadata service "
+                "(169.254.169.254). That is how SSRF reaches IAM credentials, and it needs no "
+                "follow-up connection to the domain to matter, so 'DNS request only' and a "
+                "VT-clean domain (nip.io/sslip.io are clean by design) are NOT exculpatory. "
+                "If this is an EKS node, the lookup came from a pod: what decides it is which "
+                "workload made it and what inbound request carried the URL. Without that, "
+                "escalate.")
+        elif _gkind == "c2":
+            lines.append(
+                "  How to judge: a C2, sinkholed, DGA or DNS-exfiltration lookup means code on "
+                "the host is calling out. A DNS-only lookup and a VT-clean domain are NOT "
+                "exculpatory; identify the process or pod that made it, otherwise escalate.")
+        elif _gkind == "callback":
+            lines.append(
+                "  How to judge: if the domain is an out-of-band callback service (interactsh "
+                "*.oast.*, Burp Collaborator, webhook.site), a server resolving it means "
+                "injected input made it call out: an injection or SSRF reached it. The "
+                "lookup itself is the signal, so 'no follow-up traffic' is NOT exculpatory. "
+                "Escalate unless an authorised test is documented for this workload and time.")
+        else:
+            lines.append(
+            "  How to judge: GuardDuty flagged the DNS LOOKUP, which is not itself proof "
+            "of contact. What decides this alert is (a) WHAT the domain is — a categorised "
+            "business/CDN site queried by a server whose role plausibly reaches it is very "
+            "different from a malware-repository domain — and (b) whether anything followed "
+            "the lookup. This family's repeated resolution is 'DNS request only, no further "
+            "web/data transfer, closed FP', so hunt the instance's OUTBOUND CONNECTIONS "
+            "around the finding time before concluding. A VT-clean, business-categorised "
+            "domain plus no follow-up traffic is real exculpatory evidence; an uncategorised "
+            "or VT-flagged domain, or any evidence of an actual connection, is not — escalate. "
+            "Absence of a hunt is NOT absence of traffic.")
+
+    # GuardDuty EC2 finding bound on the generic path (probing, unusual resolver, ...):
+    # rendered in the L1 comment but never reached the agent before DEMO-118243.
+    gec2 = ev.get("guardduty_ec2")
+    if gec2:
+        lines.append(
+            "\nGuardDuty EC2 finding (KEY EVIDENCE — bound from the AWSGuardDuty table, do "
+            "NOT re-query it): " + " | ".join(f"{k}={v}" for k, v in gec2.items()))
+        lines.append(
+            "  EC2 DNS lookups are not in Sentinel or CloudTrail, and most EC2 servers are "
+            "not in Defender, so empty hunts there are not evidence either way. If the "
+            "instance is an EKS node, the activity came from a pod on it.")
+
     # Port-sweep FP allowlist verdict (SOC runbook — the deciding factor for these alerts).
+    # ---- USB drive check (Files Copied to USB Drives only) ---------------------
+    # Precomputed from Sentinel. Stated as a fact: when it holds, there was no USB copy
+    # to justify, and asking the user would only repeat a question IT already answered.
+    udc = ev.get("usb_drive_check")
+    if udc:
+        if udc.get("internal") is True:
+            lines.append("\nUSB drive check (KEY EVIDENCE): no removable drive was involved — "
+                         f"{udc.get('reason')}. The files were written to a local disk; this "
+                         "alert is a rule artifact, not a copy to removable media. Judge the "
+                         "writing process and files on their own merits; no user justification "
+                         "is needed for a USB copy that did not happen.")
+        else:
+            lines.append("\nUSB drive check: a removable drive may be involved "
+                         f"({udc.get('reason')}). Treat this as a real copy to removable media.")
+
+    # ---- sign-in spray check (sign-in failure families only) -------------------
+    # Precomputed by the pipeline. Stated as a fact because it decides whether the ticket
+    # CAN close at all: the pipeline refuses an auto-close on a success-after-failures
+    # shape (or an unavailable check) whatever the verdict, so the model should know.
+    sc = ev.get("signin_spray_check")
+    if sc:
+        if not sc.get("ok"):
+            lines.append("\nSign-in spray check (KEY EVIDENCE): could not be run "
+                         f"({sc.get('error') or 'unknown'}). An auto-close is NOT possible "
+                         "for this ticket without it — if the activity looks benign, say "
+                         "so, but expect it to be routed to L2.")
+        elif sc.get("blocking"):
+            lines.append("\nSign-in spray check (KEY EVIDENCE): a SUCCESSFUL sign-in came "
+                         f"after invalid-password failures for {', '.join(sc['blocking'])}. "
+                         "That is the shape of a password spray that got in. Establish "
+                         "whether those successes were the account owner (known IPs, "
+                         "devices, locations); this ticket will not be auto-closed.")
+        elif not any(int(r.get("Failures") or 0) > 0 for r in (sc.get("rows") or [])):
+            lines.append("\nSign-in spray check (KEY EVIDENCE): NO failed sign-in was found "
+                         "for the account(s) on this alert in either SigninLogs or "
+                         "AADNonInteractiveUserSignInLogs. What fired this spike is "
+                         "unaccounted for — that is missing evidence, not proof the alert "
+                         "is wrong, and this ticket will not be auto-closed.")
+        else:
+            _f = sum(int(r.get("Failures") or 0) for r in (sc.get("rows") or []))
+            _ni = sum(int(r.get("NonInteractiveFailures") or 0) for r in (sc.get("rows") or []))
+            lines.append("\nSign-in spray check: no successful sign-in followed any "
+                         "invalid-password failure for the account(s) on this alert. "
+                         f"{_f} failed sign-in(s) found ({_ni} non-interactive).")
+
+    # ---- novelty for this actor / this device --------------------------------
+    # "This actor has done this 40 times" and "this actor has never done this" must not
+    # produce the same verdict. Before this, nothing in the prompt distinguished them:
+    # precedents are scoped to device AND user together, so a first-ever sighting simply
+    # arrived with no precedent block and read as an absence of information rather than
+    # as a fact about the alert.
+    #
+    # The framing below is load-bearing and deliberately asymmetric. Novelty RAISES the
+    # bar; frequency does NOT lower it. A frequency count is an argument a compromised
+    # account inherits wholesale from its legitimate owner — the attacker operating
+    # inside the victim's normal envelope is precisely the case where "routine for this
+    # actor" is true and irrelevant. So the routine branch says what it is worth and
+    # then says what it is not worth, in the same breath.
+    occ = ev.get("occurrence_history") or {}
+    if occ:
+        _bits = []
+        if "actor_prior" in occ:
+            a, n = occ.get("actor", "this actor"), occ["actor_prior"]
+            _bits.append(f"actor {a}: {'NEVER seen with this alert before' if n == 0 else f'{n} prior occurrence(s)'}")
+        if "device_prior" in occ:
+            d, n = occ.get("device", "this device"), occ["device_prior"]
+            _bits.append(f"device {d}: {'NEVER seen with this alert before' if n == 0 else f'{n} prior occurrence(s)'}")
+        _first = occ.get("actor_first_seen") or occ.get("device_first_seen")
+        lines.append(
+            f"\nHistory for this alert family (last {occ.get('window_days', 90)}d): "
+            + "; ".join(_bits) + ".")
+        if _first:
+            lines.append(
+                "  FIRST SIGHTING. A pattern that is routine somewhere else in the estate is "
+                "not routine HERE until something specific to this actor/device explains it. "
+                "Treat novelty as raising the evidence bar, not as neutral.")
+        else:
+            lines.append(
+                "  Routine for this entity — useful for judging whether the ACTIVITY fits an "
+                "established pattern, but NOT on its own a reason to close. A compromised "
+                "account inherits its owner's entire history, so 'they always do this' is "
+                "equally true of an attacker deliberately operating inside that pattern. "
+                "What closes a ticket is evidence about THIS occurrence.")
+
     ps = ev.get("port_sweep_check")
     if ps and ps.get("port"):
         if ps.get("known_good"):

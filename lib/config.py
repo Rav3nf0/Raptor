@@ -23,11 +23,14 @@ _SECRET_ENV_MAP: dict[str, str] = {
     "mde_client_id":          "MDE_CLIENT_ID",
     "mde_client_secret":      "MDE_CLIENT_SECRET",
     "virustotal_api_key":     "VIRUSTOTAL_API_KEY",
+    "abuseipdb_api_key":      "ABUSEIPDB_API_KEY",
+    "ABUSEIPDB_API_KEY":      "ABUSEIPDB_API_KEY",   # actual secret JSON key name
     "urlscan_api_key":        "URLSCAN_API_KEY",
     "shodan_api_key":         "SHODAN_API_KEY",
     "jira_email":                       "JIRA_EMAIL",
     "jira_api_token":                   "JIRA_API_TOKEN",
     "socket_scan_api_url":              "SOCKET_SCAN_API_URL",
+    "socket_scan_api_token":            "SOCKET_SCAN_API_TOKEN",
     "s3_raw_intel_bucket":              "S3_RAW_INTEL_BUCKET",
     "s3_audit_export_bucket":           "S3_AUDIT_EXPORT_BUCKET",
     "aws_region":                       "AWS_REGION",
@@ -46,12 +49,31 @@ _SECRET_ENV_MAP: dict[str, str] = {
     "sentinel_subscription_id":         "SENTINEL_SUBSCRIPTION_ID",
     "sentinel_resource_group":          "SENTINEL_RESOURCE_GROUP",
     "sentinel_workspace_name":          "SENTINEL_WORKSPACE_NAME",
+    # Asset-register tribe lookup — host -> owning tribe / owners / AD group. Context
+    # only; it never influences a verdict. Unmapped keys are simply unreachable in the
+    # pod (the same trap bedrock_temperature hit), so both go here.
+    "tribe_token":                      "TRIBE_TOKEN",
+    "TRIBE_TOKEN":                      "TRIBE_TOKEN",   # same trap as ABUSEIPDB_API_KEY
+    "tribe_api_base":                   "TRIBE_API_BASE",
+    # Upwind CNAPP read API — the evidence behind Upwind detection tickets.
+    "upwind_client_id":                 "UPWIND_CLIENT_ID",
+    "upwind_client_secret":             "UPWIND_CLIENT_SECRET",
     "deepintel_username":               "DEEPINTEL_USERNAME",
     "deepintel_password":               "DEEPINTEL_PASSWORD",
     "deepintel_jwt_secret":             "DEEPINTEL_JWT_SECRET",
     # Agent LLM backend (Bedrock / Mantle) — promoted so the backends' os.getenv reads work in prod
     "agent_backend":                    "AGENT_BACKEND",
     "agent_model":                      "AGENT_MODEL",
+    # Sampling temperature. The backends read os.getenv("BEDROCK_TEMPERATURE", "0.1"),
+    # but the key was never mapped here — so there was no way to change it without a
+    # code edit, and "just set the config value" was not actually possible.
+    # Measured 2026-08-28 over three arms x 3 runs on 4 tickets: verdict stability
+    # 0.750 -> 1.000 and accuracy 0.667 -> 1.000 at temperature 0, with no regression on
+    # three human-AUTO_CLOSED_TP tickets (18 runs, never auto-closed a real threat).
+    # Applies to BedrockBackend and MantleBackend; the KQL auto-fixer is a separate
+    # Gemini path pinned at its own 0.0 and is unaffected.
+    "bedrock_temperature":              "BEDROCK_TEMPERATURE",
+    "bedrock_max_tokens":               "BEDROCK_MAX_TOKENS",
     "mantle_api_key":                   "MANTLE_API_KEY",
     "MANTLE_API":                       "MANTLE_API_KEY",   # actual secret JSON key name
     "anthropic_workspace_id":           "ANTHROPIC_WORKSPACE_ID",
@@ -67,6 +89,12 @@ _SECRET_ENV_MAP: dict[str, str] = {
     "smtp_from":                        "SMTP_FROM",
     "api.external.jira.smtp_username":  "SMTP_USER",
     "api.external.jira.smtp_password":  "SMTP_PASSWORD",
+    # PagerDuty — Events API v2 routing key (pages) + a separate REST API token
+    # (reads ack state). Unlike EDR_SLACK_WEBHOOK (.env-only, never reached Secrets
+    # Manager), this is a real production secret from day one, so it's mapped here
+    # rather than left for hand-editing the host.
+    "pagerduty_routing_key":            "EDR_PAGERDUTY_ROUTING_KEY",
+    "pagerduty_api_token":              "EDR_PAGERDUTY_API_TOKEN",
 }
 
 
@@ -160,8 +188,7 @@ def get_config() -> AppConfig:
         return _config
 
     region = os.getenv("AWS_REGION", "ap-south-1")
-    # Set AWS_SECRET_NAME to pull config from AWS Secrets Manager; unset = env-only.
-    secret_name = os.getenv("AWS_SECRET_NAME", "")
+    secret_name = os.getenv("AWS_SECRET_NAME", "security/uat/deepintel")
 
     if secret_name:
         try:

@@ -11,62 +11,45 @@ router = APIRouter(tags=["auth"])
 
 
 def _render_login(error: str = "") -> str:
-    err_block = f'<p class="err">{error}</p>' if error else ""
+    err_block = (
+        f'<p class="text-red-400 text-sm text-center mt-2">{error}</p>' if error else ""
+    )
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>RAPTOR — Login</title>
+  <title>DeepIntel — Login</title>
+  <script src="https://cdn.tailwindcss.com"></script>
   <style>
-    :root {{ --ground:#0B0D11; --surface:#12151B; --line:#252B36; --text:#DDE1E8;
-             --dim:#8E96A4; --accent:#9E86F0; --crit:#F05552;
-             --mono:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,monospace;
-             --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif; }}
-    * {{ box-sizing:border-box; }}
-    body {{ margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
-            background:var(--ground); color:var(--text); font-family:var(--sans); }}
-    body::before {{ content:""; position:fixed; inset:0; pointer-events:none; opacity:.35;
-      background-image:linear-gradient(#161B22 1px,transparent 1px),linear-gradient(90deg,#161B22 1px,transparent 1px);
-      background-size:44px 44px; mask-image:radial-gradient(ellipse 80% 60% at 50% 0%,#000 30%,transparent 75%); }}
-    .wrap {{ position:relative; width:100%; max-width:360px; padding:24px; }}
-    .brand {{ text-align:center; margin-bottom:26px; }}
-    .brand h1 {{ margin:0; font-family:var(--mono); font-size:26px; font-weight:650; letter-spacing:.16em; }}
-    .brand h1 b {{ color:var(--accent); font-weight:650; }}
-    .brand p {{ margin:6px 0 0; font-family:var(--mono); font-size:10px; letter-spacing:.14em;
-                text-transform:uppercase; color:var(--dim); }}
-    .card {{ background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:26px 24px; }}
-    label {{ display:block; font-family:var(--mono); font-size:10px; letter-spacing:.06em;
-             text-transform:uppercase; color:var(--dim); margin-bottom:6px; }}
-    .field {{ margin-bottom:16px; }}
-    input {{ width:100%; background:var(--ground); border:1px solid var(--line); border-radius:7px;
-             padding:9px 11px; font-size:13px; color:var(--text); font-family:var(--sans); }}
-    input:focus {{ outline:none; border-color:var(--accent); box-shadow:0 0 0 3px rgba(158,134,240,.15); }}
-    button {{ width:100%; margin-top:6px; padding:10px; border:0; border-radius:7px; cursor:pointer;
-              background:var(--accent); color:#0B0D11; font-weight:650; font-size:13px; letter-spacing:.02em;
-              font-family:var(--sans); transition:filter .15s; }}
-    button:hover {{ filter:brightness(1.08); }}
-    .err {{ color:var(--crit); font-size:12px; text-align:center; margin:0 0 12px; }}
+    body {{background:#0f172a;color:#e2e8f0;font-family:system-ui,sans-serif;}}
   </style>
 </head>
-<body>
-  <div class="wrap">
-    <div class="brand">
-      <h1><b>RAP</b>TOR</h1>
-      <p>Autonomous L1 Alert Triage</p>
+<body class="min-h-screen flex items-center justify-center">
+  <div class="w-full max-w-sm">
+    <div class="text-center mb-8">
+      <h1 class="text-2xl font-bold text-white tracking-tight">DeepIntel</h1>
+      <p class="text-gray-400 text-sm mt-1">AI-Powered Threat Intelligence</p>
     </div>
-    <div class="card">
+    <div style="background:#1e293b;border:1px solid #334155;border-radius:0.75rem;" class="p-8">
       <form method="POST" action="/login">
-        <div class="field">
-          <label>Username</label>
-          <input type="text" name="username" autocomplete="username" required autofocus/>
+        <div class="mb-5">
+          <label class="block text-sm text-gray-400 mb-1.5">Username</label>
+          <input
+            type="text" name="username" autocomplete="username" required autofocus
+            class="w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500 transition"/>
         </div>
-        <div class="field">
-          <label>Password</label>
-          <input type="password" name="password" autocomplete="current-password" required/>
+        <div class="mb-6">
+          <label class="block text-sm text-gray-400 mb-1.5">Password</label>
+          <input
+            type="password" name="password" autocomplete="current-password" required
+            class="w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500 transition"/>
         </div>
         {err_block}
-        <button type="submit">Sign in</button>
+        <button type="submit"
+          class="w-full bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium py-2.5 rounded-lg transition mt-2">
+          Sign in
+        </button>
       </form>
     </div>
   </div>
@@ -80,7 +63,7 @@ async def login_page(request: Request):
     if token:
         from app.auth import verify_token
         if verify_token(token):
-            return RedirectResponse(url="/edr-triage", status_code=302)
+            return RedirectResponse(url="/dashboard", status_code=302)
     return HTMLResponse(content=_render_login())
 
 
@@ -93,11 +76,15 @@ async def login_submit(username: str = Form(...), password: str = Form(...)):
         return HTMLResponse(content=_render_login("Server misconfiguration: password not set."), status_code=500)
 
     if username == expected_user and password == expected_pass:
-        return make_session_response("/edr-triage", username)
+        return make_session_response("/dashboard", username)
 
     return HTMLResponse(content=_render_login("Invalid username or password."), status_code=401)
 
 
 @router.get("/logout")
+@router.post("/logout")
 async def logout():
-    return clear_session_response("/login")
+    # 303 so a POST from the Sign out form lands on GET /login.
+    resp = clear_session_response("/login")
+    resp.status_code = 303
+    return resp

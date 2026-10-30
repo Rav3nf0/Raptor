@@ -62,23 +62,56 @@ def _build(lines: list[str]) -> str:
     return "\n".join(lines)
 
 
+def _window(field: str, window_hours, anchor_iso: str = "") -> tuple[str, str]:
+    """The time filter for a hunt, anchored on the alert when an anchor is given.
+
+    `ago(Nh)` means "the N hours before NOW". On a live triage that is the N hours
+    before the alert, but on any re-triage or replay it is the wrong range entirely:
+    DEMO-107770's re-run asked for AntivirusDetection rows at 24h and got 0, while the
+    same hunt at 48h returned the 4 detections it was about. Absent evidence there is
+    the worst kind of error, because an empty result reads as "clean".
+
+    Anchored, the window is N hours BEFORE the alert plus N hours AFTER it. The
+    before-side is exactly what a live run sees, so anchoring can never shrink the
+    evidence a live triage gets; the after-side lets a replay see follow-on activity a
+    live run would have caught on its next look. Returns (where-line, anchor), with
+    anchor "" when unanchored so the caller can pick its ordering.
+    """
+    w, anchor = _win(window_hours), _ts(anchor_iso)
+    if anchor:
+        return (f"| where {field} between (datetime({anchor}) - {w}h .. datetime({anchor}) + {w}h)",
+                anchor)
+    return f"| where {field} > ago({w}h)", ""
+
+
+def _order(field: str, anchor: str) -> list[str]:
+    """Row order before `| take 50`. Anchored: nearest the alert first, with the signed
+    offset kept in the row ("12s before" and "9h after" are different evidence), so the
+    cap is spent around the alert instead of on one edge of a 2N-hour span. Unanchored:
+    newest first, as before. Without any ORDER the cap returns an ARBITRARY 50."""
+    if anchor:
+        return [f"| extend SecondsFromAlert = datetime_diff('second', {field}, datetime({anchor}))",
+                "| order by abs(SecondsFromAlert) asc"]
+    return [f"| order by {field} desc"]
+
+
 # ── MDE (Advanced Hunting — Device* tables, time field `Timestamp`) ──────────
 
-def mde_process(device: str = "", process_name: str = "", window_hours: int = 24) -> str:
+def mde_process(device: str = "", process_name: str = "", window_hours: int = 24,
+                anchor_iso: str = "") -> str:
     """Process executions on a device and/or by process name (incl. the initiating
     parent) — the day-to-day process-correlation / process-tree hunt."""
     if not (device or process_name):
         raise ValueError("hunt_process needs at least a device or a process_name")
-    q = ["DeviceProcessEvents", f"| where Timestamp > ago({_win(window_hours)}h)"]
+    rng, anchor = _window("Timestamp", window_hours, anchor_iso)
+    q = ["DeviceProcessEvents", rng]
     if device:
         q.append(f"| where DeviceName =~ {_lit(device)}")
     if process_name:
         q.append(f"| where FileName =~ {_lit(process_name)} or InitiatingProcessFileName =~ {_lit(process_name)}")
     q.append("| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, "
              "InitiatingProcessFileName, InitiatingProcessCommandLine, SHA256")
-    # Deterministic newest-first: _build appends `| take 50`, and without an ORDER
-    # that cap returns an ARBITRARY 50 of however many matched.
-    q.append("| order by Timestamp desc")
+    q += _order("Timestamp", anchor)
     return _build(q)
 
 
@@ -197,7 +230,7 @@ def mde_ip_owner(ip: str, anchor_iso: str = "", window_hours: int = _IP_OWNER_WI
     which no event table can answer. Without it a network alert that names only a source
     IP has nothing to bind a host from: DEMO-107982 and nine sibling beaconing alerts each
     carried the same source IP and each named a DIFFERENT, wrong device, none of them the
-    machine that actually owned 10.0.0.49 (srv-app-49.example.com, 761 connections to the
+    machine that actually owned 192.168.75.49 (prdaccord49.corp.example.com, 761 connections to the
     flagged destination).
 
     Returns one row per device seen holding `ip` in the window, with a count — so the
@@ -227,7 +260,7 @@ def mde_ip_owner(ip: str, anchor_iso: str = "", window_hours: int = _IP_OWNER_WI
 
 def mde_file_burst(device: str = "", window_hours: int = 24,
                    min_files: int = _BURST_MIN_FILES,
-                   start_iso: str = "", end_iso: str = "") -> str:
+                   start_iso: str = "", end_iso: str = "", anchor_iso: str = "") -> str:
     """Mass file-write bursts per (process, PID) on a device — the ransomware shape.
 
     A timeline CANNOT show this. A burst is a statistical property (how many files,
@@ -248,8 +281,8 @@ def mde_file_burst(device: str = "", window_hours: int = 24,
     if start_iso and end_iso:
         rng = f"| where Timestamp between (datetime({start_iso}) .. datetime({end_iso}))"
     else:
-        rng = f"| where Timestamp > ago({_win(window_hours)}h)"
-    noise = " and ".join(f'FolderPath !contains "{d}"' for d in _BURST_NOISE_DIRS)
+        rng, _ = _window("Timestamp", window_hours, anchor_iso)
+    noise =" and ".join(f'FolderPath !contains "{d}"' for d in _BURST_NOISE_DIRS)
     q = [
         "DeviceFileEvents",
         rng,
@@ -269,7 +302,7 @@ def mde_file_burst(device: str = "", window_hours: int = 24,
 
 
 def mde_events(device: str = "", file_name: str = "", action_type: str = "",
-               sha256: str = "", window_hours: int = 24) -> str:
+               sha256: str = "", window_hours: int = 24, anchor_iso: str = "") -> str:
     """DeviceEvents — the catch-all endpoint table the other builders don't reach.
 
     This is where AntivirusDetection lands, plus ScriptContent, PowerShellCommand,
@@ -284,6 +317,11 @@ def mde_events(device: str = "", file_name: str = "", action_type: str = "",
     thousands of rows/day fleet-wide), so an unfiltered scan is never useful.
     `action_type` matches by substring, so "Antivirus" catches AntivirusDetection
     and AntivirusReport while "AntivirusDetection" narrows to real detections.
+
+    Projects both principal columns (AccountName = the subject the event is ABOUT,
+    InitiatingProcessAccountName = who ran it), not just AccountName — DEMO-108975:
+    for UserAccountAddedToLocalGroup the acting grantor lives only in
+    InitiatingProcessAccountName, and the old projection made a real row look empty.
     """
     if not (device or file_name or action_type or sha256):
         raise ValueError(
@@ -291,7 +329,8 @@ def mde_events(device: str = "", file_name: str = "", action_type: str = "",
         )
     if sha256 and not _HEX_HASH_RE.match(sha256.strip()):
         raise ValueError(f"'{sha256}' is not a valid md5/sha1/sha256 hex hash")
-    q = ["DeviceEvents", f"| where Timestamp > ago({_win(window_hours)}h)"]
+    rng, anchor = _window("Timestamp", window_hours, anchor_iso)
+    q = ["DeviceEvents", rng]
     if device:
         q.append(f"| where DeviceName =~ {_lit(device)}")
     if action_type:
@@ -305,8 +344,10 @@ def mde_events(device: str = "", file_name: str = "", action_type: str = "",
         col = {64: "SHA256", 40: "SHA1", 32: "MD5"}[len(h)]
         q.append(f"| where {col} =~ {_lit(h)}")
     q.append("| project Timestamp, DeviceName, ActionType, FileName, FolderPath, SHA256, "
-             "AccountName, InitiatingProcessFileName, InitiatingProcessCommandLine")
-    q.append("| order by Timestamp desc")
+             "AccountName, AccountDomain, AccountSid, InitiatingProcessFileName, "
+             "InitiatingProcessCommandLine, InitiatingProcessAccountName, "
+             "InitiatingProcessAccountDomain, InitiatingProcessAccountSid")
+    q += _order("Timestamp", anchor)
     return _build(q)
 
 
@@ -333,6 +374,28 @@ def mde_process_details(names: list, window_hours: int = 168) -> str:
         "| order by FileName asc",
     ]
     return _build(q)
+
+
+# Admin-only install folders, for KQL's RE2 inside a verbatim @"" string. Same set as
+# edr_triage.service_allowlist.STANDARD_LOCATION_RE (kept in step by a test).
+#
+# windows\cluster\ added 2026-10-26 (DEMO-118550): clussvc.exe is Microsoft's own Failover
+# Clustering service binary, and C:\Windows\Cluster\ — not System32 — is its real,
+# Windows-Update-managed install location (confirmed: poqexec.exe wrote it there from a
+# WinSxS\pending.xml transaction, staged moments earlier by TiWorker.exe under a genuine
+# microsoft-windows-failovercluster-clussvc component manifest). Same admin-only tier as
+# System32: only SYSTEM/TrustedInstaller creates or writes to it. Absent from this list,
+# hunt_service called it "outside the standard install folders" and that framing is what
+# both RAPTOR and the prior AI triage read as evidence of a masquerade.
+STANDARD_LOCATION_KQL = (r"(?i)^[a-z]:\\(windows\\(system32|syswow64|winsxs|cluster)\\"
+                         r"|program files( \(x86\))?\\"
+                         r"|programdata\\microsoft\\(windows defender|microsoft defender)\\)")
+
+
+# Writable-by-users folders inside System32/SysWOW64, excluded from the set above. Same
+# list as edr_triage.service_allowlist.WRITABLE_UNDER_WINDOWS_RE (kept in step by a test).
+WRITABLE_UNDER_WINDOWS_KQL = (r"(?i)\\windows\\(system32|syswow64)\\(tasks|tasks_migrated|com\\dmp|fxstmp"
+                              r"|spool\\(drivers\\color|printers|servers)|microsoft\\crypto\\rsa\\machinekeys)\\")
 
 
 def mde_service_identity(names: list, lookback_days: int = 30) -> str:
@@ -381,17 +444,40 @@ def mde_service_identity(names: list, lookback_days: int = 30) -> str:
     return _build([
         f"let names = dynamic([{namelist}]);",
         f"let lookback = {_d}d;",
+        # A service started at boot weeks ago has no launch or image-load row of its own
+        # inside any lookback, so those two branches alone came back EMPTY for exactly the
+        # long-running services this alert flags (DEMO-116509, 2026-10-13: 0 rows for
+        # CxAudioSvc.exe while hunt_process found its children). The running binary is
+        # still on every event it INITIATES, with its own folder and hash: CxAudioSvc.exe
+        # 23 devices, FMService64.exe 18, Goodix 11, FortiClient scheduler.exe 46.
+        # Distinct-ed inside each branch so a chatty service cannot flood the union.
         "let seen = union isfuzzy=true",
         " (DeviceImageLoadEvents | where Timestamp > ago(lookback) | where FileName in~ (names)"
-        " | project FileName, DeviceName, FolderPath, SHA1),",
+        " | distinct FileName, DeviceName, FolderPath, SHA1),",
         " (DeviceProcessEvents   | where Timestamp > ago(lookback) | where FileName in~ (names)"
-        " | project FileName, DeviceName, FolderPath, SHA1);",
+        " | distinct FileName, DeviceName, FolderPath, SHA1),",
+        " (DeviceProcessEvents   | where Timestamp > ago(lookback)"
+        " | where InitiatingProcessFileName in~ (names)"
+        " | distinct FileName=InitiatingProcessFileName, DeviceName,"
+        " FolderPath=InitiatingProcessFolderPath, SHA1=InitiatingProcessSHA1),",
+        " (DeviceNetworkEvents   | where Timestamp > ago(lookback)"
+        " | where InitiatingProcessFileName in~ (names)"
+        " | distinct FileName=InitiatingProcessFileName, DeviceName,"
+        " FolderPath=InitiatingProcessFolderPath, SHA1=InitiatingProcessSHA1)",
+        # One row per binary whatever case each table logged it in.
+        " | extend FileName=tolower(FileName)",
+        " | where isnotempty(SHA1);",
         "let certs = DeviceFileCertificateInfo | where Timestamp > ago(lookback)",
         " | summarize Signer=take_any(Signer), Signed=max(toint(IsSigned)),"
         " Trusted=max(toint(IsTrusted)) by SHA1;",
         "let prevalence = seen | summarize Devices=dcount(DeviceName) by FileName;",
         "seen",
-        "| summarize Path=take_any(FolderPath) by FileName, SHA1",
+        # Odd = this hash ran from outside the admin-only install folders. Counted over
+        # EVERY copy (Paths below is only a 3-path sample), so an unsigned impostor of a
+        # signed vendor name on one host cannot hide behind the genuine copies elsewhere.
+        f"| extend Std = FolderPath matches regex @\"{STANDARD_LOCATION_KQL}\""
+        f" and not(FolderPath matches regex @\"{WRITABLE_UNDER_WINDOWS_KQL}\")",
+        "| summarize Path=take_any(FolderPath), Odd=max(toint(not(Std))) by FileName, SHA1",
         "| join kind=leftouter certs on SHA1",
         # Three-way, NOT trusted-vs-everything-else. A hash with no row in
         # DeviceFileCertificateInfo is a COVERAGE GAP, not an unsigned binary, and
@@ -400,16 +486,17 @@ def mde_service_identity(names: list, lookback_days: int = 30) -> str:
         # escalated it as "unsigned hashes … requires L2 review".
         "| summarize Hashes=dcount(SHA1), TrustedHashes=countif(Trusted==1),"
         " UntrustedHashes=countif(Trusted==0), NoCertRecord=countif(isnull(Trusted)),"
+        " OddUnverifiedHashes=countif(Odd==1 and isnull(Trusted)),"
         " Signers=make_set(Signer, 6), Paths=make_set(Path, 3) by FileName",
         "| join kind=inner prevalence on FileName",
         "| project FileName, Devices, Hashes, TrustedHashes, UntrustedHashes,"
-        " NoCertRecord, Signers, Paths",
+        " NoCertRecord, OddUnverifiedHashes, Signers, Paths",
         "| order by Devices desc",
     ])
 
 
 def mde_script_egress(device: str, process_name: str = "powershell",
-                      lookback_days: int = 7) -> str:
+                      lookback_days: int = 7, anchor_iso: str = "") -> str:
     """WHERE a script actually connected — resolves a parameterised URL to real hosts.
 
     A 'PowerShell script was loaded in memory' alert captures the script TEXT, and that
@@ -421,7 +508,7 @@ def mde_script_egress(device: str, process_name: str = "powershell",
     the question an analyst asks first: where did it actually go?
 
     DeviceNetworkEvents answers it. On e849msudaitwl2 every PowerShell egress in 30 days
-    resolved to app.example.com:443 (plus OCSP certificate checks and internal
+    resolved to ironwatch.uat.example.com:443 (plus OCSP certificate checks and internal
     LDAP) — one destination, internal, no divergence.
 
     Summarised by destination rather than row-by-row, and over DAYS not hours, on
@@ -437,9 +524,14 @@ def mde_script_egress(device: str, process_name: str = "powershell",
     except (TypeError, ValueError):
         _d = 7
     _d = max(1, min(_d, 30))
+    # Anchored: the N days before the alert plus a day after it, so a replay of an old
+    # ticket summarises the script's destinations around THAT load, not this week's.
+    anchor = _ts(anchor_iso)
+    rng = (f"| where Timestamp between (datetime({anchor}) - {_d}d .. datetime({anchor}) + 1d)"
+           if anchor else f"| where Timestamp > ago({_d}d)")
     q = [
         "DeviceNetworkEvents",
-        f"| where Timestamp > ago({_d}d)",
+        rng,
         f"| where DeviceName startswith {_lit(str(device).split('.')[0])}",
     ]
     if process_name:
@@ -475,9 +567,14 @@ def mde_network(device: str = "", remote_ip: str = "", remote_url: str = "",
         raise ValueError("hunt_network needs at least a device, remote_ip or remote_url")
     anchor = _ts(anchor_iso)
     if anchor:
-        half = max(1, _win(window_hours) // 2)
+        # Half-width in MINUTES, not hours: at window_hours=1 an integer-hour halving
+        # floors to 0, and clamping that back up to 1h would make the anchored window
+        # 2h — wider than the unanchored one it replaces. Minutes halve exactly at
+        # every window size, which is what keeps "never widens" true rather than
+        # true-for-the-common-case.
+        half_min = max(1, (_win(window_hours) * 60) // 2)
         q = ["DeviceNetworkEvents",
-             f"| where Timestamp between (datetime({anchor}) - {half}h .. datetime({anchor}) + {half}h)"]
+             f"| where Timestamp between (datetime({anchor}) - {half_min}m .. datetime({anchor}) + {half_min}m)"]
     else:
         q = ["DeviceNetworkEvents", f"| where Timestamp > ago({_win(window_hours)}h)"]
     if device:
@@ -498,13 +595,15 @@ def mde_network(device: str = "", remote_ip: str = "", remote_url: str = "",
     return _build(q)
 
 
-def mde_file(sha256: str = "", file_name: str = "", device: str = "", window_hours: int = 24) -> str:
+def mde_file(sha256: str = "", file_name: str = "", device: str = "", window_hours: int = 24,
+             anchor_iso: str = "") -> str:
     """File events by hash (md5/sha1/sha256) / file name / device."""
     if not (sha256 or file_name or device):
         raise ValueError("hunt_file needs at least a sha256, file_name or device")
     if sha256 and not _HEX_HASH_RE.match(sha256.strip()):
         raise ValueError(f"'{sha256}' is not a valid md5/sha1/sha256 hex hash")
-    q = ["DeviceFileEvents", f"| where Timestamp > ago({_win(window_hours)}h)"]
+    rng, anchor = _window("Timestamp", window_hours, anchor_iso)
+    q = ["DeviceFileEvents", rng]
     if sha256:
         h = sha256.strip()
         col = {64: "SHA256", 40: "SHA1", 32: "MD5"}[len(h)]
@@ -515,46 +614,71 @@ def mde_file(sha256: str = "", file_name: str = "", device: str = "", window_hou
         q.append(f"| where DeviceName =~ {_lit(device)}")
     q.append("| project Timestamp, DeviceName, FileName, FolderPath, SHA256, ActionType, "
              "InitiatingProcessFileName")
-    # Deterministic newest-first: _build appends `| take 50`, and without an ORDER
-    # that cap returns an ARBITRARY 50 of however many matched.
-    q.append("| order by Timestamp desc")
+    q += _order("Timestamp", anchor)
     return _build(q)
 
 
-def mde_logons(device: str = "", account: str = "", window_hours: int = 24) -> str:
+def mde_logons(device: str = "", account: str = "", window_hours: int = 24,
+               anchor_iso: str = "") -> str:
     """Logon events on a device / by an account."""
     if not (device or account):
         raise ValueError("hunt_logons needs at least a device or an account")
-    q = ["DeviceLogonEvents", f"| where Timestamp > ago({_win(window_hours)}h)"]
+    rng, anchor = _window("Timestamp", window_hours, anchor_iso)
+    q = ["DeviceLogonEvents", rng]
     if device:
         q.append(f"| where DeviceName =~ {_lit(device)}")
     if account:
         q.append(f"| where AccountName =~ {_lit(account)}")
     q.append("| project Timestamp, DeviceName, AccountName, LogonType, RemoteIP, ActionType, "
              "InitiatingProcessFileName")
-    # Deterministic newest-first: _build appends `| take 50`, and without an ORDER
-    # that cap returns an ARBITRARY 50 of however many matched.
-    q.append("| order by Timestamp desc")
+    q += _order("Timestamp", anchor)
     return _build(q)
 
 
 # ── Sentinel (Log Analytics — time field `TimeGenerated`) ────────────────────
 
-def sentinel_signin(upn: str = "", window_hours: int = 24) -> str:
+def sentinel_signin(upn: str = "", window_hours: int = 24, anchor_iso: str = "") -> str:
     """Azure AD interactive sign-ins for a user principal name."""
     if not upn:
         raise ValueError("hunt_signin needs a upn")
+    rng, anchor = _window("TimeGenerated", window_hours, anchor_iso)
     return _build([
         "SigninLogs",
-        f"| where TimeGenerated > ago({_win(window_hours)}h)",
+        rng,
         f"| where UserPrincipalName =~ {_lit(upn)}",
         "| project TimeGenerated, UserPrincipalName, ResultType, ResultDescription, "
         "IPAddress, AppDisplayName, Location",
-        "| order by TimeGenerated desc",
+        *_order("TimeGenerated", anchor),
     ])
 
 
-def sentinel_signin_summary(upn: str = "", window_hours: int = 24) -> str:
+def sentinel_signin_ips(upn: str = "", window_hours: int = 24, anchor_iso: str = "") -> str:
+    """Per SOURCE IP for a UPN, over both sign-in tables: volume, failures, successes,
+    network (ASN) and country — what an analyst asks first about a failure spike.
+
+    DEMO-116466 (2026-10-10) called 24.239.151.201/.202 "internal (India)" with no lookup.
+    They are AS55256, Netskope's egress, which ~400 Acme users sign in through: right
+    by luck, and beside the point — a shared egress cannot say WHO signed in. Typed with
+    tostring() because the two tables disagree on column types.
+    """
+    if not upn:
+        raise ValueError("sentinel_signin_ips needs a upn")
+    rng, _anchor = _window("TimeGenerated", window_hours, anchor_iso)
+    branch = (f" | {rng.lstrip('| ')} | where UserPrincipalName =~ {_lit(upn)}"
+              " | project IPAddress, ResultType=tostring(ResultType),"
+              " ASN=tostring(AutonomousSystemNumber), Country=tostring(Location)")
+    return _build([
+        "union",
+        f" (SigninLogs{branch}),",
+        f" (AADNonInteractiveUserSignInLogs{branch})",
+        "| summarize Events=count(), Failures=countif(ResultType != \"0\"),"
+        " Successes=countif(ResultType == \"0\"), ASN=take_anyif(ASN, isnotempty(ASN)),"
+        " Country=take_anyif(Country, isnotempty(Country)) by IPAddress",
+        "| order by Events desc",
+    ])
+
+
+def sentinel_signin_summary(upn: str = "", window_hours: int = 24, anchor_iso: str = "") -> str:
     """Sign-in OUTCOMES for a UPN, counted — the shape a failure-spike alert asks about.
 
     'Privileged Accounts - Sign in Failure Spikes' is a question about counts, and no
@@ -566,19 +690,96 @@ def sentinel_signin_summary(upn: str = "", window_hours: int = 24) -> str:
     to sign-in frequency checks by conditional access", which is the benign explanation
     the analysts closed on.
 
-    Returns one row per (ResultType, ResultDescription) with counts and first/last seen,
-    so the failure volume and its REASON are both visible without paging through rows.
+    Returns one row per (Table, ResultType, ResultDescription) with counts and first/last
+    seen, so the failure volume and its REASON are both visible without paging through rows.
+
+    Counts BOTH sign-in tables, as the analytics rule does. DEMO-115064: SigninLogs alone
+    showed 25 successes and no failure, the agent read that as "directly contradicts the
+    alert" and auto-closed — the spike was not in the table it looked at.
     """
     if not upn:
         raise ValueError("sentinel_signin_summary needs a upn")
+    rng, who = _window("TimeGenerated", window_hours, anchor_iso)[0], _lit(upn)
     return _build([
-        "SigninLogs",
-        f"| where TimeGenerated > ago({_win(window_hours)}h)",
-        f"| where UserPrincipalName =~ {_lit(upn)}",
+        "union isfuzzy=true",
+        f"    (SigninLogs {rng} | where UserPrincipalName =~ {who}"
+        " | extend Table = \"interactive\"),",
+        f"    (AADNonInteractiveUserSignInLogs {rng}"
+        f" | where UserPrincipalName =~ {who} | extend Table = \"non-interactive\")",
+        "| extend ResultType = tostring(ResultType)",
         "| summarize Events=count(), First=min(TimeGenerated), Last=max(TimeGenerated),"
         " IPs=dcount(IPAddress), Apps=make_set(AppDisplayName, 5)"
-        " by ResultType, ResultDescription",
+        " by Table, ResultType, ResultDescription",
         "| order by Events desc",
+    ])
+
+
+# Entra result codes that mean "a password was tried and was wrong" (50126: invalid
+# username or password) or "wrong so often the account locked" (50053). These are what a
+# password spray produces. Deliberately NOT 70044 (Conditional Access sign-in-frequency
+# expiry), which is this tenant's dominant BENIGN cause of failure spikes — DEMO-107545 had
+# 608 of them — and is not a wrong-password event at all.
+SPRAY_FAILURE_CODES = ("50126", "50053")
+
+
+def sentinel_signin_spray_check(upns: list[str], anchor_iso: str = "",
+                                before_hours: int = 24, until_iso: str = "") -> str:
+    """For each account: invalid-password failures, and any SUCCESS that came after them.
+
+    The question behind "never auto-close a sign-in failure spike when a success follows
+    invalid-password failures". Counting outcomes by type (sentinel_signin_summary) shows
+    that a success exists, but not whether it came AFTER the failures — which is the
+    difference between a user who logged in and later mistyped, and a spray that got in.
+    One row per account: BadPw, FirstBadPw, SuccessAfterBadPw, FirstSuccessAfter and the
+    IPs of those later successes.
+
+    Window runs from `before_hours` before the alert to NOW, not to the alert: a spray
+    that succeeds shortly after the alert fired is the case that matters most. Accounts
+    given without a domain match any UPN beginning `name@`. `until_iso` caps the window
+    for replaying a past ticket as it looked at triage time; production leaves it empty.
+
+    Also counts EVERY failure (`Failures`, any non-zero ResultType, 70044 included) across
+    BOTH sign-in tables — the analytics rule unions SigninLogs with
+    AADNonInteractiveUserSignInLogs (see edr_triage.sentinel_client.query_signin_logs), so
+    a spike can live entirely in the non-interactive table. DEMO-115064 auto-closed at 95%
+    on "zero failed sign-ins … directly contradicts the alert": the hunt had searched only
+    SigninLogs. `Failures == 0` means the failures that fired the alert were not found,
+    which is a gap in the evidence, not exculpation. Successes are still counted from the
+    INTERACTIVE table only: a background token refresh after a mistyped password is
+    routine, and counting it would change what this guard was measured against.
+    """
+    names = [u.strip() for u in (upns or []) if u and u.strip()]
+    if not names:
+        raise ValueError("sentinel_signin_spray_check needs at least one account")
+    who = " or ".join(
+        f"UserPrincipalName =~ {_lit(u)}" if "@" in u
+        else f"UserPrincipalName startswith {_lit(u + '@')}"
+        for u in names)
+    a, u = _ts(anchor_iso), _ts(until_iso)
+    end = f"datetime({u})" if u else "now()"
+    span = (f"TimeGenerated between (datetime({a}) - {_win(before_hours)}h .. {end})" if a
+            else f"TimeGenerated > ago({_win(before_hours) + 24}h)")
+    bad = ", ".join(_lit(c) for c in SPRAY_FAILURE_CODES)
+    return "\n".join([
+        f"let bad = dynamic([{bad}]);",
+        "let s = union isfuzzy=true",
+        f"    (SigninLogs | where {span} | where {who} | extend Interactive = true),",
+        f"    (AADNonInteractiveUserSignInLogs | where {span} | where {who}"
+        " | extend Interactive = false)",
+        "| extend rt = tostring(ResultType);",
+        "s | summarize BadPw = countif(rt in (bad)), FirstBadPw = minif(TimeGenerated, rt in (bad)),",
+        "    Failures = countif(rt != \"0\" and rt != \"\"),",
+        "    NonInteractiveFailures = countif(rt != \"0\" and rt != \"\" and not(Interactive))",
+        "    by UserPrincipalName",
+        "| join kind=leftouter (s | where rt == \"0\" and Interactive"
+        " | project UserPrincipalName, SuccessAt = TimeGenerated, IPAddress) on UserPrincipalName",
+        "| summarize BadPw = take_any(BadPw), FirstBadPw = take_any(FirstBadPw),",
+        "    Failures = take_any(Failures), NonInteractiveFailures = take_any(NonInteractiveFailures),",
+        "    SuccessAfterBadPw = countif(isnotnull(FirstBadPw) and SuccessAt > FirstBadPw),",
+        "    FirstSuccessAfter = minif(SuccessAt, isnotnull(FirstBadPw) and SuccessAt > FirstBadPw),",
+        "    SuccessIPs = make_set_if(IPAddress, isnotnull(FirstBadPw) and SuccessAt > FirstBadPw, 10)",
+        "    by UserPrincipalName",
+        f"| take {MAX_ROWS}",
     ])
 
 
@@ -674,17 +875,17 @@ def sentinel_identity_grant(actor: str = "", recipient: str = "", window_hours: 
     modifiedProperties under Role.DisplayName. Hence a template.
 
     Returns one row per (Actor, Recipient): who initiated, who received, the set of roles
-    granted, and the result. Verified on DEMO-106406 — one admin granted another user
-    five admin roles (Groups / User / Helpdesk / Authentication / Intune Administrator)
-    in 33 seconds.
+    granted, and the result. Verified on DEMO-106406 — tatum.shah granted
+    hayden.roy five admin roles (Groups / User / Helpdesk / Authentication / Intune
+    Administrator) in 33 seconds.
 
     NOTE for the caller: this answers ATTRIBUTION, not AUTHORISATION. Naming the grantor
     does not establish the grant was sanctioned — a compromised admin account produces
     exactly this shape. It tells you WHO to ask, not that the answer is fine.
 
-    At least one of `actor`/`recipient` is required — with both empty this ran unfiltered
-    over AuditLogs and returned the top tenant-wide grants by volume, which the caller
-    then mistook for evidence about an unrelated (non-Entra) alert.
+    At least one of `actor`/`recipient` is required — DEMO-108975: with both empty this
+    ran unfiltered over AuditLogs and returned the top tenant-wide grants by volume,
+    which the caller then mistook for evidence about an unrelated (non-Entra) alert.
     """
     if not (actor or recipient):
         raise ValueError(
@@ -724,8 +925,26 @@ def sentinel_identity_grant(actor: str = "", recipient: str = "", window_hours: 
     return _build(q)
 
 
+# Exchange/O365 parameters whose VALUE decides whether a change is dangerous.
+OFFICE_KEY_PARAMS = (
+    "UnifiedAuditLogIngestionEnabled", "AdminAuditLogEnabled", "AdminAuditLogAgeLimit",
+    "AuditDisabled", "AuditEnabled", "AuditBypassEnabled", "AuditLogAgeLimit",
+    "ForwardingSmtpAddress", "ForwardingAddress", "DeliverToMailboxAndForward",
+    "ForwardTo", "RedirectTo", "ForwardAsAttachmentTo", "DeleteMessage", "MoveToFolder",
+    "AutoForwardEnabled", "AccessRights", "GrantSendOnBehalfTo", "Trustee",
+    "SoftDeleteMessage", "MarkAsRead",
+)
+
+
+# High-volume read-only operations, left out of an operation-less hunt_office.
+OFFICE_READ_NOISE = (
+    "MailItemsAccessed", "FileAccessed", "FileAccessedExtended", "FilePreviewed",
+    "PageViewed", "PageViewedExtended", "ListViewed", "SearchQueryPerformed",
+)
+
+
 def sentinel_office_activity(operation: str = "", user: str = "", target: str = "",
-                             window_hours: int = 24) -> str:
+                             window_hours: int = 24, anchor_iso: str = "") -> str:
     """Office 365 / Exchange admin operations with the fields that DECIDE them.
 
     'Rare and potentially high-risk Office operations' is a host-less alert, so no MDE
@@ -747,13 +966,21 @@ def sentinel_office_activity(operation: str = "", user: str = "", target: str = 
       ExternalAccess  false = internal admin action, not an external principal.
       UserType        Admin/Regular, and AppPoolName names the calling component.
     """
-    q = ["OfficeActivity", f"| where TimeGenerated > ago({_win(window_hours)}h)"]
+    rng, anchor = _window("TimeGenerated", window_hours, anchor_iso)
+    q = ["OfficeActivity", rng]
     if operation:
         q.append(f"| where Operation =~ {_lit(operation)}")
+    else:
+        # A person's mailbox logs hundreds of reads a day; unfiltered, they bury the one
+        # rare change the alert is about (DEMO-108455: 50 rows of MailItemsAccessed, no
+        # New-InboxRule). Reads stay reachable by naming the operation.
+        noise = ", ".join(_lit(o) for o in OFFICE_READ_NOISE)
+        q.append(f"| where Operation !in~ ({noise})")
     if user:
         q.append(f"| where UserId has {_lit(user)}")
     if target:
         q.append(f"| where OfficeObjectId has {_lit(target)}")
+    keyparams = ", ".join(_lit(p) for p in OFFICE_KEY_PARAMS)
     q += [
         # Parameters is a JSON array of {Name, Value}; pull just the names — the values
         # carry GUIDs/PII and would blow the tool-result truncation for no added signal.
@@ -761,24 +988,33 @@ def sentinel_office_activity(operation: str = "", user: str = "", target: str = 
         # contains double quotes, and @"…" cannot carry them unescaped.
         """| extend ChangedParams = strcat_array(extract_all(@'"Name":"([^"]+)"', """
         """tostring(Parameters)), ", ")""",
+        # ...except the settings that decide whether a change is dangerous, whose VALUE is
+        # the whole question: audit on/off, forwarding and redirect targets, permission
+        # grants. DEMO-116600 (2026-10-12) called Set-AdminAuditLogConfig routine without
+        # being able to see it set AdminAuditLogEnabled=True; =False would be an attacker
+        # blinding the tenant, and the names alone look identical.
+        f"| extend KeySettings = todynamic(Parameters)",
+        f"| mv-apply kp = KeySettings on (where tostring(kp.Name) in~ ({keyparams})"
+        " | summarize KeySettings = strcat_array(make_list(strcat(tostring(kp.Name), \"=\","
+        " tostring(kp.Value))), \", \"))",
         "| project TimeGenerated, Operation, UserType, UserId, Target=OfficeObjectId, "
-        "ResultStatus, ExternalAccess, ClientIP, AppPoolName, ChangedParams",
-        "| order by TimeGenerated desc",
+        "ResultStatus, ExternalAccess, ClientIP, AppPoolName, ChangedParams, KeySettings",
+        *_order("TimeGenerated", anchor),
     ]
     return _build(q)
 
 
-def sentinel_security_event(host: str = "", account: str = "", window_hours: int = 24) -> str:
+def sentinel_security_event(host: str = "", account: str = "", window_hours: int = 24,
+                            anchor_iso: str = "") -> str:
     """Windows SecurityEvent rows by host (Computer) and/or account."""
     if not (host or account):
         raise ValueError("hunt_sentinel_event needs at least a host or an account")
-    q = ["SecurityEvent", f"| where TimeGenerated > ago({_win(window_hours)}h)"]
+    rng, anchor = _window("TimeGenerated", window_hours, anchor_iso)
+    q = ["SecurityEvent", rng]
     if host:
         q.append(f"| where Computer =~ {_lit(host)}")
     if account:
         q.append(f"| where Account has {_lit(account)}")
     q.append("| project TimeGenerated, Computer, Account, EventID, Activity")
-    # Deterministic newest-first: _build appends `| take 50`, and without an ORDER
-    # that cap returns an ARBITRARY 50 of however many matched.
-    q.append("| order by TimeGenerated desc")
+    q += _order("TimeGenerated", anchor)
     return _build(q)

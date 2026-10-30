@@ -17,6 +17,7 @@ from app.database import init_db, close_db
 from app.views.auth_views import router as auth_router
 from app.views.edr_triage_views import router as edr_triage_router
 from app.views.memory_views import router as memory_router
+from app.views.shadow_views import router as shadow_router
 
 
 # Set to True once config + DB init have completed.
@@ -25,6 +26,41 @@ _ready: bool = False
 
 def _demo_mode() -> bool:
     return os.getenv("DEMO_MODE", "false").lower() == "true"
+
+
+async def _run_shadow_hunter() -> None:
+    """Shadow-mode detector loop — scores the agent against analyst decisions.
+
+    No DB init here: the main app owns it. Each detector runs under its own lease so
+    one replica runs it once, and the initial pass is spaced out because firing every
+    detector back to back trips the hunting API's rate limit.
+    """
+    while not _ready:
+        await asyncio.sleep(0.5)
+    scheduler = None
+    try:
+        from shadow_hunter.detectors import DETECTORS
+        from shadow_hunter.scheduler import build_scheduler, _job
+
+        scheduler = build_scheduler()
+        scheduler.start()
+        logging.getLogger("shadow_hunter.service").info(
+            "shadow hunter started — %d detectors scheduled", len(DETECTORS)
+        )
+        for detector in DETECTORS:
+            await _job(detector)
+            await asyncio.sleep(5)
+        logging.getLogger("shadow_hunter.service").info("initial hunt pass complete")
+
+        while True:
+            await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logging.getLogger("shadow_hunter.service").exception("shadow hunter service crashed")
+    finally:
+        if scheduler:
+            scheduler.shutdown()
 
 
 async def _run_edr_triage() -> None:
@@ -142,7 +178,8 @@ async def _do_startup() -> None:
 async def lifespan(app: FastAPI):
     _handler = logging.StreamHandler(sys.stdout)
     _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
-    for _name in ("edr_triage", "edr_triage.service", "edr_triage.closure_poller", "app.main"):
+    for _name in ("edr_triage", "edr_triage.service", "edr_triage.closure_poller", "app.main",
+                  "shadow_hunter", "shadow_hunter.service"):
         _lg = logging.getLogger(_name)
         _lg.setLevel(logging.INFO)
         _lg.addHandler(_handler)
@@ -155,6 +192,7 @@ async def lifespan(app: FastAPI):
         tasks += [
             asyncio.create_task(_run_edr_triage(),          name="edr-triage"),
             asyncio.create_task(_run_jira_closure_poller(), name="jira-closure-poller"),
+            asyncio.create_task(_run_shadow_hunter(),       name="shadow-hunter"),
         ]
     tasks += [
         asyncio.create_task(_run_scg_decay(), name="scg-decay"),
@@ -202,6 +240,7 @@ app.add_middleware(_AuthMiddleware)
 app.include_router(auth_router)
 app.include_router(edr_triage_router)
 app.include_router(memory_router)
+app.include_router(shadow_router)
 
 
 @app.get("/")

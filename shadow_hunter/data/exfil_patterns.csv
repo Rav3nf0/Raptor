@@ -1,0 +1,6 @@
+Timestamp,DeviceName,RemoteUrl,RemoteIP,InitiatingProcessFileName,InitiatingProcessAccountName
+Apr 17 2026 14:22:00,wks-18.corp.example.com,https://transfer.sh/abc123/data.zip,198.211.123.45,chrome.exe,liam.osei
+Apr 17 2026 18:30:00,wks-05.corp.example.com,https://api.telegram.org/bot1234567890:AAF/sendDocument,149.154.167.220,powershell.exe,hana.oyelaran
+Apr 18 2026 01:45:00,srv-05.corp.example.com,sustained-connection-beacon,45.33.32.156,cmd.exe,administrator
+Apr 18 2026 04:10:00,wks-24.corp.example.com,https://mega.nz/file/abcXYZ,31.216.144.116,msedge.exe,node
+Apr 17 2026 22:55:00,wks-14.corp.example.com,https://discord.com/api/webhooks/1234/abcdefgh,162.159.135.233,python3.exe,rosa.nikolic
