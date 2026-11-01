@@ -98,6 +98,13 @@ confidence decay ages out patterns that stop matching reality.
   `/memory/graph`. Plain-canvas, no libraries. [Scaling notes.](docs/scaling-the-graph.md)
 - **ReAct agent loop.** Think, act, observe over real tools (MDE/Sentinel KQL hunts,
   VirusTotal, precedent recall, Jira), with deterministic safety gates on the verdict.
+- **A gate layer that overrules the model.** Verdicts are checked against the run that
+  produced them — values no tool returned, an actor read out of a role ARN, a close resting
+  on a hunt that errored, absence of evidence used as evidence. Gates only ever downgrade,
+  and one overturned auto-close disarms the whole alert family. [Safety gates.](#safety-gates)
+- **Shadow mode, so the numbers are yours.** Triage real alerts beside your analysts without
+  touching a ticket, score every verdict against what they decided, and quarantine the
+  disagreements instead of averaging them away. [Measuring it.](#measuring-it)
 - **Dual-LLM routing.** Sensitive classes (CloudTrail, privesc, command-line) go to an
   on-prem model with raw data; the rest take the sanitized cloud path.
 - **Vendor-agnostic core.** Every alert becomes a `NormalizedAlert` at intake; the
@@ -146,6 +153,7 @@ query layer) and the classifier, playbooks, agent, boundary, and memory stay the
 | **`agent_core/`** | ReAct agent loop, LLM backend abstraction, `sanitize.py` (the boundary), spend budget |
 | **`entity_graph/`** | the Security Context Graph: entities, relationships, tiered memory and decay |
 | **`agent_tools/`** | tools the agent can call (VirusTotal, MDE/Sentinel KQL, SCG recall, Jira) |
+| **`shadow_hunter/`** | shadow-mode scoring harness: hunts, detectors, verdict-vs-analyst agreement |
 | **`app/`** | FastAPI app, auth, the RAPTOR and AI-Memory views |
 
 ## How it compares
