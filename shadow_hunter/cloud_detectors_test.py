@@ -1,5 +1,5 @@
 """cloud_session_split and edr_silent_active — pinned on the properties that separated the
-INC-2026-0911-KB replay from ordinary days (see detectors/cloud.py).
+INC-2026-0001-KB replay from ordinary days (see detectors/cloud.py).
 
 Run: python -m pytest shadow_hunter/cloud_detectors_test.py -q
 """
@@ -55,12 +55,12 @@ def test_split_finding_masks_ids_and_names_the_behaviour():
 
 # ── edr_silent_active ───────────────────────────────────────────────────────────────
 
-def _dev(host, last, ips=("103.101.102.187",), user="lanesethi", os="macOS"):
+def _dev(host, last, ips=("203.0.113.55",), user="lanesethi", os="macOS"):
     return {"Host": host, "Last": last, "PublicIPs": list(ips), "OS": os, "DeviceId": f"id-{host}",
             "UsersRaw": [f'[{{"UserName":"{user}"}}]']}
 
 
-def _act(src, who, first, ip="103.101.102.187", dev="", calls=3, last=None):
+def _act(src, who, first, ip="203.0.113.55", dev="", calls=3, last=None):
     return {"Src": src, "Who": who, "First": first, "Last": last or first, "Ip": ip, "Dev": dev, "Calls": calls}
 
 

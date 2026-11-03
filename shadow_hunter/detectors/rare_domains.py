@@ -1,14 +1,14 @@
 """Fleet-new, fleet-rare external destinations reached by an unusual process.
 
 The previous version emitted 82,904 of /shadow's 96,597 unreviewed findings (2026-09-30)
-and still never flagged INC-2026-0911-KB's beacon. Two reasons, both verified live against
+and still never flagged INC-2026-0001-KB's beacon. Two reasons, both verified live against
 MDE on 2026-09-30:
 
   * It counted every process, so browsers, Teams, Zoom and OS daemons — whose job is
     talking to arbitrary CDN hosts — produced ~950 "rare" destinations a day.
   * It filtered on RemoteIPType == "Public", and macOS ConnectionSuccess rows carry an
     EMPTY RemoteIPType. Every successful Mac connection was invisible, including
-    macbook-pro-51's launchd -> python beacon to 144.172.101.226 / datamnw.com.
+    macbook-pro-51's launchd -> python beacon to 198.51.100.99 / datamnw.com.
 
 A destination now qualifies only when all of these hold: reached by an interpreter/shell/
 downloader, OR by a binary name almost no other device runs when launched from persistence
@@ -53,7 +53,7 @@ def build_kql(lookback_hours: int = 24, history_days: int = 7, max_fleet_devices
     # Empty RemoteIPType (macOS ConnectionSuccess) falls back to "not private/loopback IPv4".
     public = ('(RemoteIPType == "Public" or (isempty(RemoteIPType) and isnotempty(RemoteIP) '
               'and not(ipv4_is_private(RemoteIP)) and RemoteIP !startswith "127."))')
-    # RemoteUrl may be a full URL (http://144.172.101.226/update2.php); compare by host.
+    # RemoteUrl may be a full URL (http://198.51.100.99/update2.php); compare by host.
     dest = ('iff(isnotempty(RemoteUrl), tolower(coalesce(tostring(parse_url(RemoteUrl).Host), '
             'RemoteUrl)), RemoteIP)')
     proc = 'trim_end(@"\\.exe", tolower(InitiatingProcessFileName))'

@@ -3,7 +3,7 @@
 Kept from the original: the signal is precise (Group Policy's svchost writes ~13 exclusion
 values on most workstations every few days and is excluded; nothing else writes them
 routinely). Two changes, from UAT on 2026-09-30:
-  * One PowerShell run on uat-dart-pubsr on 2026-09-26 wrote 52 exclusion values, which made
+  * One PowerShell run on uat-atlas-pubsr on 2026-09-26 wrote 52 exclusion values, which made
     52 findings. Values from one writer command on one device are now one finding.
   * macOS was invisible. `mdatp exclusion ... add` is now covered.
   * 2026-10-05: MDE's own Security Settings Management (SenseCM.exe > powershell running the

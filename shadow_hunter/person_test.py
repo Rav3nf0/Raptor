@@ -13,9 +13,9 @@ from shadow_hunter import person as P
 
 # the incident Mac (replayed from Sentinel): fleet-new destinations reached by interpreters from
 # 2026-08-26, and by the implant from persistence from 08-27
-DEV = {"c2_high": ["mac-1: 144.172.101.226"], "rare_dest": ["mac-1: updateserver.xyz", "mac-1: aptupdate.org"],
+DEV = {"c2_high": ["mac-1: 198.51.100.99"], "rare_dest": ["mac-1: updateserver.xyz", "mac-1: aptupdate.org"],
        "persistence": []}
-STOLEN_KEY = {"new_net_calls": 257, "new_net_ips": 27, "session_split": True, "ips": ["193.37.32.48"],
+STOLEN_KEY = {"new_net_calls": 257, "new_net_ips": 27, "session_split": True, "ips": ["198.51.100.67"],
               "new_net_sensitive": ["ListSecrets", "GetSecretValue", "PutRolePolicy", "SendCommand"],
               "first_sensitive": ["ListSecrets", "GetSecretValue", "PutRolePolicy"]}
 
@@ -28,10 +28,10 @@ def test_the_incident_shape_is_one_high_case_in_attack_order():
     days = [_day("2026-08-26", endpoint=DEV),
             _day("2026-08-27", endpoint=DEV),
             _day("2026-09-07", cloud=STOLEN_KEY),
-            _day("2026-09-10", identity={"password_ok_mfa_stopped": 3, "ips": ["193.37.32.48"]})]
+            _day("2026-09-10", identity={"password_ok_mfa_stopped": 3, "ips": ["198.51.100.67"]})]
     c = P.score_case(days)
     assert c["severity"] == "high" and c["chain"] is True
-    assert set(c["strong_planes"]) >= {"endpoint", "cloud", "identity"} and c["shared_ips"] == ["193.37.32.48"]
+    assert set(c["strong_planes"]) >= {"endpoint", "cloud", "identity"} and c["shared_ips"] == ["198.51.100.67"]
 
 
 def test_a_single_source_never_makes_a_case_however_loud():
@@ -66,7 +66,7 @@ def test_run_day_writes_one_case_and_grows_it(monkeypatch):
         date(2026, 9, 1): {"a.user@corp.in": _day("2026-09-01", endpoint=DEV)},       # the C2 kept beaconing
         date(2026, 9, 7): {"a.user@corp.in": _day("2026-09-07", cloud=STOLEN_KEY)},
         date(2026, 9, 10): {"a.user@corp.in": _day("2026-09-10", identity={
-            "password_ok_mfa_stopped": 3, "ips": ["193.37.32.48"]})},
+            "password_ok_mfa_stopped": 3, "ips": ["198.51.100.67"]})},
     }
 
     async def fake_daily(day, client=None):
@@ -82,7 +82,7 @@ def test_run_day_writes_one_case_and_grows_it(monkeypatch):
     assert outs[0]["written"] == outs[1]["written"] == 0  # endpoint alone: no case
     assert outs[2]["written"] == 1 and outs[3]["updated"] == 1
     assert len(rows) == 1 and rows[0].severity == "high" and rows[0].indicator == "a.user@corp.in@2026-08-26"
-    assert rows[0].raw["shared_ips"] == ["193.37.32.48"] and rows[0].account_name == "a.user@corp.in"
+    assert rows[0].raw["shared_ips"] == ["198.51.100.67"] and rows[0].account_name == "a.user@corp.in"
 
 
 def test_an_unchanged_case_keeps_its_ai_suggestion(monkeypatch):

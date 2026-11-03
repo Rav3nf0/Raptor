@@ -10,7 +10,7 @@ fleet, combined with the network rarity findings rare_domains already produces:
   rare_persistent  fleet-rare interpreter lineages running from persistence (launchd, cron,
                    services) — whether or not they are new for the device. A persistent
                    implant is NOT novel after its first day; self-novelty alone learns it as
-                   normal (INC-2026-0911-KB: the launchd > python3 - lineage already ran on
+                   normal (INC-2026-0001-KB: the launchd > python3 - lineage already ran on
                    Sep 2), so fleet rarity has to count independently.
   net_high/med     rare_external_domains findings for the device that day
 

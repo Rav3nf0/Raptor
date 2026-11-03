@@ -1,7 +1,7 @@
 """Person cases: one rolling 14-day story per person across EDR, Netskope, Entra and CloudTrail.
 
 Why: the device behaviour score is keyed by device, so it can't see the cloud and identity
-planes, which are keyed by person. INC-2026-0911 was spread across both and over two weeks:
+planes, which are keyed by person. INC-2026-0001 was spread across both and over two weeks:
 the install and C2 on the laptop on Aug 26 (EDR), the person's AWS session replayed from a
 foreign network to list secrets on Sep 7 (CloudTrail). Each was a weak signal in its own tool.
 
@@ -131,7 +131,7 @@ def kql_network(d0: date, d1: date) -> str:
 def kql_identity(d0: date, d1: date) -> str:
     """Entra sign-ins from a country new for the person: successful ones, and attempts where the
     password was accepted and only MFA stopped them (50074/50076/50079/500121 — the attacker has
-    the password: INC-2026-0911, 193.37.32.48, 2026-09-10). Risk levels are hidden in this tenant,
+    the password: INC-2026-0001, 198.51.100.67, 2026-09-10). Risk levels are hidden in this tenant,
     so they are not used. Source IPs are kept for cross-plane matching with CloudTrail."""
     return f"""
         let t0 = {_dt(d0)}; let t1 = {_dt(d1)};

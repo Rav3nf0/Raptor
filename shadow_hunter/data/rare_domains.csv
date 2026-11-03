@@ -5,7 +5,7 @@ Destination,ConnectionCount,Devices,InitiatingProcesses
 23.201.47.137,2,"[""wks-18.corp.example.com""]","[""onedrive.exe"",""svchost.exe""]"
 13.235.4.4,4,"[""wks-18.corp.example.com""]","[""wpscloudsvr.exe"",""wpscenter.exe""]"
 23.217.53.24,5,"[""wks-28.corp.example.com""]","[""widgets.exe"",""explorer.exe""]"
-www.dartstechbku2.com,3,"[""uat-dart-pubsr""]","[""webxprsfiletransfer.exe""]"
+www.atlastech-bku2.com,3,"[""uat-atlas-pubsr""]","[""webxprsfiletransfer.exe""]"
 2606:4700:3037::6815:43ba,2,"[""wks-23.corp.example.com""]","[""chrome.exe""]"
 23.217.53.11,5,"[""wks-28.corp.example.com""]","[""chrome.exe"",""widgets.exe""]"
 23.60.109.60,4,"[""wks-08.corp.example.com""]","[""chrome.exe""]"

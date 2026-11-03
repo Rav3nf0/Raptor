@@ -69,7 +69,7 @@ def test_pick_is_stratified_and_spread_across_detectors():
         return await AC.pick(9)
     p = asyncio.run(go())
     assert len(p) == 9
-    assert "f100" in p                                     # the lone lolbin decision is not crowded out by DART
+    assert "f100" in p                                     # the lone lolbin decision is not crowded out by ATLAS
     assert sum(x.startswith("f2") and len(x) == 4 for x in p) == 3       # 3 Claude-unsure
     assert {x for x in p if x.startswith("f3")} & {"f300", "f310"} == {"f300", "f310"}  # both FP detectors
 

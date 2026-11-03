@@ -1,5 +1,5 @@
 """Story context (Jira alerts + VictoriaLogs), the story page and the v5-style report.
-Fixtures follow the DART intrusion of 17-19 Oct 2026."""
+Fixtures follow the ATLAS intrusion of 17-19 Oct 2026."""
 from __future__ import annotations
 
 import asyncio
@@ -13,7 +13,7 @@ from shadow_hunter import story_context as C
 from shadow_hunter.models import AuditLog, Finding, Story
 
 T = datetime(2026, 10, 19, 1, 46, tzinfo=timezone.utc)
-ATTACKER, NAT = "43.153.133.154", "65.2.96.12"
+ATTACKER, NAT = "198.51.100.23", "203.0.113.10"
 
 
 def finding(name, summary, at, detector="upwind_threats", raw=None, account=""):
@@ -25,19 +25,19 @@ def finding(name, summary, at, detector="upwind_threats", raw=None, account=""):
 
 def story(**kw):
     base = dict(title="2 hosts · Upwind · 17-19 Oct", severity="critical", first_seen=T - timedelta(hours=30), last_seen=T,
-                entities={"hosts": [{"name": "idart-publisher01", "aliases": ["BYOC::byoc-acme-dc::::ffff:10.0.0.76"],
+                entities={"hosts": [{"name": "iatlas-publisher01", "aliases": ["BYOC::byoc-acme-dc::::ffff:10.0.0.76"],
                                      "ips": ["10.0.0.76"]},
                                     {"name": "publisher02", "aliases": [], "ips": []}],
                           "accounts": ["devon.rao@example.com", "system"]},
-                timeline=[{"ts": T.isoformat(), "host": "idart-publisher01", "event": "webshell zz60770.ashx ran whoami",
+                timeline=[{"ts": T.isoformat(), "host": "iatlas-publisher01", "event": "webshell zzab12cd.ashx ran whoami",
                            "source": "upwind_threats", "severity": "critical", "finding_id": "f1"}])
     base.update(kw)
     defaults = {k: (f.default_factory() if f.default_factory else f.default) for k, f in Story.model_fields.items()}
     return Story.model_construct(**{**defaults, **base})
 
 
-DART = [finding("idart-publisher01", f"POST from {ATTACKER} to /DataService/zz60770.ashx", T,
-                raw={"ip": ATTACKER, "path": "c:\\inetpub\\zz60770.ashx"}),
+ATLAS = [finding("iatlas-publisher01", f"POST from {ATTACKER} to /DataService/zzab12cd.ashx", T,
+                raw={"ip": ATTACKER, "path": "c:\\inetpub\\zzab12cd.ashx"}),
         finding("publisher02", f"relay via {NAT} k6123456 upload", T + timedelta(minutes=5), raw={"ip": NAT}),
         finding("publisher02", f"{ATTACKER} again, cmd.exe /c whoami", T + timedelta(minutes=9))]
 
@@ -46,14 +46,14 @@ DART = [finding("idart-publisher01", f"POST from {ATTACKER} to /DataService/zz60
 
 def test_terms_put_attacker_ip_first_never_search_the_shared_nat_and_cap():
     st = story()
-    terms = C.mention_terms(st, DART)
+    terms = C.mention_terms(st, ATLAS)
     assert terms[0] == ATTACKER
     assert NAT not in terms
-    assert "zz60770" in terms and len(terms) <= C.MAX_TERMS
-    assert NAT in C.public_ips(st, DART)          # still looked up at the edge, just not full-text
+    assert "zzab12cd" in terms and len(terms) <= C.MAX_TERMS
+    assert NAT in C.public_ips(st, ATLAS)          # still looked up at the edge, just not full-text
     assert C.private_host_ips(st) == ["10.0.0.76"]
     assert C.people(st) == ["devon.rao@example.com"]
-    assert C.host_names(st) == ["idart-publisher01", "publisher02"]   # BYOC address is not a host name
+    assert C.host_names(st) == ["iatlas-publisher01", "publisher02"]   # BYOC address is not a host name
 
 
 def test_merge_rows_adds_counts_widens_times_and_unions_values():
@@ -87,7 +87,7 @@ class FakeVL:
                      "OriginResponseStatus": "200", "n": "263", "attack_paths": "263",
                      "sample_paths": '["/order-api/open/..%2fv0/order"]', "first": start, "last": end}]
         if "/aws/rds/" in q:
-            return [{"log_group": "/aws/rds/cluster/dart-db/audit", "dbuser": "sa", "client": "10.0.0.76", "op": "QUERY", "n": "2",
+            return [{"log_group": "/aws/rds/cluster/atlas-db/audit", "dbuser": "sa", "client": "10.0.0.76", "op": "QUERY", "n": "2",
                      "sample": '["1,srv,sa,10.0.0.76,1,2,QUERY,db,\'CREATE USER x IDENTIFIED BY \\\\\'hunter2pass\\\\\'\',0"]',
                      "first": start, "last": end}]
         if "-source_type:cloudflare" in q:
@@ -97,7 +97,7 @@ class FakeVL:
 
 def test_vlogs_context_queries_each_source_and_redacts_database_passwords():
     st, vl = story(), FakeVL()
-    out = asyncio.run(C.vlogs_context(st, DART, vl))
+    out = asyncio.run(C.vlogs_context(st, ATLAS, vl))
     assert set(out["edge"]) == {ATTACKER, NAT}
     assert out["edge"][ATTACKER]["rows"][0]["n"] == 263 * len(C.chunks(*_edge_window(st), C.EDGE_CHUNK_HOURS))
     assert list(out["eks"]) == ["devon.rao@example.com"]
@@ -121,14 +121,14 @@ def _hours(call):
 def test_vlogs_errors_are_recorded_not_raised_and_a_dead_lookup_stops_early():
     st = story()
     vl = FakeVL(fail=lambda q: "-source_type:cloudflare" in q)
-    out = asyncio.run(C.vlogs_context(st, DART, vl))
+    out = asyncio.run(C.vlogs_context(st, ATLAS, vl))
     m = out["mentions"][ATTACKER]
     assert m["rows"] == [] and len(m["errors"]) == 2 and m["chunks"].startswith("0/")
     assert out["edge"][ATTACKER]["rows"]                       # the other sources still answered
 
 
 def test_time_budget_skips_the_rest_and_says_so():
-    out = asyncio.run(C.vlogs_context(story(), DART, FakeVL(), budget_seconds=0))
+    out = asyncio.run(C.vlogs_context(story(), ATLAS, FakeVL(), budget_seconds=0))
     res = out["edge"][ATTACKER]
     assert res["rows"] == [] and "time budget" in res["errors"][0]
 
@@ -152,15 +152,15 @@ def test_related_alerts_match_host_or_person_in_the_window_only():
     async def go():
         await _db("ctx_alerts")
         st = story()
-        await _sr("DEMO-1", "IDART-PUBLISHER01.corp.local", "", T).insert()               # host, FQDN form
+        await _sr("DEMO-1", "IATLAS-PUBLISHER01.corp.local", "", T).insert()               # host, FQDN form
         await _sr("DEMO-2", "laptop-9", "CORP\\devon.rao", T - timedelta(hours=10)).insert()  # same person
         await _sr("DEMO-3", "laptop-9", "system", T).insert()                               # generic account: never
         await _sr("DEMO-4", "publisher02", "", T + timedelta(days=5)).insert()              # outside ±48 h
-        await _sr("DEMO-5", "idart-publisher011", "", T).insert()                           # prefix lookalike
+        await _sr("DEMO-5", "iatlas-publisher011", "", T).insert()                           # prefix lookalike
         return await C.related_alerts(st)
     out = asyncio.run(go())
     assert [a["jira_key"] for a in out] == ["DEMO-2", "DEMO-1"]
-    assert out[1]["matched_on"] == "host idart-publisher01"
+    assert out[1]["matched_on"] == "host iatlas-publisher01"
     assert out[0]["matched_on"] == "account devon.rao@example.com"
 
 
@@ -244,8 +244,8 @@ def test_story_page_and_report_render_everything_escaped_in_ist():
                         "vlogs": {"mentions": {ATTACKER: {"window": [T.isoformat(), T.isoformat()], "chunks": "1/1",
                                                           "rows": [{"source_type": "aws_s3", "n": "116", "first": T.isoformat()}]}}},
                         "fetched_at": T.isoformat()})
-    page = P.render_story_page(st, DART)
-    rep = P.render_story_report(st, DART)
+    page = P.render_story_page(st, ATLAS)
+    rep = P.render_story_report(st, ATLAS)
     for html in (page, rep):
         assert "<img src=x" not in html and "&lt;img" in html
         assert "jira.example.com/browse/DEMO-9" in html and "aws_s3" in html
@@ -260,13 +260,13 @@ def test_story_page_and_report_render_everything_escaped_in_ist():
 
 def test_indicator_kinds_accept_public_ips_and_tokens_only():
     assert C.indicator_kind(ATTACKER) == "ip"
-    assert C.indicator_kind("zz60770") == "term" and C.indicator_kind("62.2.96.0/24") == "term"
+    assert C.indicator_kind("zzab12cd") == "term" and C.indicator_kind("203.0.113.0/24") == "term"
     assert C.indicator_kind("10.0.0.76") is None          # private: nothing to see at the edge
     assert C.indicator_kind('x" or 1=1') is None and C.indicator_kind("ab") is None
 
 
 def test_an_analysts_indicator_is_searched_first_even_when_the_findings_carry_none():
-    # the DART story's 91 findings held no public IP; the attacker IP came from IIS logs
+    # the ATLAS story's 91 findings held no public IP; the attacker IP came from IIS logs
     st = story(indicators=[{"value": ATTACKER, "kind": "ip", "note": "IIS logs", "by": "riley"},
                            {"value": "atex", "kind": "term"}])
     bare = [finding("publisher02", "encoded powershell", T, detector="encoded_powershell")]
@@ -279,7 +279,7 @@ def test_an_analysts_indicator_is_searched_first_even_when_the_findings_carry_no
 
 
 def test_iocs_leave_out_our_own_asset_ids_and_dotnet_namespaces():
-    f = finding("idart-publisher01", "Upwind on uwr-bb8b0a1fe961b510280d5b517123eb73 using System.Net "
+    f = finding("iatlas-publisher01", "Upwind on uwr-bb8b0a1fe961b510280d5b517123eb73 using System.Net "
                 "dropped f2628a993b00596247d6da2858c6538a169089cc", T)
     f.device_id = "uwr-bb8b0a1fe961b510280d5b517123eb73"
     vals = {i["value"] for i in C.iocs(story(), [f])}
@@ -307,7 +307,7 @@ def test_add_and_remove_indicator_validates_dedups_audits_and_marks_context_due(
 
 
 def test_story_page_has_the_add_indicator_form_and_chips():
-    html = P.render_story_page(story(id="s2", indicators=[{"value": ATTACKER, "kind": "ip", "note": "IIS"}]), DART)
+    html = P.render_story_page(story(id="s2", indicators=[{"value": ATTACKER, "kind": "ip", "note": "IIS"}]), ATLAS)
     assert 'id="add-ind"' in html and f"data-rm='{ATTACKER}'" in html
 
 

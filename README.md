@@ -105,6 +105,9 @@ confidence decay ages out patterns that stop matching reality.
 - **Shadow mode, so the numbers are yours.** Triage real alerts beside your analysts without
   touching a ticket, score every verdict against what they decided, and quarantine the
   disagreements instead of averaging them away. [Measuring it.](#measuring-it)
+- **Scheduled hunting.** Fifteen detectors across endpoint, cloud and edge go after what
+  never raised a ticket. Findings resolve to one host across four naming systems and group
+  into incident stories with a merged timeline. [Hunting.](#hunting)
 - **Dual-LLM routing.** Sensitive classes (CloudTrail, privesc, command-line) go to an
   on-prem model with raw data; the rest take the sanitized cloud path.
 - **Vendor-agnostic core.** Every alert becomes a `NormalizedAlert` at intake; the
@@ -218,6 +221,31 @@ with and a comparison mode for running two models over the same alerts
 
 > We deliberately do not print our own accuracy figure here. It is a property of one SOC's
 > alert mix, and it would not be reproducible for you. Run the harness on yours.
+
+## Hunting
+
+Triage only ever sees what your rules already alert on. The other half of `shadow_hunter/`
+is fifteen detectors that go looking, on a schedule, for what never raised a ticket: encoded
+PowerShell, LOLBin abuse, Defender exclusions written at runtime, suspicious parent/child
+lineages, rare persistence, remote logons, EKS and RDS audit anomalies, cloud session splits,
+SSH reverse tunnels, rare destinations, exfil patterns, and attack-shaped paths the origin
+answered 2xx. They produce findings rather than alerts — scored, then held against an
+allowlist your analysts build up as they dismiss things.
+
+Two pieces make that a queue worth reading rather than another one to ignore.
+
+- **Hosts are resolved, not matched.** One machine arrives as an Upwind asset id, an MDE
+  device id, a BYOC address and a hostname. Union-find joins them on shared identifiers, so a
+  host under four names is one entity instead of four findings.
+- **Findings become stories.** Related findings group across hosts into a single story with a
+  merged timeline, so an intrusion that lands as dozens of findings on several machines reads
+  as one incident. Rendered at `/shadow/stories/{id}` with its evidence, and a printable
+  report alongside.
+
+Behavioural scoring runs beside the detectors. Each device's process lineages (grandparent >
+parent > child, versions normalized so `python3.13` and `python3.12` are one name) are
+profiled daily, and the device is scored on how far it departs from its own history and from
+the fleet. Learned profiles, not signature lists.
 
 ## Security & threat model
 

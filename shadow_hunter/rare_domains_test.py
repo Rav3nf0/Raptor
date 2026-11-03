@@ -2,7 +2,7 @@
 
 Replayed live against MDE on 2026-09-30: the old query produced ~950 destinations a day
 and never saw macOS successful connections at all (their RemoteIPType is empty). The
-rewrite gave 20 on the INC-2026-0911-KB day with the two C2 indicators as the only highs,
+rewrite gave 20 on the INC-2026-0001-KB day with the two C2 indicators as the only highs,
 and 27 / 189 with zero highs on two ordinary days. These tests pin the properties that
 produced that, so a later edit cannot quietly undo one.
 

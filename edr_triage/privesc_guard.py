@@ -217,8 +217,8 @@ async def check(jira_key: str, device: str, actor: str, cmds: list[str], cfg) ->
 # ── Session check ─────────────────────────────────────────────────────────────────────
 # The repeat rule asks "has a person cleared these commands for this user on this host?".
 # It cannot tell the person from someone replaying their stolen session with the same
-# routine command (INC-2026-0911-KB: a stolen ReadOnly session replayed from
-# 193.37.32.0/24). So a repeat closes only when the SSM session itself looks like this
+# routine command (INC-2026-0001-KB: a stolen ReadOnly session replayed from
+# 198.51.100.0/24). So a repeat closes only when the SSM session itself looks like this
 # person's usual ones: every StartSession behind the alert came from a source IP they used
 # on at least SESSION_MIN_DAYS earlier days, through a role and a kind of client they have
 # used before. Anything unfamiliar is asked about or escalated instead. Fails closed.

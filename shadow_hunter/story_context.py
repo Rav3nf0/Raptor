@@ -2,7 +2,7 @@
 
 A story (shadow_hunter/stories.py) groups /shadow findings. The rest of the picture lives
 elsewhere: the Jira alerts RAPTOR triaged on the same hosts and accounts, and the edge,
-Kubernetes, database and application logs in VictoriaLogs. The DART intrusion showed the
+Kubernetes, database and application logs in VictoriaLogs. The ATLAS intrusion showed the
 cost of leaving those out: the order attempts, the gateway bypass and 116 S3 access-log
 lines from the attacker IP were each found by hand, in a different place.
 
@@ -48,7 +48,7 @@ STORIES_PER_RUN = 2
 MAX_INDICATORS = 20
 # Shared Acme egress (corporate NAT, ~13M requests a day): a phrase search for it matches
 # everything and times out, and "this IP appears in the logs" says nothing.
-SKIP_TERMS = {"65.2.96.12"}
+SKIP_TERMS = {"203.0.113.10"}
 
 _PRIVATE = re.compile(r"^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)")
 _IPV4 = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")

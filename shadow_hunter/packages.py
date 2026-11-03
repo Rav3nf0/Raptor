@@ -1,6 +1,6 @@
 """Package names out of install command lines, and their reputation from OSV.dev.
 
-INC-2026-0911-KB started with `npm install self-certificate`, run on 2026-08-26 by the user's
+INC-2026-0001-KB started with `npm install self-certificate`, run on 2026-08-26 by the user's
 Claude Code agent. OSV had listed that package as malicious (MAL-2026-5644, from Amazon
 Inspector's feed via OpenSSF malicious-packages) since 2026-06-11. The old detector keyed on
 "npm spawned a shell", which is every install; the package name was the signal.

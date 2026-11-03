@@ -15,7 +15,7 @@ from shadow_hunter.detectors.edge_attacks import ATTACK_PATH_RE, EdgeAttacksDete
 # ── the path pattern ───────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("path", [
-    "/order-api/open/..%2fv0/order",                                  # DART 2026-10-19
+    "/order-api/open/..%2fv0/order",                                  # ATLAS 2026-10-19
     "/pledge-margins/v1/open/..%2F..%2Fv2/pledge-unpledge-request",
     "/mutual-funds/open/actuato%72;%2f%2e%2e/gateway/routes/x",       # Oct 14 actuator bypass
     "/mutual-funds/open/actuator/gateway/routes/x",
@@ -43,7 +43,7 @@ def test_the_logsql_literal_round_trips_to_the_same_regex():
 
 # ── findings ───────────────────────────────────────────────────────────────────
 
-def _row(method, ip="65.2.96.12", hits="263", sample=None):
+def _row(method, ip="203.0.113.10", hits="263", sample=None):
     return {"ClientIP": ip, "ClientCountry": "in", "ClientRequestHost": "service.example.com",
             "ClientRequestMethod": method, "hits": hits, "paths": "3",
             "sample": sample if sample is not None else json.dumps(["/order-api/open/..%2fv0/order"]),
@@ -53,8 +53,8 @@ def _row(method, ip="65.2.96.12", hits="263", sample=None):
 def test_a_write_answered_2xx_is_critical_and_a_read_is_high():
     f = EdgeAttacksDetector().to_findings([_row("POST"), _row("GET", hits="10")])
     assert [x["severity"] for x in f] == ["critical", "high"]
-    assert f[0]["indicator"] == "65.2.96.12|service.example.com|POST|2026-10-19"
-    assert f[0]["device_name"] == "service.example.com" and f[0]["device_id"] == "65.2.96.12"
+    assert f[0]["indicator"] == "203.0.113.10|service.example.com|POST|2026-10-19"
+    assert f[0]["device_name"] == "service.example.com" and f[0]["device_id"] == "203.0.113.10"
     assert "/order-api/open/..%2fv0/order" in f[0]["summary"] and "WRITE" in f[0]["summary"]
     assert f[0]["raw"]["sample_paths"] == ["/order-api/open/..%2fv0/order"]
     assert f[0]["mitre_techniques"] == ["T1190"]

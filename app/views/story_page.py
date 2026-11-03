@@ -5,7 +5,7 @@
                        edge requests, other logs), systems, every alert and detection, the
                        VictoriaLogs context, indicators and why the findings were grouped.
   render_story_report  /shadow/stories/{id}/print: the written report in the layout of the
-                       DART v5 report, followed by sections built from the story itself;
+                       ATLAS v5 report, followed by sections built from the story itself;
                        light, A4, the browser's Save as PDF makes the file.
 
 Everything shown passes through stories.clean() and is HTML-escaped; report bodies are a
@@ -409,7 +409,7 @@ def render_story_page(st, findings: list) -> str:
 <h2>Indicators</h2>
 <p class="muted small">Add what the detections do not carry (an attacker IP from web-server logs, a file stem). The edge
 and other logs are searched for it on the next refresh, which starts right away.</p>
-<form class="addind" id="add-ind"><input name="value" placeholder="43.153.133.154 or zz60770" required maxlength="100">
+<form class="addind" id="add-ind"><input name="value" placeholder="198.51.100.23 or zzab12cd" required maxlength="100">
 <input name="note" placeholder="where it came from (optional)" maxlength="200"><button class="btn" type="submit">Add indicator</button></form>
 {_added(st)}
 {_iocs_table(clean(iocs(st, findings)))}

@@ -1,5 +1,5 @@
 """Incident stories: grouping, link reasons, safety rules and redaction (shadow_hunter/stories.py).
-Fixtures follow the DART intrusion of 17-19 Oct 2026."""
+Fixtures follow the ATLAS intrusion of 17-19 Oct 2026."""
 from __future__ import annotations
 
 import asyncio
@@ -46,26 +46,26 @@ async def _insert(*fs):
 
 def test_byoc_address_name_and_hostname_resolve_to_one_host():
     a = upwind(BYOC, "A host is retrieving its system hostname", T, typ="INTERNAL_VPC")
-    b = upwind("idart-publisher01", "A host is retrieving the current user identity", T + timedelta(minutes=10), typ="BYOC_HOST")
+    b = upwind("iatlas-publisher01", "A host is retrieving the current user identity", T + timedelta(minutes=10), typ="BYOC_HOST")
     f2e, ents = S.resolve_entities([a, b])
-    assert f2e[a.id] == f2e[b.id] == "idart-publisher01"
-    assert ents["idart-publisher01"]["ips"] == ["10.0.0.76"]
+    assert f2e[a.id] == f2e[b.id] == "iatlas-publisher01"
+    assert ents["iatlas-publisher01"]["ips"] == ["10.0.0.76"]
 
 
 def test_same_rare_title_links_two_hosts_but_an_everyday_title_on_many_hosts_does_not():
     rare = [upwind("publisher02", "A host is searching files recursively for credential-related strings", T, asset="uwr-p2"),
-            upwind("idart-publisher01", "A host is searching files recursively for credential-related strings", T + timedelta(minutes=5))]
+            upwind("iatlas-publisher01", "A host is searching files recursively for credential-related strings", T + timedelta(minutes=5))]
     common = [upwind(f"uat-host-{i}", "Login Banner Inspection", T, asset=f"uwr-{i}") for i in range(7)]
     fs = rare + common
     f2e, _ = S.resolve_entities(fs)
     edges = S.shared_indicator_edges(fs, f2e, {f.id: S.tokens(f) for f in fs})
     assert len(edges) == 1 and edges[0]["kind"] == "shared_indicator"
-    assert "publisher02" in edges[0]["reason"] and "idart-publisher01" in edges[0]["reason"]
+    assert "publisher02" in edges[0]["reason"] and "iatlas-publisher01" in edges[0]["reason"]
 
 
 def test_shared_file_stem_links_hosts_but_cmd_exe_never_does():
-    x = mde("uat-dart-pubsr", "encoded_powershell", "w3wp > cmd > powershell writes DataService\\zz60770.ashx", T)
-    y = upwind("publisher02", "Batch script via nested shells D:\\IDartswwwroot\\DataService\\zz60770.ashx", T + timedelta(minutes=8), asset="uwr-p2")
+    x = mde("uat-atlas-pubsr", "encoded_powershell", "w3wp > cmd > powershell writes DataService\\zzab12cd.ashx", T)
+    y = upwind("publisher02", "Batch script via nested shells D:\\IAtlaswwwroot\\DataService\\zzab12cd.ashx", T + timedelta(minutes=8), asset="uwr-p2")
     z = mde("laptop-1", "suspicious_parent_child", "excel.exe started cmd.exe", T, device_id="b" * 40)
     w = mde("laptop-2", "suspicious_parent_child", "word.exe started cmd.exe", T, device_id="c" * 40)
     fs = [x, y, z, w]
@@ -77,13 +77,13 @@ def test_shared_file_stem_links_hosts_but_cmd_exe_never_does():
 
 
 def test_network_touch_only_inside_the_60_minute_window():
-    src = mde("uat-dart-pubsr.corp.example.com", "encoded_powershell", "w3wp > cmd", T - timedelta(minutes=30))
+    src = mde("uat-atlas-pubsr.corp.example.com", "encoded_powershell", "w3wp > cmd", T - timedelta(minutes=30))
     dst = upwind(BYOC, "A host is retrieving its system hostname", T + timedelta(minutes=10))
     fs = [src, dst]
     f2e, ents = S.resolve_entities(fs)
-    inside = [{"DeviceName": "uat-dart-pubsr.corp.example.com", "RemoteIP": "10.0.0.76", "Times": [T.isoformat()]}]
-    outside = [{"DeviceName": "uat-dart-pubsr.corp.example.com", "RemoteIP": "10.0.0.76", "Times": [(T - timedelta(hours=3)).isoformat()]}]
-    after = [{"DeviceName": "uat-dart-pubsr.corp.example.com", "RemoteIP": "10.0.0.76", "Times": [(T + timedelta(hours=1)).isoformat()]}]
+    inside = [{"DeviceName": "uat-atlas-pubsr.corp.example.com", "RemoteIP": "10.0.0.76", "Times": [T.isoformat()]}]
+    outside = [{"DeviceName": "uat-atlas-pubsr.corp.example.com", "RemoteIP": "10.0.0.76", "Times": [(T - timedelta(hours=3)).isoformat()]}]
+    after = [{"DeviceName": "uat-atlas-pubsr.corp.example.com", "RemoteIP": "10.0.0.76", "Times": [(T + timedelta(hours=1)).isoformat()]}]
     e = S.network_touch_edges(fs, f2e, ents, inside)
     assert len(e) == 1 and "10 min later" in e[0]["reason"]
     assert S.network_touch_edges(fs, f2e, ents, outside) == []
@@ -102,15 +102,15 @@ def test_a_lone_finding_or_a_quiet_pair_on_one_host_is_not_a_story():
     assert S.qualifies(trio, f2e)
 
 
-def test_build_groups_the_dart_shape_and_is_idempotent():
+def test_build_groups_the_atlas_shape_and_is_idempotent():
     async def go():
         await _db("stories_build")
         fs = await _insert(
-            mde("uat-dart-pubsr", "encoded_powershell", "w3wp writes DataService\\zz60770.ashx", T, sev="medium"),
-            mde("uat-dart-pubsr", "unusual_remote_logons", "RDP by administrator", T + timedelta(hours=1)),
-            upwind(BYOC, "A host is searching files recursively for credential-related strings DataService\\zz60770.ashx", T + timedelta(minutes=10),
+            mde("uat-atlas-pubsr", "encoded_powershell", "w3wp writes DataService\\zzab12cd.ashx", T, sev="medium"),
+            mde("uat-atlas-pubsr", "unusual_remote_logons", "RDP by administrator", T + timedelta(hours=1)),
+            upwind(BYOC, "A host is searching files recursively for credential-related strings DataService\\zzab12cd.ashx", T + timedelta(minutes=10),
                    ai="true_positive"),
-            upwind("idart-publisher01", "A host is retrieving the current user identity", T + timedelta(minutes=20), typ="BYOC_HOST"),
+            upwind("iatlas-publisher01", "A host is retrieving the current user identity", T + timedelta(minutes=20), typ="BYOC_HOST"),
             upwind("publisher02", "A host is retrieving the current user identity", T + timedelta(minutes=21), asset="uwr-p2"),
             mde("laptop-9", "rare_persistence", "WPS update task", T, device_id="9" * 40),
         )
@@ -125,7 +125,7 @@ def test_build_groups_the_dart_shape_and_is_idempotent():
     st = sts[0]
     assert len(st.finding_ids) == 5 and st.severity == "high"
     hosts = {h["name"] for h in st.entities["hosts"]}
-    assert hosts == {"uat-dart-pubsr", "idart-publisher01", "publisher02"}
+    assert hosts == {"uat-atlas-pubsr", "iatlas-publisher01", "publisher02"}
     assert {e["kind"] for e in st.edges} >= {"same_entity", "shared_indicator"}
     assert all(e["reason"] for e in st.edges)
     assert [t["ts"] for t in st.timeline] == sorted(t["ts"] for t in st.timeline)
@@ -136,8 +136,8 @@ def test_detached_finding_never_rejoins_closed_story_never_reopens_severity_neve
     async def go():
         await _db("stories_rules")
         a = upwind("publisher02", "A host is retrieving the current user identity", T, asset="uwr-p2", ai="true_positive")
-        b = upwind("idart-publisher01", "A host is retrieving the current user identity", T + timedelta(minutes=3))
-        c = mde("idart-publisher01", "encoded_powershell", "enc", T + timedelta(minutes=30), sev="low")
+        b = upwind("iatlas-publisher01", "A host is retrieving the current user identity", T + timedelta(minutes=3))
+        c = mde("iatlas-publisher01", "encoded_powershell", "enc", T + timedelta(minutes=30), sev="low")
         await _insert(a, b, c)
         await S.build(now=NOW)
         st = (await Story.find_all().to_list())[0]
@@ -149,7 +149,7 @@ def test_detached_finding_never_rejoins_closed_story_never_reopens_severity_neve
         await S.set_status(st.id, "closed", "analyst")
         d = upwind("publisher02", "A host is retrieving the current user identity", T + timedelta(hours=2), asset="uwr-p2",
                    ai="true_positive")
-        e = upwind("idart-publisher01", "A host is retrieving the current user identity", T + timedelta(hours=2, minutes=1))
+        e = upwind("iatlas-publisher01", "A host is retrieving the current user identity", T + timedelta(hours=2, minutes=1))
         await _insert(d, e)
         await S.build(now=NOW)
         all_st = await Story.find_all().to_list()
@@ -192,7 +192,7 @@ def test_enrichment_failure_still_groups():
     async def go():
         await _db("stories_enrich_fail")
         await _insert(upwind("publisher02", "A host is retrieving the current user identity", T, asset="uwr-p2", ai="true_positive"),
-                      upwind("idart-publisher01", "A host is retrieving the current user identity", T + timedelta(minutes=2)))
+                      upwind("iatlas-publisher01", "A host is retrieving the current user identity", T + timedelta(minutes=2)))
         return await S.build(now=NOW, client=Broken())
     r = asyncio.run(go())
     assert r["created"] == 1 and "429" in r["enrichment_error"]
@@ -201,7 +201,7 @@ def test_enrichment_failure_still_groups():
 def test_vendor_installed_binaries_never_link_hosts_but_app_files_do():
     a = mde("pc-1", "rare_persistence", r"task runs C:\Windows\System32\DriverStore\FileRepository\cui.inf\igfxEM.exe", T, device_id="1" * 40)
     b = mde("pc-2", "rare_persistence", r"task runs C:\Windows\System32\DriverStore\FileRepository\cui.inf\igfxEM.exe", T, device_id="2" * 40)
-    c = mde("uat-dart-pubsr", "encoded_powershell", r"ReadAllBytes('C:\IDarts Services\DIPL API Services\ApiServices.dll.config')", T)
+    c = mde("uat-atlas-pubsr", "encoded_powershell", r"ReadAllBytes('C:\IAtlas Services\Acme API Services\ApiServices.dll.config')", T)
     d = upwind("publisher02", r"findstr acme D:\ApiServices.dll.con*", T + timedelta(minutes=5), asset="uwr-p2")
     fs = [a, b, c, d]
     f2e, _ = S.resolve_entities(fs)
@@ -305,7 +305,7 @@ def test_a_new_story_needs_a_true_positive_but_an_open_story_still_grows():
     async def go():
         await _db("stories_tp_gate")
         a = upwind("publisher02", "A host is retrieving the current user identity", T, asset="uwr-p2")
-        b = upwind("idart-publisher01", "A host is retrieving the current user identity", T + timedelta(minutes=3))
+        b = upwind("iatlas-publisher01", "A host is retrieving the current user identity", T + timedelta(minutes=3))
         await _insert(a, b)
         r0 = await S.build(now=NOW)                                   # untriaged: nothing
         ov = await Finding.get(a.id)
@@ -329,7 +329,7 @@ def test_a_confirmed_true_positive_backs_a_story_without_any_ai_verdict():
     async def go():
         await _db("stories_tp_human")
         a = upwind("publisher02", "A host is retrieving the current user identity", T, asset="uwr-p2")
-        b = upwind("idart-publisher01", "A host is retrieving the current user identity", T + timedelta(minutes=3))
+        b = upwind("iatlas-publisher01", "A host is retrieving the current user identity", T + timedelta(minutes=3))
         fs = await _insert(a, b)
         fs[0].decision, fs[0].reviewed_at = "true_positive", NOW
         await fs[0].save()

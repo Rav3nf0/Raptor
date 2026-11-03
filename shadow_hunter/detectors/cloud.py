@@ -1,6 +1,6 @@
 """Detectors that need the Sentinel workspace (AWSCloudTrail, SigninLogs), not only MDE.
 
-Both came out of INC-2026-0911-KB: the endpoint score only flagged macbook-pro-51 on Sep 10,
+Both came out of INC-2026-0001-KB: the endpoint score only flagged macbook-pro-51 on Sep 10,
 because its MDE sensor was silent Sep 2-9 — the week an attacker replayed the user's AWS
 session from elsewhere (Sep 7). Measured on UAT's Sentinel data, 2026-09-30.
 

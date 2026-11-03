@@ -1,6 +1,6 @@
 """Package installs checked against what is known about the package — not "npm ran a shell".
 
-INC-2026-0911-KB began on 2026-08-26 with `npm install self-certificate`, run by the user's
+INC-2026-0001-KB began on 2026-08-26 with `npm install self-certificate`, run by the user's
 Claude Code agent. OSV had listed the package as malicious since 2026-06-11. The retired
 npm_postinstall_scripts detector did flag it — as one of ~112 identical "high" rows a day,
 one per install of anything — and nobody reviewed it.

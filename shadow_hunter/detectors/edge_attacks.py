@@ -1,7 +1,7 @@
 """Attack-shaped requests at the Cloudflare edge that the ORIGIN answered 2xx.
 
 The WAF blocks most probing (3,205 traversal attempts on api.example.com got 403 during the
-DART intrusion). What matters is the request that got through: an attack pattern in the
+ATLAS intrusion). What matters is the request that got through: an attack pattern in the
 path that our own service accepted. On 2026-10-19 00:37-02:45 UTC two IPs used the gateway
 bypass `/order-api/open/..%2fv0/order` on service.example.com and got 200 on POST x263, PUT,
 PATCH and DELETE — nothing in Defender, Sentinel or Upwind saw it.
@@ -10,7 +10,7 @@ Reads VictoriaLogs (source_type:cloudflare) in place, through shadow_hunter.clie
 The Cloudflare feed carries path, method and statuses but no query string, user agent, WAF
 action or request headers, so this matches on the PATH only.
 
-Replay on 2026-10-19 data: the last 24 h had only the DART requests (10 groups); busy
+Replay on 2026-10-19 data: the last 24 h had only the ATLAS requests (10 groups); busy
 weekday windows had 0-1 (a /blog/phpmyadmin/ hit on algoverse), plus Oct 14's Spring Cloud
 Gateway actuator route-injection POSTs on mutual-funds that came back 2xx.
 

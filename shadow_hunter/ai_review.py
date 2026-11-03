@@ -1,7 +1,7 @@
 """/shadow AI suggestions, cheaply: group findings, Mistral gathers the evidence, Opus decides.
 
 Why (2026-10-26): Mistral alone matched Claude only where analyst precedents existed and,
-on new findings, called a real edge brute-force (216.185.57.67) FP; the Claude Code passes
+on new findings, called a real edge brute-force (198.51.100.44) FP; the Claude Code passes
 are good because they group findings and investigate each pattern once. Opus running the
 whole tool loop per finding would cost ~$200-400/month; this design keeps the expensive model
 out of the tool loop:

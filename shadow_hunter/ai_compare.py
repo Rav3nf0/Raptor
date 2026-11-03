@@ -33,7 +33,7 @@ def _db():
 async def pick(limit: int) -> list[str]:
     """A stratified sample: a third analyst-decided (ground truth), a third Claude TP/unsure
     (where a model miss hurts), a third Claude FP; each spread across detectors round-robin,
-    so one big incident (DART: 24 confirmed encoded-PowerShell TPs) cannot fill the run."""
+    so one big incident (ATLAS: 24 confirmed encoded-PowerShell TPs) cannot fill the run."""
     from shadow_hunter.models import Finding
     rows = await Finding.get_pymongo_collection().find(
         {"ai_by": CLAUDE_BY, "ai_verdict": {"$in": ["true_positive", "false_positive", "unsure"]}},

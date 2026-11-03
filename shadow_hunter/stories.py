@@ -1,8 +1,8 @@
 """Incident stories: related findings grouped into one story with a timeline and a report.
 
-Why: the DART intrusion (17-19 Oct 2026) reached /shadow as ~70 separate findings on three
+Why: the ATLAS intrusion (17-19 Oct 2026) reached /shadow as ~70 separate findings on three
 hosts, and 24 more came back as "new" on 19 Oct only because Upwind renamed
-'BYOC::byoc-acme-dc::::ffff:10.0.0.76' to 'idart-publisher01'. The analyst stitched the
+'BYOC::byoc-acme-dc::::ffff:10.0.0.76' to 'iatlas-publisher01'. The analyst stitched the
 story together by hand. This module does the stitching; the written report is added on
 request (a Claude Code pass reads /bundle and posts /report; write_report() is the seam for
 an in-app model later). Never Gemini: a story is internal data end to end.
@@ -16,7 +16,7 @@ How:
     left out, never guessed.
   * Edges, each with the reason it was made:
       same_entity       consecutive findings on one host or account within 48 h
-      shared_indicator  a rare token (file stem like zz60770, file name, domain, public IP,
+      shared_indicator  a rare token (file stem like zzab12cd, file name, domain, public IP,
                         hash, Upwind title) on 2-5 entities within 48 h; tokens on more
                         entities, and a deny-list of everyday ones, never link
       network_touch     host A connected to one of host B's IPs (DeviceNetworkEvents) and
@@ -263,7 +263,7 @@ def _installed_binary(token: str, blob: str) -> bool:
 
 def tokens(f) -> set[str]:
     """Distinctive strings in a finding. Upwind titles count as tokens too: two hosts raising
-    the same rare detection within hours is how publisher02 and idart-publisher01 meet."""
+    the same rare detection within hours is how publisher02 and iatlas-publisher01 meet."""
     blob = " ".join([f.indicator or "", f.summary or "",
                      json.dumps(f.raw or {}, default=str)[:20000]]).replace("\\\\", "\\")
     out = set()
@@ -692,7 +692,7 @@ def _trim_raw(raw: dict, limit: int = 2500) -> dict | str:
     return raw if len(s) <= limit else s[:limit] + "…"
 
 
-# The written report follows the DART incident report (v5, 19 Oct 2026): the sections an
+# The written report follows the ATLAS incident report (v5, 19 Oct 2026): the sections an
 # incident lead, the service owners and management read. The writer fills these; the story
 # page and the PDF add the IOC table, related alerts, edge/log context, the merged timeline
 # and evidence sources from the story itself, so the writer does not retype them.
