@@ -11,7 +11,7 @@
 [![Last commit](https://img.shields.io/github/last-commit/rav3nf0/raptor?style=flat-square&color=8b97a3)](https://github.com/rav3nf0/raptor/commits)
 [![Stars](https://img.shields.io/github/stars/rav3nf0/raptor?style=flat-square&color=f0b866)](https://github.com/rav3nf0/raptor/stargazers)
 
-[Quick start](#quick-start) · [Architecture](#architecture) · [How it compares](#how-it-compares) · [Threat model](#security--threat-model) · [Earning autonomy](#earning-autonomy) · [Contributing](#contributing) · [Docs](#docs)
+[Quick start](#quick-start) · [Architecture](#architecture) · [What it costs](#what-it-costs) · [How it compares](#how-it-compares) · [Threat model](#security--threat-model) · [Earning autonomy](#earning-autonomy) · [Contributing](#contributing) · [Docs](#docs)
 
 **[📹 Watch the demo](docs/raptor-demo.mp4)** — triage, boundary, and memory in ~4 minutes.
 
@@ -24,7 +24,7 @@ L1 SOC analyst you can run in your own environment. It polls your ticketing/EDR 
 classifies each alert, investigates it with a ReAct agent loop over real tools, and posts a
 verdict.
 
-Three things make it different.
+Four things make it different.
 
 **It assumes the model will be confidently wrong.** Most of this codebase is not the agent —
 it is the layer that refuses the agent's answer. Grounding and claim checks reject verdicts
@@ -43,6 +43,11 @@ you generate — see [Measuring it](#measuring-it).
 names, user principals, ARNs, internal IPs, and command lines out of every external-LLM call,
 while a tiered memory learns from how your analysts actually close tickets and ages out stale
 patterns.
+
+**It costs about two cents an alert.** A mid-tier model behind a hard in-process spend cap,
+not a frontier model behind a per-seat licence. A queue of a few thousand alerts a month
+triages for under $100, and the cap refuses the call rather than emailing you about the
+overspend afterwards. See [What it costs](#what-it-costs).
 
 > **Status:** extracted from a platform running in a financial-services SOC. Apache-2.0.
 > Runs offline on synthetic data with no credentials — see [Quick start](#quick-start).
@@ -96,8 +101,12 @@ confidence decay ages out patterns that stop matching reality.
 - **Interactive context graph.** Devices, users, and the alerts linking them, colored by
   verdict, with rings on AI/analyst disagreements. In the AI-Memory tab or full-screen at
   `/memory/graph`. Plain-canvas, no libraries. [Scaling notes.](docs/scaling-the-graph.md)
-- **ReAct agent loop.** Think, act, observe over real tools (MDE/Sentinel KQL hunts,
-  VirusTotal, precedent recall, Jira), with deterministic safety gates on the verdict.
+- **ReAct agent loop.** Think, act, observe over real tools, with deterministic safety gates
+  on the verdict. What an alert gets checked against is the point: MDE and Sentinel KQL hunts,
+  VirusTotal and AbuseIPDB, the vulnerability state of the host, cloud runtime detections, the
+  Cloudflare edge, EKS and Aurora audit trails held in VictoriaLogs, precedent recall out of
+  the graph, and the ticket's own history. An alert nobody can give context to is the one that
+  gets closed because it is cheaper than finding out.
 - **A gate layer that overrules the model.** Verdicts are checked against the run that
   produced them — values no tool returned, an actor read out of a role ARN, a close resting
   on a hunt that errored, absence of evidence used as evidence. Gates only ever downgrade,
@@ -155,7 +164,7 @@ query layer) and the classifier, playbooks, agent, boundary, and memory stay the
 | **`edr_triage/`** | poll → classify → playbook pipeline, verdict store |
 | **`agent_core/`** | ReAct agent loop, LLM backend abstraction, `sanitize.py` (the boundary), spend budget |
 | **`entity_graph/`** | the Security Context Graph: entities, relationships, tiered memory and decay |
-| **`agent_tools/`** | tools the agent can call (VirusTotal, MDE/Sentinel KQL, SCG recall, Jira) |
+| **`agent_tools/`** | tools the agent can call (MDE/Sentinel KQL, VictoriaLogs, VirusTotal, AbuseIPDB, cloud runtime, vuln state, SCG recall, Jira) |
 | **`shadow_hunter/`** | shadow-mode scoring harness: hunts, detectors, verdict-vs-analyst agreement |
 | **`app/`** | FastAPI app, auth, the RAPTOR and AI-Memory views |
 
@@ -234,6 +243,29 @@ Three things keep the number honest once you are closing tickets for real:
 > We deliberately do not print our own accuracy figure here. It is a property of one SOC's
 > alert mix, and it would not be reproducible for you. Run the harness on yours.
 
+## What it costs
+
+A mid-tier model does this job. RAPTOR defaults to Mistral Large — roughly $0.59 per million
+input tokens — rather than a frontier model, and that is a consequence of the gate design
+rather than a compromise. Deterministic checks catch the failure modes you would otherwise
+pay a much larger model to avoid, so the budget goes into verification instead of parameters.
+A queue of a few thousand alerts a month runs on under $100 of model spend: on the order of
+two cents an alert, for the whole volume rather than per analyst.
+
+The cap is enforced, not reported. Every call's token usage and USD cost is written to Mongo
+and the monthly limit is checked in-process — the backend refuses the call once
+month-to-date spend reaches it. Shadow-mode experiments draw on their own budget, so a batch
+you kicked off overnight cannot starve production triage. Month-to-date spend sits at the top
+of the console.
+
+Which is the case for running this on a small team rather than despite being one. There is no
+per-seat licence and no minimum contract, it deploys as one container plus Mongo, and the
+in-process cap lets a three-person team bound its exposure to the exact dollar. The gate layer
+matters more at that size, not less: a small team cannot hand-review every verdict, so
+deterministic refusal is what makes leaving it switched on survivable. Per-family autonomy and
+the self-disarming brake exist for the same reason — you turn it on for one alert family, and
+it turns itself off if it starts being wrong, with nobody watching.
+
 ## Hunting
 
 Triage only ever sees what your rules already alert on. The other half of `shadow_hunter/`
@@ -242,7 +274,10 @@ PowerShell, LOLBin abuse, Defender exclusions written at runtime, suspicious par
 lineages, rare persistence, remote logons, EKS and RDS audit anomalies, cloud session splits,
 SSH reverse tunnels, rare destinations, exfil patterns, proxy and control bypasses (a binary
 running from an interpreter's own bin folder under someone else's name), and attack-shaped
-paths the origin answered 2xx. They produce findings rather than alerts — scored, then held
+paths the origin answered 2xx. Endpoint and cloud come from MDE, Sentinel and the cloud
+runtime; the edge, Kubernetes and database detectors read VictoriaLogs in place, which holds
+what the EDR never sees — every Cloudflare request, the prod EKS API audit trail and the
+Aurora audit log of every production database. They produce findings rather than alerts — scored, then held
 against an allowlist your analysts build up as they dismiss things.
 
 Two pieces make that a queue worth reading rather than another one to ignore.
@@ -252,8 +287,9 @@ Two pieces make that a queue worth reading rather than another one to ignore.
   host under four names is one entity instead of four findings.
 - **Findings become stories.** Related findings group across hosts into a single story with a
   merged timeline, so an intrusion that lands as dozens of findings on several machines reads
-  as one incident. Rendered at `/shadow/stories/{id}` with its evidence, and a printable
-  report alongside.
+  as one incident. Rendered at `/shadow/stories/{id}` with its evidence and a printable report
+  alongside, including a VictoriaLogs snapshot taken onto the story so it still reads after
+  the logs behind it have aged out.
 
 Behavioural scoring runs beside the detectors. Each device's process lineages (grandparent >
 parent > child, versions normalized so `python3.13` and `python3.12` are one name) are
