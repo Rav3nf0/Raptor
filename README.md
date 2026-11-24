@@ -45,9 +45,9 @@ while a tiered memory learns from how your analysts actually close tickets and a
 patterns.
 
 **It costs about two cents an alert.** A mid-tier model behind a hard in-process spend cap,
-not a frontier model behind a per-seat licence. A queue of a few thousand alerts a month
-triages for under $100, and the cap refuses the call rather than emailing you about the
-overspend afterwards. See [What it costs](#what-it-costs).
+not a frontier model behind a per-seat licence. The queue this came out of averages about
+4,400 alerts a month and triages for under $100, and the cap refuses the call rather than
+emailing you about the overspend afterwards. See [What it costs](#what-it-costs).
 
 > **Status:** extracted from a platform running in a financial-services SOC. Apache-2.0.
 > Runs offline on synthetic data with no credentials — see [Quick start](#quick-start).
@@ -249,8 +249,9 @@ A mid-tier model does this job. RAPTOR defaults to Mistral Large — roughly $0.
 input tokens — rather than a frontier model, and that is a consequence of the gate design
 rather than a compromise. Deterministic checks catch the failure modes you would otherwise
 pay a much larger model to avoid, so the budget goes into verification instead of parameters.
-A queue of a few thousand alerts a month runs on under $100 of model spend: on the order of
-two cents an alert, for the whole volume rather than per analyst.
+The production queue this was built against averages about 4,400 alerts a month and runs on
+under $100 of model spend: about two cents an alert, for the whole volume rather than per
+analyst.
 
 The cap is enforced, not reported. Every call's token usage and USD cost is written to Mongo
 and the monthly limit is checked in-process — the backend refuses the call once
