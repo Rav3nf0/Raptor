@@ -508,7 +508,7 @@ DET_LABEL = {"encoded_powershell": "encoded PowerShell", "upwind_threats": "Upwi
              "unusual_remote_logons": "RDP anomaly", "suspicious_parent_child": "parent-child", "exfil_patterns": "exfil",
              "entity_behavior": "behaviour", "person_behavior": "person case", "fleet_spread": "fleet spread",
              "lolbin_abuse": "LOLBin", "defender_exclusions": "Defender exclusion", "package_installs": "package install",
-             "edge_attacks": "edge attack", "eks_audit": "EKS audit", "rds_audit": "RDS audit", "ssh_backdoor": "SSH backdoor"}
+             "edge_attacks": "edge attack", "eks_audit": "EKS audit", "rds_audit": "RDS audit", "ssh_backdoor": "SSH backdoor", "control_bypass": "control bypass"}
 
 
 def describe(comp, f2e, ents) -> dict:
@@ -817,7 +817,7 @@ _WRITING: set = set()           # background report tasks, held so they are not 
 def report_writer_enabled() -> bool:
     """In-app reports: Claude only (SHADOW_LLM=claude) and only when SHADOW_STORY_REPORTS is on."""
     from agent_core.backend import shadow_llm
-    return shadow_llm() == "claude" and os.getenv("SHADOW_STORY_REPORTS", "0").strip().lower() in ("1", "true", "yes", "on")
+    return shadow_llm() == "claude" and os.getenv("SHADOW_STORY_REPORTS", "1").strip().lower() in ("1", "true", "yes", "on")
 
 
 def fit_bundle(b: dict, limit: int = BUNDLE_LIMIT) -> str:
@@ -860,8 +860,8 @@ def parse_sections(text: str) -> list[dict]:
 
 
 async def write_report(story_id: str) -> dict | None:
-    """In-app report writer: Claude (SHADOW_LLM=claude, SHADOW_STORY_REPORTS=1) with extended
-    thinking, from the story bundle alone. Returns the stored report, or None when the writer is
+    """In-app report writer: Claude (SHADOW_LLM=claude, SHADOW_STORY_REPORTS=1), with adaptive
+    thinking for a high/critical story, from the story bundle alone. Returns the stored report, or None when the writer is
     off. Raises on a failed call or an unusable reply; the caller keeps the story queued for a
     Claude Code pass. Never Gemini."""
     if not report_writer_enabled():
@@ -874,7 +874,10 @@ async def write_report(story_id: str) -> dict | None:
     prompt = (f"{REPORT_GUIDE}\n\nSections, in this order (omit one that has nothing to say):\n{template}\n\n"
               'Reply with JSON only: {"sections": [{"heading": "...", "body": "markdown"}]}\n\n'
               f"STORY BUNDLE (masked; secrets redacted):\n{fit_bundle(b)}")
-    text, _ = await get_shadow_backend(thinking=True).chat(
+    from shadow_hunter.models import Story
+    st = await Story.get(story_id)
+    deep = bool(st and st.severity in ("high", "critical"))      # adaptive thinking only for these
+    text, _ = await get_shadow_backend(thinking=deep).chat(
         [{"role": "system", "content": REPORT_SYSTEM}, {"role": "user", "content": prompt}], [])
     secs = parse_sections(text)
     if not secs:

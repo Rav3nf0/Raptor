@@ -105,7 +105,7 @@ confidence decay ages out patterns that stop matching reality.
 - **Shadow mode, so the numbers are yours.** Triage real alerts beside your analysts without
   touching a ticket, score every verdict against what they decided, and quarantine the
   disagreements instead of averaging them away. [Measuring it.](#measuring-it)
-- **Scheduled hunting.** Fifteen detectors across endpoint, cloud and edge go after what
+- **Scheduled hunting.** Sixteen detectors across endpoint, cloud and edge go after what
   never raised a ticket. Findings resolve to one host across four naming systems and group
   into incident stories with a merged timeline. [Hunting.](#hunting)
 - **Dual-LLM routing.** Sensitive classes (CloudTrail, privesc, command-line) go to an
@@ -189,13 +189,14 @@ outcome *more* cautious — downgrade to "needs L2", never upgrade to a close. A
 | Errored hunt | A close that rests on a tool call which actually failed. |
 | Service / fleet masquerade | A binary trusted because it is named like a vendor service, without the signer or fleet evidence to back it. |
 | Concurrency hold | Closing an alert while a sibling on the same incident is still open with a human. |
+| Grant check | A close that rests on "there is an approval/exception for this" without the artefact actually being found. |
 | Autonomy brake | The whole alert family, the moment an analyst overturns one of its auto-closes. |
 
 Each gate is there because a real alert was triaged wrongly without it, and each ships with
 the regression test for that specific failure. The guards live in
 [`edr_triage/`](edr_triage/) (`privesc_guard`, `signin_guard`, `powershell_guard`,
 `usb_guard`, `uba_guard`, `log_ingestion_guard`, `custom_block_guard`, `duplicate_guard`,
-`autonomy_brake`, `concurrency_hold`) and the model-facing checks in
+`failed_login_guard`, `canary_guard`, `file_origin`, `autonomy_brake`, `concurrency_hold`) and the model-facing checks in
 [`agent_core/`](agent_core/) (`claim_check`, `critic`, `close_review`).
 
 Autonomy is per-alert-family and off by default — see [Earning autonomy](#earning-autonomy).
@@ -219,18 +220,30 @@ one you can walk back to individual tickets. The harness also ships the detector
 with and a comparison mode for running two models over the same alerts
 (`/api/shadow/ai/compare`).
 
+Three things keep the number honest once you are closing tickets for real:
+
+- **QA sample.** A few random autonomous closes a day go in front of an analyst and the
+  answer is counted. Measuring only the closes someone happened to look at measures the
+  wrong thing.
+- **Replay corpus.** Every live triage records what it was given, every tool result, and
+  what it decided. Swap the model or the EDR and you can replay the corpus instead of
+  waiting another month for fresh alerts to find out what broke.
+- **Rule candidates.** Shapes people always close the same way are surfaced as candidates
+  for a deterministic rule. An LLM call you can replace with four lines of code should be.
+
 > We deliberately do not print our own accuracy figure here. It is a property of one SOC's
 > alert mix, and it would not be reproducible for you. Run the harness on yours.
 
 ## Hunting
 
 Triage only ever sees what your rules already alert on. The other half of `shadow_hunter/`
-is fifteen detectors that go looking, on a schedule, for what never raised a ticket: encoded
+is sixteen detectors that go looking, on a schedule, for what never raised a ticket: encoded
 PowerShell, LOLBin abuse, Defender exclusions written at runtime, suspicious parent/child
 lineages, rare persistence, remote logons, EKS and RDS audit anomalies, cloud session splits,
-SSH reverse tunnels, rare destinations, exfil patterns, and attack-shaped paths the origin
-answered 2xx. They produce findings rather than alerts — scored, then held against an
-allowlist your analysts build up as they dismiss things.
+SSH reverse tunnels, rare destinations, exfil patterns, proxy and control bypasses (a binary
+running from an interpreter's own bin folder under someone else's name), and attack-shaped
+paths the origin answered 2xx. They produce findings rather than alerts — scored, then held
+against an allowlist your analysts build up as they dismiss things.
 
 Two pieces make that a queue worth reading rather than another one to ignore.
 

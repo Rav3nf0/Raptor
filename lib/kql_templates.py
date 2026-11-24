@@ -507,7 +507,7 @@ def mde_script_egress(device: str, process_name: str = "powershell",
     That is the one hole in closing this family on an exact-command precedent, and it is
     the question an analyst asks first: where did it actually go?
 
-    DeviceNetworkEvents answers it. On e849msudaitwl2 every PowerShell egress in 30 days
+    DeviceNetworkEvents answers it. On e849bqinitwl2 every PowerShell egress in 30 days
     resolved to ironwatch.uat.example.com:443 (plus OCSP certificate checks and internal
     LDAP) — one destination, internal, no divergence.
 
@@ -612,10 +612,47 @@ def mde_file(sha256: str = "", file_name: str = "", device: str = "", window_hou
         q.append(f"| where FileName =~ {_lit(file_name)}")
     if device:
         q.append(f"| where DeviceName =~ {_lit(device)}")
+    # Where the file came from decides most "unsigned binary" alerts: DEMO-121950's
+    # jit-cli-s3 was downloaded from jit.example.com, a fact the agent never saw.
+    # Query strings are cut (S3 presigned links carry a signature).
+    q.append("| extend FileOriginUrl = tostring(split(FileOriginUrl, '?')[0]), "
+             "FileOriginReferrerUrl = tostring(split(FileOriginReferrerUrl, '?')[0])")
     q.append("| project Timestamp, DeviceName, FileName, FolderPath, SHA256, ActionType, "
-             "InitiatingProcessFileName")
+             "InitiatingProcessFileName, InitiatingProcessCommandLine, FileOriginUrl, "
+             "FileOriginReferrerUrl")
     q += _order("Timestamp", anchor)
     return _build(q)
+
+
+def mde_file_prevalence(sha256: str, days: int = 29, anchor_iso: str = "") -> str:
+    """Every device that has held this file in the last `days` (MDE keeps 30), with where
+    each copy was downloaded from. One row per device.
+
+    hunt_file is clamped to +-7 days around the alert, which on DEMO-121950 showed the
+    internal JIT tool on 1 other Mac instead of 8 and no download source at all.
+    """
+    h = (sha256 or "").strip()
+    if not _HEX_HASH_RE.match(h):
+        raise ValueError(f"'{sha256}' is not a valid md5/sha1/sha256 hex hash")
+    col = {64: "SHA256", 40: "SHA1", 32: "MD5"}.get(len(h))
+    if not col:
+        raise ValueError(f"'{sha256}' is not a valid md5/sha1/sha256 hex hash")
+    d = max(1, min(int(days or 29), 29))
+    anchor = _ts(anchor_iso)
+    rng = (f"| where Timestamp between (datetime({anchor}) - {d}d .. datetime({anchor}) + 1h)"
+           if anchor else f"| where Timestamp > ago({d}d)")
+    return "\n".join([
+        "DeviceFileEvents", rng,
+        f"| where {col} =~ {_lit(h)}",
+        "| extend Origin = tostring(split(FileOriginUrl, '?')[0]), "
+        "Referrer = tostring(split(FileOriginReferrerUrl, '?')[0])",
+        "| summarize FirstSeen = min(Timestamp), LastSeen = max(Timestamp), Events = count(), "
+        "Origins = make_set_if(Origin, isnotempty(Origin), 5), "
+        "Referrers = make_set_if(Referrer, isnotempty(Referrer), 5), "
+        "Names = make_set(FileName, 5), Paths = make_set(FolderPath, 5) by DeviceName",
+        "| order by FirstSeen asc",
+        f"| take {MAX_ROWS}",
+    ])
 
 
 def mde_logons(device: str = "", account: str = "", window_hours: int = 24,

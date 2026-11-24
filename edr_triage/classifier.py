@@ -248,6 +248,13 @@ _CREDENTIAL_ACCESS_PATTERNS = [
 ]
 
 
+# Cyble digests ("Found 216 alerts for stealer_logs across 2 entities") are intel, read by
+# their own threat-intel guards, not by an endpoint playbook. "stealer"
+# sent them to the MDE malware playbook, which wrote "Unknown Device ... notifying affected
+# user via Slack" on every stealer_logs digest (DEMO-122951).
+_CYBLE_DIGEST = re.compile(r"^\s*found\s+\d+\s+alerts?\s+for\s+\S+.*\sacross\s+\d+\s+entit", re.I)
+
+
 def classify(alert_name: str, investigation_state: str = "") -> str:
     """Return a playbook name for the given alert.
 
@@ -264,6 +271,9 @@ def classify(alert_name: str, investigation_state: str = "") -> str:
             return user_result
     except Exception:
         pass  # never crash classification due to rule load failure
+
+    if _CYBLE_DIGEST.match(name):
+        return "generic"
 
     for pat in _UPWIND_PATTERNS:
         if pat.search(name):

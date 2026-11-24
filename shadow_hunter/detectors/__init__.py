@@ -1,5 +1,6 @@
 from shadow_hunter.detectors.base import Detector
 from shadow_hunter.detectors.cloud import CloudSessionSplitDetector, EdrSilentActiveDetector
+from shadow_hunter.detectors.control_bypass import ControlBypassDetector
 from shadow_hunter.detectors.defender_exclusions import DefenderExclusionsDetector
 from shadow_hunter.detectors.edge_attacks import EdgeAttacksDetector
 from shadow_hunter.detectors.eks_audit import EksAuditDetector
@@ -26,6 +27,7 @@ DETECTORS: list[Detector] = [
     LOLBinAbuseDetector(),
     RarePersistenceDetector(),
     SshBackdoorDetector(),
+    ControlBypassDetector(),
     # PackageInstallsDetector() — paused 2026-10-01: even trimmed, its run got the UAT pod OOM-killed
     # (256 MiB limit, ~160 MiB used at idle). Re-enable once the pod has >=1 GiB.
     # Medium — run every 30 min

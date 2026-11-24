@@ -30,7 +30,7 @@ def ask_comment(who: str, reason: str) -> str:
 # The Sentinel rule joins file writes to the latest "UsbDriveMounted" event and tests
 # `FolderPath startswith DriveLetter`. An internal SATA DVD drive (BusType 11) "mounts" with
 # NO drive letter, the empty letter matches every path, and every write to a local D:\ then
-# reads as a USB copy. up11nnadaoprwd raised 23 of 50 USB alerts in 60 days this way:
+# reads as a USB copy. up11cbrkoprwd raised 23 of 50 USB alerts in 60 days this way:
 # busywin.exe (Busy accounting) writing its own files to D:\busywin. IT confirmed it
 # (BitRaser run, DVD write disabled, nothing copied to USB) — but the drive still mounts
 # ~20 times a day, so the alerts keep coming until the rule excludes BusType 11.
@@ -76,11 +76,28 @@ async def drive_check(incident_url: str, alert_id: str) -> dict:
     Returns {"internal": True, "device", "paths", "mounts", "reason"} only when it is proven
     that none was; otherwise {"internal": False, "reason": "..."}.
     """
-    try:
-        return await _drive_check(incident_url, alert_id)
-    except Exception as exc:
-        _log.warning("usb_guard: drive check failed for %s: %s", alert_id, exc)
-        return {"internal": False, "reason": f"drive check failed ({str(exc)[:120]})"}
+    import asyncio
+    res: dict = {}
+    for wait in (0, *RETRY_WAITS):
+        if wait:
+            await asyncio.sleep(wait)
+        try:
+            res = await _drive_check(incident_url, alert_id)
+        except Exception as exc:
+            _log.warning("usb_guard: drive check failed for %s: %s", alert_id, exc)
+            res = {"internal": False, "reason": f"drive check failed ({str(exc)[:120]})"}
+        if not str(res.get("reason") or "").startswith(_NOT_YET_IN_SENTINEL):
+            break
+    return res
+
+
+# The Jira ticket can be triaged before Log Analytics has the alert row: DEMO-122894's
+# SecurityAlert row was ingested 2 s before RAPTOR commented (100 s after the alert), so the
+# check read "not found", G14 stayed on and RAPTOR asked the user about a copy that never
+# happened. Only "not there yet" answers are retried; a removable mount never is.
+RETRY_WAITS = (30, 45, 60)
+_NOT_YET_IN_SENTINEL = ("Sentinel alert not found", "no file event read",
+                        "no drive mount found for the alert window", "drive check failed")
 
 
 async def _drive_check(incident_url: str, alert_id: str) -> dict:

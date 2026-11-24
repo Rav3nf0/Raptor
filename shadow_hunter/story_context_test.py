@@ -204,7 +204,7 @@ def test_refresh_keeps_old_alerts_when_the_lookup_fails_and_stores_redacted_cont
     async def go():
         await _db("ctx_refresh")
         st = Story(title="t", finding_ids=[], first_seen=T, last_seen=T,
-                   context={"alerts": [{"jira_key": "SIM-OLD"}]})
+                   context={"alerts": [{"jira_key": "DEMO-OLD"}]})
         await st.insert()
 
         async def boom(_):
@@ -217,7 +217,7 @@ def test_refresh_keeps_old_alerts_when_the_lookup_fails_and_stores_redacted_cont
         await C.refresh(st.id, client=VL())
         return await Story.get(st.id)
     st = asyncio.run(go())
-    assert st.context["alerts"] == [{"jira_key": "SIM-OLD"}] and "mongo down" in st.context["alerts_error"]
+    assert st.context["alerts"] == [{"jira_key": "DEMO-OLD"}] and "mongo down" in st.context["alerts_error"]
     assert "Sup3rS3cretValue" not in str(st.context) and st.context_at is not None
 
 
@@ -439,17 +439,17 @@ def test_refresh_links_the_guardduty_ticket_on_the_node_the_story_ran_on():
             st.finding_ids.append(f.id)
         await st.save()
         await _gd_ticket("DEMO-118243", "i-03b20b3d6f4b473ea", PO_T + timedelta(hours=2)).insert()
-        await _gd_ticket("SIM-OTHER", "i-0ffffffffffffffff", PO_T).insert()               # another node
-        await _gd_ticket("SIM-OLD", "i-03b20b3d6f4b473ea", PO_T - timedelta(days=5)).insert()  # outside ±48 h
-        await _gd_ticket("SIM-DEV", "", PO_T, device="IP-10-193-86-192.ap-south-1.compute.internal").insert()
+        await _gd_ticket("DEMO-OTHER", "i-0ffffffffffffffff", PO_T).insert()               # another node
+        await _gd_ticket("DEMO-OLD", "i-03b20b3d6f4b473ea", PO_T - timedelta(days=5)).insert()  # outside ±48 h
+        await _gd_ticket("DEMO-DEV", "", PO_T, device="IP-10-193-86-192.ap-south-1.compute.internal").insert()
         await C.refresh(st.id, client=NodeVL(), sentinel=FakeSentinel(GD_ROWS), fetch=_fetch)
         return await Story.get(st.id)
     st = asyncio.run(go())
     alerts = {a["jira_key"]: a for a in st.context["alerts"]}
-    assert set(alerts) == {"DEMO-118243", "SIM-DEV"}
+    assert set(alerts) == {"DEMO-118243", "DEMO-DEV"}
     assert alerts["DEMO-118243"]["matched_on"].startswith("i-03b20b3d6f4b473ea: node ip-10-193-125-65")
     assert "partner-onboarding-service" in alerts["DEMO-118243"]["matched_on"]
-    assert alerts["SIM-DEV"]["matched_on"].startswith("ip-10-193-86-192")
+    assert alerts["DEMO-DEV"]["matched_on"].startswith("ip-10-193-86-192")
     assert st.context["infra"]["domains"] == [REBIND, OAST]
 
 

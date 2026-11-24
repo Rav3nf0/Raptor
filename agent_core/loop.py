@@ -324,6 +324,7 @@ async def run(
     # run. See get_tools in agent_tools/registry.py.
     valid_names = get_tool_names()
     tool_call_records: list[ToolCallRecord] = []
+    _gate_msgs: list[dict] = []     # gate nudges — never evidence for the model's own claims
     # The concurrency check is a PRECONDITION for auto-close, and it is a plain DB query
     # over device/user — no model judgment in it at all. Leaving it to the model to
     # remember was costing correct verdicts outright, because the failure is silent and
@@ -635,12 +636,20 @@ async def run(
                     _claims_now = _claims_now + [
                         "these specific values, which appear in no tool result or alert field: "
                         + ", ".join(f"`{v}`" for v in _values_now)]
+                from agent_core.claim_check import seen_text as _seen_now
+                from agent_core.claim_check import unbacked_grants as _grants_now
+                _g_now = _grants_now(result.reasoning, _seen_now(
+                    messages, tool_call_records, evidence or {}, alert,
+                    static_prompt=oscar_module.OSCAR_SYSTEM, skip=tuple(_gate_msgs)))
+                if _g_now:
+                    _claims_now = _claims_now + [
+                        f"{g}, which nothing you were shown mentions" for g in _g_now]
                 if _claims_now:
                     claim_verify_nudges += 1
                     logger.info("[AGENT-GATE] %s: %s cites unrun checks %s — asking to verify "
                                 "or withdraw", jira_key, result.triage_class, _claims_now)
                     messages.append({"role": "assistant", "content": content_clean})
-                    messages.append({"role": "user", "content": (
+                    _gate_msgs.append({"role": "user", "content": (
                         f"Your {result.triage_class} reasoning relies on "
                         f"{', '.join(_claims_now)}, but no such check ran successfully on this "
                         "ticket. A security engineer does not state what they have not checked. "
@@ -649,6 +658,7 @@ async def run(
                         "and do not describe an IP, account or file (its owner, location, "
                         "reputation or purpose) unless a tool result or the alert says so."
                     )})
+                    messages.append(_gate_msgs[-1])
                     consecutive_no_tool = 0
                     continue
             # Record the MODEL's verdict before any gate/critic downgrade — so we can
@@ -684,6 +694,23 @@ async def run(
             # (DEMO-107147). Runs after the safety gates; only ever downgrades to NEEDS_L2.
             result = _apply_grounding_check(result, evidence or {}, user_name, tool_call_records,
                                             jira_key, alert=alert)
+            # Grant backstop — a close resting on an exception, approval, change ticket,
+            # allowlist entry, planned window or a person's confirmation that nothing the
+            # model was shown mentions. The nudge above already asked once; still there means
+            # the close leans on it. Only ever downgrades to NEEDS_L2.
+            if result.triage_class in ("AUTO_CLOSED_FP", "AUTO_CLOSED_TP"):
+                from agent_core.claim_check import seen_text as _seen
+                from agent_core.claim_check import unbacked_grants as _grants
+                _g = _grants(result.reasoning, _seen(
+                    messages, tool_call_records, evidence or {}, alert,
+                    static_prompt=oscar_module.OSCAR_SYSTEM, skip=tuple(_gate_msgs)))
+                if _g:
+                    logger.info("[AGENT-GRANT] %s: unbacked %s → NEEDS_L2", jira_key, _g)
+                    result.triage_class = "NEEDS_L2"
+                    result.blocked_by_safety = True
+                    result.safety_block_reason = (
+                        "Unbacked grant — the verdict relies on " + ", ".join(_g)
+                        + ", which nothing RAPTOR was shown mentions.")
             # LLM grounding critic (opt-in AGENT_GROUNDING_CRITIC_ENABLED) — nuance the
             # deterministic check can't reach, on the INTERNAL backend with RAW facts
             # (never Gemini for alert data). Gated by the deterministic backstop above;
@@ -969,7 +996,7 @@ def _strip_verdict_block(text: str) -> str:
 # but hunt_network keep it out of the model-visible schema). Without it they search the N
 # hours before NOW, which on any re-triage of an older ticket is the wrong range.
 _ALERT_ANCHORED_HUNTS = frozenset({
-    "hunt_network", "hunt_process", "hunt_file", "hunt_events", "hunt_file_burst",
+    "hunt_network", "hunt_process", "hunt_file", "hunt_events", "hunt_file_burst", "hunt_file_prevalence",
     "hunt_script_egress", "hunt_logons", "hunt_signin", "hunt_office", "hunt_sentinel_event", "hunt_vlogs",
     "hunt_query",
 })
@@ -1312,7 +1339,7 @@ def _apply_grounding_check(result: AgentResult, evidence: dict, user_name: str,
     #     It used to flag ANY word following "user" that wasn't in the actor fields,
     #     which is ordinary English far more often than it is a fabricated identity —
     #     it blocked correct auto-closes on "…privilege escalation (user switching, not
-    #     root)" (DEMO-107206) and "The user discrepancy (`nico.bh…`)" (DEMO-107341),
+    #     root)" (DEMO-107206) and "The user discrepancy (`nico.gu…`)" (DEMO-107341),
     #     and each block then cascaded via the concurrent-open-alerts gate. A stopword
     #     list can't fix that; it's whack-a-mole over the whole dictionary.
     #
@@ -2260,6 +2287,16 @@ def _apply_safety_gates(result: AgentResult, severity: str, is_test_device: bool
             and not any(_ti_flagged_detail(tc) for tc in tool_calls)):
         result.triage_class = "AUTO_CLOSED_FP"
         result.confidence = max(result.confidence, 0.90)
+        # The ticket otherwise shows the model's "escalate to L2" text under a close
+        # (DEMO-121888): say which rule closed it, and keep the model's view below.
+        result.reasoning = (
+            "Closed by RAPTOR's service-identity rule, not by the model. Every flagged "
+            "service is either signed by a trusted publisher on every copy in the fleet, or "
+            "is a vetted vendor service found only in its standard install folder; no copy "
+            "carries an untrusted signature. The model recommended L2 — its view is kept "
+            "below for the record.\n\n" + (result.reasoning or ""))
+        result.recommended_actions = [
+            "No action needed. Reopen if this service should not be on these hosts."]
 
     # National-ID DLP is never a false positive from the model. Policy (2026-09-22) is to
     # ask the file's owner and let L2 decide on the answer, and the playbook already does
@@ -2599,6 +2636,15 @@ def _apply_safety_gates(result: AgentResult, severity: str, is_test_device: bool
                            "(gate disabled, observing only): %s", _incomplete)
 
     if result.triage_class == "AUTO_CLOSED_FP":
+        from edr_triage.canary_guard import close_block_reason
+        _canary_why = close_block_reason(alert_name)
+        if _canary_why:
+            result.triage_class = "NEEDS_L2"
+            result.blocked_by_safety = True
+            result.safety_block_reason = _canary_why
+            return result
+
+    if result.triage_class == "AUTO_CLOSED_FP":
         _threat = _named_threat_detection(evidence or {}, alert_name)
         if _threat:
             result.triage_class = "NEEDS_L2"
@@ -2702,14 +2748,28 @@ def _apply_safety_gates(result: AgentResult, severity: str, is_test_device: bool
         # anything seen. DEMO-118344 closed AWS credential abuse with its one hunt at 0 rows,
         # on "598 prior alerts" and role names. The prompt has always said never to close
         # on an empty hunt; this enforces it. Errors are handled just below.
-        if (not _corroborating and not _all_errored
-                and any(_is_hunt_tool(tc.name) for tc in tool_calls)):
+        # No hunt at all counts the same: DEMO-119923 and DEMO-119164 closed AWS credential
+        # abuse on the concurrency check and "634 prior alerts" alone. Rule-decided FPs
+        # (port-sweep allowlist) returned before this point.
+        # Already-bound telemetry counts as seen: Netskope findings arrive with their events
+        # bound, and a proven internal drive (usb_guard.drive_check: the alert's files were
+        # written on the device and no removable drive was mounted, from DeviceFileEvents and
+        # mount events) is the hunt the G14 exception above rests on. Without it every
+        # SATA-artifact USB close the exception exists for was blocked here (DEMO-122093).
+        _bound = bool(((evidence or {}).get("netskope_dlp") or {}).get("events")
+                      or (evidence or {}).get("netskope_uba")
+                      or (_is_usb_copy_alert(alert_name)
+                          and ((evidence or {}).get("usb_drive_check") or {}).get("internal") is True))
+        if not _corroborating and not _all_errored and not _bound:
+            _ran = any(_is_hunt_tool(tc.name) for tc in tool_calls)
             result.triage_class = "NEEDS_L2"
             result.blocked_by_safety = True
             result.safety_gate_kind = "no_hunt_data"
             result.safety_block_reason = (
-                "Auto-close blocked: every hunt came back empty, so nothing about this alert "
-                "was actually seen — prior alerts and names are not evidence it is benign.")
+                "Auto-close blocked: " + ("every hunt came back empty" if _ran else
+                                          "no telemetry was hunted")
+                + ", so nothing about this alert was actually seen — prior alerts, memories "
+                "and names are not evidence it is benign.")
             return result
         if _errored and len(_corroborating) < _CORROBORATING_HUNTS_REQUIRED:
             tc = _errored[0]

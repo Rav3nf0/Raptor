@@ -735,7 +735,9 @@ _MALWARE_LOOKBACK_DAYS = 30
 # L2 writes "as per (the) confirmation from user". The CASB re-enablement template is not
 # one — nobody was asked (DEMO-115919 was cleared on exactly those).
 _USER_ANSWER_RE = re.compile(
-    r"PRIOR BUSINESS JUSTIFICATION|confirmation from (?:the )?user|as (?:per|confirmed by) "
+    r"PRIOR BUSINESS JUSTIFICATION|(?:as per|per|after|on|with|based on) (?:the )?confirmation "
+    r"(?:received )?from (?:the )?user|confirmation (?:was )?received from (?:the )?user"
+    r"|as (?:per|confirmed by) "
     r"(?:the )?user|user (?:has )?confirmed|\[user —"
     r"|(?:provided|shared|gave|given) (?:a |the |his |her |their )?(?:business )?justification", re.I)
 

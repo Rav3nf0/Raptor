@@ -306,11 +306,17 @@ async def poll_new_mde_tickets(cfg: Optional[EDRTriageConfig] = None) -> list[di
 
         # Analyst notes ALREADY on the ticket (a re-swept "Awaiting more inputs" or
         # "L2 Analysis Required" ticket, not a brand-new one) — L1/L2 frequently type
-        # out the exact field-level diff by hand (DEMO-108035: Subodh Patil posted the
+        # out the exact field-level diff by hand (DEMO-108035: Subodh Okafor posted the
         # full policy change — Policy/Result/Change Detected/Current Applications/
         # Current Users — none of which the agent ever saw, because only `description`
         # was ever fetched). Passed through as context; oscar.py decides how to weigh it.
         existing_comments, _, _ = _extract_all_comments(fields, bot_email=cfg.jira_email or "")
+
+        # Opened by /shadow for a Claude-confirmed TP (shadow_hunter/tickets.py): already
+        # investigated and already paged, so RAPTOR neither triages nor pages it again.
+        if any(str(l).strip().lower() == "deepintel-shadow" for l in (fields.get("labels") or [])):
+            logger.debug("[skip] %s — opened by /shadow", key)
+            continue
 
         alert_id = parse_mde_alert_id(description)
         parsed = parse_description_fields(description)

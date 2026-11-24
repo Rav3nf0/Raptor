@@ -203,7 +203,8 @@ def get_config() -> AppConfig:
             # up the values even if they were imported before get_config() ran.
             # _resolve_secret handles both flat keys and dotted nested paths.
             for secret_key, env_key in _SECRET_ENV_MAP.items():
-                val = _resolve_secret(secrets, secret_key)
+                # Accept the env-style name too (e.g. JIRA_TOKEN as well as jira_token)
+                val = _resolve_secret(secrets, secret_key) or secrets.get(env_key)
                 if val:
                     os.environ[env_key] = str(val)
 

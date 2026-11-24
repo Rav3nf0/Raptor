@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -59,6 +59,9 @@ _ALLOWED_TARGET_STATUSES = frozenset({"l2 analysis required"})
 _NOTIFIED_MARKERS = ("notification dispatched",)
 _JUSTIFIED_MARKERS = ("added a business justification",)
 _ACK_MARKERS = ("acknowledged involvement",)
+
+# Minutes a bare Acknowledge waits for its reason before the packet goes to L2.
+ACK_GRACE_MINUTES = 30
 _REJECT_MARKERS = ("reject", "escalate to security", "did not perform")
 # A Security Bot relay is one short line ("<user> rejected involvement via slack", 16 of 16
 # rejects over 120 days). RAPTOR's own notes are bot-authored too and run to thousands of
@@ -217,9 +220,9 @@ def _attribute(answers: dict[str, dict], expected: list[str]) -> dict[str, dict]
     """Key each reply by the Involved Users address it answers for.
 
     The bot relays replies under the Slack handle, which is not always the address's local
-    part: DEMO-116104 asked pratapsingh.c@example.com and the replies came from
-    `pratapsingh.chaudhary`, so the user never counted as answered — every round waited out
-    the stale timer and told L2 "no answer from pratapsingh.c" beside his own acknowledgement.
+    part: DEMO-116104 asked gabriel.c@example.com and the replies came from
+    `gabriel.cortez`, so the user never counted as answered — every round waited out
+    the stale timer and told L2 "no answer from gabriel.c" beside his own acknowledgement.
     A handle maps to an address when it is the only one either prefixes; with one user asked,
     the bot DMs nobody else, so its lone unmatched replier is that user."""
     out: dict[str, dict] = {}
@@ -229,6 +232,7 @@ def _attribute(answers: dict[str, dict], expected: list[str]) -> dict[str, dict]
         cur = out.setdefault(user, {"justification": "", "acked": False})
         cur["justification"] = cur["justification"] or a["justification"]
         cur["acked"] = cur["acked"] or a["acked"]
+        cur["at"] = max(filter(None, (cur.get("at"), a.get("at"))), default=None)
         if a.get("justification") and cur["justification"] == a["justification"]:
             cur["on_ticket"] = a.get("on_ticket", False)
 
@@ -261,7 +265,7 @@ async def _process(key: str, fields: dict, cfg, dry_run: bool = False) -> dict:
     """
     comments = _comments(fields)
     # Only the latest round counts. L2 can send a routed ticket back for another round
-    # (Parker re-chased 8 on 2026-10-12 16:03-16:09: L2 Analysis required -> Event Analysis
+    # (parker re-chased 8 on 2026-10-12 16:03-16:09: L2 Analysis required -> Event Analysis
     # -> Awaiting more inputs, which fires the bot again). A packet anywhere on the ticket
     # used to mean "handled", so the second round's answers were never routed back.
     _packets = [i for i, (_, _, txt) in enumerate(comments) if _PACKET_MARKER.lower() in txt.lower()]
@@ -281,7 +285,7 @@ async def _process(key: str, fields: dict, cfg, dry_run: bool = False) -> dict:
     for created, author, text in comments:
         if bot_email and author != bot_email:
             # The asked person answering ON THE TICKET counts as their answer (DEMO-117308:
-            # Swapnesh explained in a Jira comment and only clicked Acknowledge in Slack, so
+            # Dmitri explained in a Jira comment and only clicked Acknowledge in Slack, so
             # L2 was told "NO justification" and re-chased him). Matched by the commenter's
             # own address, never by a name, and only after this round's dispatch.
             local = author.split("@")[0]
@@ -304,6 +308,7 @@ async def _process(key: str, fields: dict, cfg, dry_run: bool = False) -> dict:
                 a["justification"] = (m.group(3) or "").strip() or text
                 a["slack_justified"], a["on_ticket"] = True, False
             a["acked"] = True
+            a["at"] = max(filter(None, (a.get("at"), _parse_iso(created))), default=None)
         elif (len(text) < _RELAY_MAX_CHARS and any(r in low for r in _REJECT_MARKERS)
               and not any(n in low for n in _NOTIFIED_MARKERS)):
             rejected.append(text[:200])
@@ -317,6 +322,17 @@ async def _process(key: str, fields: dict, cfg, dry_run: bool = False) -> dict:
     waited = (datetime.now(timezone.utc) - notified_at).total_seconds() / 3600.0
     all_answered = bool(answers) and not silent
     timed_out = waited >= cfg.chase_stale_hours
+    # An Acknowledge click is usually followed by the reason a few minutes later: 79 of 82
+    # "acknowledged, NO justification" packets in the 30 days to 2026-11-06 went to L2 within
+    # 10 minutes of the click (DEMO-120714: Victor's reason never reached the ticket). Give a
+    # bare acknowledgement time to be followed by its reason before routing.
+    grace = getattr(cfg, "chase_ack_grace_minutes", ACK_GRACE_MINUTES)
+    bare = [a["at"] for a in answers.values()
+            if a.get("acked") and not a.get("justification") and a.get("at")]
+    if (all_answered and not rejected and not timed_out and bare
+            and datetime.now(timezone.utc) - max(bare) < timedelta(minutes=grace)):
+        return {"waiting_hours": round(waited, 1), "answered": sorted(answers),
+                "silent": silent, "ack_grace": True}
     if not (rejected or all_answered or timed_out):
         return {"waiting_hours": round(waited, 1), "answered": sorted(answers),
                 "silent": silent}

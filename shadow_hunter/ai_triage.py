@@ -118,6 +118,7 @@ DETECTOR_GUIDE = {
     "suspicious_parent_child": "Office/mail/Teams/browser starting a shell or LOLBin with a rare command. Benign: add-ins, native-messaging hosts, ClickOnce, Office for Mac housekeeping. Bad: a document spawning powershell/cmd/mshta with download or encoded content.",
     "lolbin_abuse": "Known LOLBin abuse forms (certutil download/decode, mshta URL, regsvr32 scriptlet, bitsadmin, wmic process create, rundll32 script/URL, msiexec from URL). Benign: a known IT script or installer bootstrap. Bad: fetching from a rare/raw-IP URL.",
     "exfil_patterns": "A non-browser process reaching file-drop, paste, webhook or tunnel services (ngrok, trycloudflare, webhook.site). Benign: a developer exposing a local dev server on purpose. Bad: an interpreter or transfer tool sending data out, a proxy relaying for an unknown client.",
+    "control_bypass": "Getting around the web proxy (Netskope): a program running from an interpreter's own bin folder under a foreign name (a renamed, re-signed node/python), a process named exactly like an in-house app (AcmeProBeta) outside the iOS Simulator / Xcode folders, or a browser started with --proxy-server / --proxy-pac-url. Benign: an engineer's documented test proxy (Charles/mitmproxy) for app debugging, confirmed with them. Bad: browsing tunnelled through a disguised local proxy so it skips inspection (e795jwebtechmac, Nov 2026: node renamed acmeprobeta, Dia via 127.0.0.1:8899, blocked WhatsApp reachable). Never FP on the user's say-so alone while the proxy is still running.",
     "defender_exclusions": "Defender exclusions added by a script host or shell (not GPO/Intune). Benign: an IT build script for trading or security software. Bad: exclusions for user/temp paths, extensions, or added by an unknown script.",
     "unusual_remote_logons": "RDP breaking the account's own 14-day pattern: from a public IP, by an account with no recent RDP, or a new target from a new source. Benign: an admin's first visit to a new server via the jump hosts. Bad: public source, service accounts doing interactive RDP, chains of new targets.",
     "cloud_session_split": "One person's AWS SSO session key used within 10 min from a network new to them AND from a second OS or 5+ rotating IPs: a copied credential. Benign only if the user confirms a VM/VPN of their own.",
@@ -336,9 +337,12 @@ async def reusable_verdict(f) -> dict | None:
         # originals only: copying a copy chained "Same pattern as … Same pattern as …" (2026-10-07)
         {"detector": f.detector, "_id": {"$ne": f.id}, "ai_at": {"$gte": since},
          "ai_by": {"$regex": "^ai:"}, "ai_verdict": {"$in": list(VERDICTS)},
-         "ai_reasoning": {"$not": re.compile(f"^{REUSED_PREFIX}")}},
+         "ai_reasoning": {"$not": re.compile(f"^({REUSED_PREFIX}|\\[Opus unavailable)")},
+         # an Opus-down fallback guess is not a verdict to spread (2026-11-04)
+         "ai_prompt_version": {"$not": re.compile("-fallback$")}},
         {"_id": 1, "detector": 1, "raw": 1, "account_name": 1, "indicator": 1, "device_name": 1,
-         "ai_verdict": 1, "ai_confidence": 1, "ai_reasoning": 1, "ai_at": 1}).sort("ai_at", -1).limit(300).to_list(300)
+         "ai_verdict": 1, "ai_confidence": 1, "ai_reasoning": 1, "ai_at": 1, "ai_by": 1,
+         "ai_prompt_version": 1}).sort("ai_at", -1).limit(300).to_list(300)
     for r in rows:
         other = Finding.model_construct(id=r["_id"], detector=r["detector"], raw=r.get("raw") or {},
                                         account_name=r.get("account_name", ""), indicator=r.get("indicator", ""),
@@ -346,6 +350,13 @@ async def reusable_verdict(f) -> dict | None:
         if pattern_key(other) == key:
             return r
     return None
+
+
+def reused_by(same: dict, current: str) -> tuple[str, str]:
+    """Who a copied verdict is credited to: the model that judged the original, never the model
+    that only matched the pattern. A Mistral fallback guess copied by an Opus run was recorded as
+    Opus at 0.98 and paged as Claude-verified (edf640c0 from 0691dfe3, 2026-11-04)."""
+    return (same.get("ai_by") or current), (same.get("ai_prompt_version") or "")
 
 
 def _model_id() -> str:
@@ -391,7 +402,7 @@ async def run_batch(limit: int | None = None) -> dict:
                     f, same["ai_verdict"], same.get("ai_confidence"),
                     f"{REUSED_PREFIX} {str(same['_id'])[:8]} (judged {str(same.get('ai_at', ''))[:10]}): "
                     f"{same.get('ai_reasoning', '')}",
-                    [f"verdict reused from finding {same['_id']}"], _model_id(), PROMPT_VERSION)
+                    [f"verdict reused from finding {same['_id']}"], *reused_by(same, _model_id()))
                 out["reused"] = out.get("reused", 0) + 1
                 out["by_verdict"][same["ai_verdict"]] = out["by_verdict"].get(same["ai_verdict"], 0) + 1
                 continue
@@ -414,5 +425,9 @@ async def run_batch(limit: int | None = None) -> dict:
 
 
 def enabled() -> bool:
-    """Paused by default (2026-10-10). SHADOW_AI_TRIAGE=1 (or true/yes/on) turns the job on."""
-    return os.getenv("SHADOW_AI_TRIAGE", "0").strip().lower() in ("1", "true", "yes", "on")
+    """On by default when /shadow runs on Claude (the grouped Opus review, 2026-11-03). The
+    Mistral-only agent stays paused (2026-10-10) unless SHADOW_AI_TRIAGE=1 says otherwise;
+    SHADOW_AI_TRIAGE=0 turns either off."""
+    from agent_core.backend import shadow_llm
+    default = "1" if shadow_llm() == "claude" else "0"
+    return os.getenv("SHADOW_AI_TRIAGE", default).strip().lower() in ("1", "true", "yes", "on")

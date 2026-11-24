@@ -63,3 +63,8 @@ def test_tunnel_to_a_public_ip_is_critical_known_tunnel_services_are_left_to_exf
     assert det.to_findings([_row(Dest="10.2.3.4", **t)])[0]["severity"] == "high"
     assert det.to_findings([_row(Dest="jump.example.com", **t)])[0]["severity"] == "high"
     assert det.to_findings([_row(Dest="serveo.net", **t)]) == []
+
+
+def test_kambala_vendor_key_rotation_is_skipped_only_on_its_own_account():
+    kql = build_kql()
+    assert 'FolderPath == "/home/netra/.ssh/authorized_keys"' in kql and 'contains_cs "/ NUH/d"' in kql

@@ -140,7 +140,7 @@ async def find_original(jira_key: str, created_at: str, dlp: dict, cfg) -> dict 
 
 
 # Files at rest are re-scanned: a CASB API scan finds the same file of the same user again
-# hours or days later and every finding is a new ticket (v-aayush.bhapkar1's "RA Payment
+# hours or days later and every finding is a new ticket (v-rory.benson's "RA Payment
 # Done Data" was ticketed 7 times 2026-10-07..09; wren.pillai's "Bank Transaction Summary" 4).
 # Analysts mark each re-find Duplicate of the ticket already being worked ("a similar alert
 # has already been raised to L2"). Narrower than their practice — they also fold a DIFFERENT

@@ -17,8 +17,8 @@ netskope.py, unchanged by this. That matters because the justifications vary in 
 one line attaches "this data was saved as part of business purposes" to sixteen people,
 which is far too thin to act on but still worth an analyst seeing.
 
-EXACT EMAIL MATCH ONLY. 17 entries are still keyed by a bare first name ("Manisha",
-"Gaurav J") and are deliberately skipped: inferring name -> account is what produced the
+EXACT EMAIL MATCH ONLY. 17 entries are still keyed by a bare first name ("Dana",
+"Robin K") and are deliberately skipped: inferring name -> account is what produced the
 wrong-actor attribution this project spent weeks removing, and a justification filed
 against the wrong person is worse than none.
 """

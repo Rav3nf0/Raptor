@@ -124,6 +124,30 @@ def build_kql(lookback_hours: int = 24, history_days: int = 7, max_fleet_devices
             | where not(Item in ({", ".join(ESU_TASKS)})
                         and ((TaskCmd == "cmd" and isempty(TaskArgs))
                              or TaskCmd endswith @"\\system32\\clipesuconsumer.exe"))
+            // Intune MDM enrolment registers ...\\EnterpriseMgmt\\<guid>\\... tasks running Windows'
+            // own deviceenroller.exe (22 findings to 2026-11-06, 0 TP), and the Azure Arc agent
+            // installs \\azcmagent running its script from its Program Files folder. Skipped only in
+            // that exact form: the same names running anything else are still reported.
+            | where not(Item has "enterprisemgmt" and TaskCmd endswith @"\\system32\\deviceenroller.exe")
+            | where not(Item == @"\\azcmagent" and TaskArgs has @"\\Program Files\\AzureConnectedMachineAgent\\")
+            // Windows Update's own tasks as they appear while an update rolls out (14 findings to
+            // 2026-11-11, 0 TP): WaaSMedic's DeferredWork/MaintenanceWork are only ever its COM
+            // handler, and MRT's MRT_ERROR_HB only ever System32\\MRT.exe /EHB. Same exact-form rule.
+            | where not(Item has "waasmedic" and isempty(TaskCmd)
+                        and tostring(parse_json(tostring(parse_json(AdditionalFields).TaskContent)).Actions.ComHandler.ClassId)
+                            == "{{72566E27-1ABB-4EB3-B4F0-EB431CB1CB32}}")
+            | where not(Item has "removaltools" and TaskCmd endswith @"\\system32\\mrt.exe" and TaskArgs startswith "/EHB ")
+            // UpdateOrchestrator, the ManageEngine agent and Google Updater (25 findings to 2026-11-12,
+            // 0 TP), in the one form each takes across 30 days of the fleet: USO only runs System32's
+            // usoclient / musnotification / mlenginestub; \\DCAgentUpdater and \\UEMSLogCollector only
+            // their own exe from ManageEngine\\UEMS_Agent\\bin with "Task"; GoogleUpdater only
+            // Google\\GoogleUpdater\\<version>\\updater.exe --wake.
+            | where not(Item has "updateorchestrator"
+                        and TaskCmd matches regex @"^%(systemroot|windir)%\\\\system32\\\\(usoclient|musnotification|mlenginestub)\\.exe$")
+            | where not(Item in (@"\\dcagentupdater", @"\\uemslogcollector") and TaskArgs == "Task"
+                        and TaskCmd matches regex @"^c:\\\\program files \\(x86\\)\\\\manageengine\\\\uems_agent\\\\bin\\\\(dcagentupgrader|uemslogcollector)\\.exe$")
+            | where not(Item has "googleupdater" and TaskArgs in ("--wake", "--wake --system")
+                        and TaskCmd matches regex @"\\\\google\\\\googleupdater\\\\[0-9.]+\\\\updater\\.exe""?$")
             | extend Mechanism = "scheduled_task",
                      Sample = substring(tostring(parse_json(AdditionalFields).TaskContent), 0, 240),
                      TaskNS = extract(@"^\\\\([^\\\\]+)\\\\", 1, Item),
@@ -152,7 +176,10 @@ def build_kql(lookback_hours: int = 24, history_days: int = 7, max_fleet_devices
             | where NSDevices > {max_ns_devices}
             | project NS;
         let macRecent = macRecentAll
-            | where not(NS in (commonNS) and (NS != "com.apple" or SystemPath));
+            | where not(NS in (commonNS) and (NS != "com.apple" or SystemPath))
+            // Google Updater bootstrapping its own wake job, from its own binary only
+            | where not(Item in ("com.google.googleupdater.wake.plist", "com.google.googleupdater.wake.system.plist")
+                        and InitiatingProcessFileName =~ "googleupdater");
         // Same idea for task folders (\\lenovo, \\mozilla, \\powertoys) — except \\microsoft,
         // which malware routinely registers under, as it masquerades as com.apple on macOS.
         let commonTaskNS = DeviceEvents

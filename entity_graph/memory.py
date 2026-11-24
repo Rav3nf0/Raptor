@@ -313,7 +313,7 @@ def _norm_principal(name: str) -> set[str]:
 
     Actors arrive in many shapes — `DOMAIN\\svc`, `svc@corp.com`, `NT SERVICE\\X`,
     bare `svc`. We compare on the lowercased full string AND the "leaf" (part after
-    the last backslash / before the @) so `CORP\\nilesh.dosi` matches `nilesh.dosi`.
+    the last backslash / before the @) so `CORP\\victor.dosi` matches `victor.dosi`.
     """
     if not name:
         return set()

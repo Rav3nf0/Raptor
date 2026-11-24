@@ -280,6 +280,33 @@ async def hunt_file(sha256: str = "", file_name: str = "", device: str = "", win
 
 
 @register(
+    name="hunt_file_prevalence",
+    description=(
+        "Which devices held this exact file (by hash) over the last 30 days, and the URL each "
+        "copy was DOWNLOADED FROM (FileOriginUrl/referrer), with downloads from Acme "
+        "internal sources (e.g. jit.example.com) labelled. One query, one row per device. "
+        "Use it for any unsigned / Gatekeeper / unknown-binary question: hunt_file is limited "
+        "to days around the alert, so it under-counts how widely a tool is deployed."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "sha256": {"type": "string", "description": "File hash — md5, sha1, or sha256 (hex)"},
+            "device": {"type": "string", "description": "The alert's device, to report its own copy's origin"},
+        },
+        "required": ["sha256"],
+    },
+)
+async def hunt_file_prevalence(sha256: str = "", device: str = "", alert_time: str = "") -> dict:
+    from edr_triage import file_origin
+    anchor, note = _alert_anchor(alert_time, _MDE_DAYS)
+    res = await file_origin.check(sha256, device, anchor)
+    if note:
+        res = {**res, "anchor_note": note}
+    return res
+
+
+@register(
     name="hunt_events",
     description=(
         "Hunt MDE DeviceEvents — the catch-all endpoint table the other hunts do NOT cover. "

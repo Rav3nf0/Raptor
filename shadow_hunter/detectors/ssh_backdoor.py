@@ -44,6 +44,13 @@ def build_kql(lookback_hours: int = 24, history_days: int = 14, end: str = "now(
             | where Timestamp between (histStart .. windowEnd)
             | where ActionType in ("FileCreated", "FileModified", "FileRenamed")
             | where FolderPath matches regex @"(?i)([\\\\/]\\.ssh[\\\\/]authorized_keys2?|administrators_authorized_keys)$"
+            // Kambala's NOREN update helper rotating the vendor's own key on its own account (every
+            // few days on the preprod OMS boxes): exactly its helper binary, or its sed removing
+            // the ' NUH' key line. Anything else writing that file is still reported.
+            | where not(FolderPath == "/home/netra/.ssh/authorized_keys"
+                        and (InitiatingProcessFileName == "norenupdhelperc"
+                             or InitiatingProcessCommandLine contains_cs "/ NUH/d"
+                             or InitiatingProcessParentFileName == "norenupdhelperc"))
             | extend Kind = "authorized_keys", Dest = "", Writer = tolower(InitiatingProcessFileName),
                      Sample = FolderPath;
         let tunnels = DeviceProcessEvents

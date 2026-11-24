@@ -9,9 +9,9 @@ from typing import Optional
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
-# Shared severity ranking — Jira/MDE priority.name values, lowercased. Used both for
-# the PagerDuty paging threshold here and, later, for the auto-containment severity
-# gate (same free-text severity field, same comparison, one definition).
+# Shared severity ranking — Jira/MDE priority.name values, lowercased. Kept for the
+# planned auto-containment severity gate (same free-text severity field, one definition).
+# Paging does not use it: 96% of tickets arrive as Medium (edr_triage/paging_rules.py).
 SEVERITY_RANK: dict[str, int] = {
     "informational": 0,
     "low": 1,
@@ -180,6 +180,14 @@ class EDRTriageConfig(BaseSettings):
     # reopening the ticket) detects DISAGREEMENT, not diligence — no reopen cannot
     # distinguish "checked and correct" from "nobody looked", so the age has to be visible.
     autoclose_review_hours: int = Field(default=48, alias="EDR_AUTOCLOSE_REVIEW_HOURS")
+    # Random autonomous closes put to L2 each IST day (qa_sample.py). OFF until the user
+    # turns it on after November 2026; EDR_QA_SAMPLE_PER_DAY=3 enables it.
+    qa_sample_per_day: int = Field(default=0, alias="EDR_QA_SAMPLE_PER_DAY")
+    # Replay corpus (replay_corpus.py): what RAPTOR was given and decided on each live
+    # ticket, with the human verdict added later — the check a reworked RAPTOR is held to
+    # once the EDR changes and nobody closes tickets by hand. Records kept per alert
+    # family (True Positive, L2-handled and reopened ones are kept beyond it). 0 = off.
+    replay_corpus_per_family: int = Field(default=150, alias="EDR_REPLAY_CORPUS_PER_FAMILY")
     # Exact-repeat DLP duplicates (duplicate_guard.py): the same Netskope event ticketed
     # again within 2 minutes goes to Duplicate. Off = recommend only.
     auto_duplicate_enabled: bool = Field(default=True, alias="EDR_AUTO_DUPLICATE")
@@ -221,6 +229,9 @@ class EDRTriageConfig(BaseSettings):
     # "Log injestion stopped" closes False Positive only when every silent table is one analysts
     # retired (log_ingestion_guard.py). Off = recommend only.
     log_ingestion_close_enabled: bool = Field(default=True, alias="EDR_LOG_INGESTION_CLOSE")
+    # Netskope Failed Login: close an exact repeat of failures a person cleared for the same
+    # user, app and source IP (failed_login_guard.py). Its re-fire Duplicate rides EDR_AUTO_DUPLICATE.
+    failed_login_close_enabled: bool = Field(default=True, alias="EDR_FAILED_LOGIN_CLOSE")
     # Where analysts open DeepIntel — links RAPTOR writes into tickets (the Brand Intel
     # drawer for raising a takedown). Not DEEPINTEL_URL, which is the in-pod address.
     deepintel_public_url: str = Field(default="https://deepintel.uat.example.com",
@@ -241,7 +252,7 @@ class EDRTriageConfig(BaseSettings):
     )
 
     # ------------------------------------------------------------------
-    # PagerDuty alerting (lib.pagerduty_client, triggered from pipeline._process_ticket)
+    # PagerDuty alerting (lib/paging.py; which verdicts page: edr_triage/paging_rules.py)
     #
     # Routing key = Events API v2 integration key (triggers/resolves incidents). API
     # token = a separate PagerDuty REST API token, used only to poll ack state for the
@@ -251,9 +262,6 @@ class EDRTriageConfig(BaseSettings):
     # ------------------------------------------------------------------
     pagerduty_routing_key: str = Field(default="", alias="EDR_PAGERDUTY_ROUTING_KEY")
     pagerduty_api_token: str = Field(default="", alias="EDR_PAGERDUTY_API_TOKEN")
-    # Minimum severity (see SEVERITY_RANK) that triggers a page. Alerts below this
-    # still get their normal Jira comment/label — only paging is gated.
-    pagerduty_min_severity: str = Field(default="High", alias="EDR_PAGERDUTY_MIN_SEVERITY")
 
     # ------------------------------------------------------------------
     # Upwind CNAPP read API (lib.upwind_client) — fetches the evidence behind an
@@ -450,23 +458,6 @@ class EDRTriageConfig(BaseSettings):
             return False, (f"model confidence {confidence:.2f} is below the "
                            f"{floor:.2f} auto-close floor")
         return True, "family is autonomous, not on the never-close list, report is on"
-
-    def should_page(self, severity: str, triage_class: str) -> bool:
-        """Return True if this verdict should trigger a PagerDuty page.
-
-        Deliberately independent of AGENT_PHASE / _effective_agent_phase: paging is a
-        notification, not a ticket-state change, so shadow and copilot phases page just
-        as loudly as autonomous — the phase gate exists to protect Jira ticket state,
-        which this never touches.
-
-        AUTO_CLOSED_FP is excluded even above the severity floor: the ticket is already
-        resolved as a false positive, so paging it would page on a closed non-issue.
-        """
-        if not self.pagerduty_routing_key:
-            return False
-        if triage_class == "AUTO_CLOSED_FP":
-            return False
-        return severity_rank(severity) >= severity_rank(self.pagerduty_min_severity)
 
     def portsweep_fp_ports(self) -> set[str]:
         """Return the set of known-good port-sweep destination ports (as strings)."""

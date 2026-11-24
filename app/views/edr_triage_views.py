@@ -689,6 +689,33 @@ async def edr_residual_report(days: int = 7):
     }
 
 
+@router.get("/api/edr-triage/replay-corpus-report")
+async def edr_replay_corpus_report():
+    """How many triages the replay corpus holds per alert family, and how many carry a
+    human verdict (edr_triage/replay_corpus.py). Read-only apart from copying verdicts
+    that have arrived since the last look."""
+    from edr_triage import replay_corpus
+    return await replay_corpus.report()
+
+
+@router.get("/api/edr-triage/l2-queue")
+async def edr_l2_queue(limit: int = 100):
+    """The open L2 queue in the order to read it: tier, points and the reason for every
+    point (edr_triage/l2_priority.py). Read-only; orders tickets, changes none."""
+    from edr_triage import l2_priority
+    from edr_triage.config import get_edr_config
+    return await l2_priority.report(get_edr_config(), limit=limit)
+
+
+@router.get("/api/edr-triage/rule-candidates")
+async def edr_rule_candidates(days: int = 90, min_n: int = 20):
+    """Alert shapes people closed False Positive `min_n` or more times with no True Positive,
+    among tickets RAPTOR did not close — places to look for a close rule
+    (edr_triage/rule_candidates.py). Read-only; a candidate is not a rule."""
+    from edr_triage import rule_candidates
+    return await rule_candidates.report(days=days, min_n=min_n)
+
+
 @router.get("/api/edr-triage/fp-report")
 async def edr_fp_report(days: int = 7):
     """Every alert the agent judged AUTO_CLOSED_FP in the window — the weekly review
@@ -1030,7 +1057,7 @@ async def edr_sentinel_write_check(days: int = 14):
     kql = (f"SecurityIncident | where TimeGenerated > ago({d}d) "
            "| summarize arg_max(TimeGenerated, *) by IncidentNumber "
            "| where Status == 'Closed' "
-           "| extend ByRaptorComment = ClassificationComment has 'SIM-' "
+           "| extend ByRaptorComment = ClassificationComment has 'DEMO-' "
            "| summarize closed = count(), with_sim_link = countif(ByRaptorComment) by ModifiedBy = tostring(ModifiedBy) "
            "| top 15 by closed desc")
     rows, err = await run_sentinel_query(kql)
@@ -1263,15 +1290,17 @@ async def _set_suggestion_status(suggestion_id: str, status: str, reviewed_by: s
 
 
 @router.post("/api/edr-triage/suggestions/{suggestion_id}/approve")
-async def edr_approve_suggestion(suggestion_id: str):
+async def edr_approve_suggestion(suggestion_id: str, request: Request):
     """Approve a suggestion (marks it for a human to implement — does NOT auto-edit code)."""
-    return await _set_suggestion_status(suggestion_id, "approved")
+    return await _set_suggestion_status(suggestion_id, "approved",
+                                        getattr(request.state, "user", None) or "l2_analyst")
 
 
 @router.post("/api/edr-triage/suggestions/{suggestion_id}/dismiss")
-async def edr_dismiss_suggestion(suggestion_id: str):
+async def edr_dismiss_suggestion(suggestion_id: str, request: Request):
     """Dismiss a suggestion."""
-    return await _set_suggestion_status(suggestion_id, "dismissed")
+    return await _set_suggestion_status(suggestion_id, "dismissed",
+                                        getattr(request.state, "user", None) or "l2_analyst")
 
 
 @router.get("/api/edr-triage/run-ticket-status")
@@ -1397,7 +1426,7 @@ async def _run_ticket_bg(jira_key: str, force_agent: bool = False,
         alert_name = parsed.get("alert_name", fields.get("summary", ""))
 
         # Analyst notes ALREADY on the ticket — a re-triage is exactly when these
-        # exist and matter (DEMO-108035: Subodh Patil's full policy-change breakdown
+        # exist and matter (DEMO-108035: Subodh Okafor's full policy-change breakdown
         # was never seen by the agent because only `description` was ever fetched).
         from edr_triage.jira_closure_poller import _extract_all_comments
         existing_comments, _, _ = _extract_all_comments(fields, bot_email=cfg.jira_email or "")
@@ -1727,11 +1756,48 @@ async def edr_investigation_page(alert_id: str):
     return HTMLResponse(_INVESTIGATION_TPL.replace("__ALERT_ID__", _json.dumps(alert_id)))
 
 
+@router.get("/api/paging/report")
+async def paging_report(days: int = 14):
+    """PagerDuty trial numbers: what would have paged (lib/paging.py)."""
+    import asyncio
+    from lib import paging
+    return await asyncio.to_thread(paging.report, max(1, min(days, 90)))
+
+
+@router.get("/api/paging/missed")
+async def paging_missed(days: int = 7):
+    """Confirmed true positives (RAPTOR tickets and /shadow findings) that never paged, with why."""
+    from shadow_hunter.paging import missed
+    return await missed(max(1, min(days, 60)))
+
+
+@router.get("/api/paging/type-rules")
+async def paging_type_rules():
+    import asyncio
+    from lib import paging
+    return {"rules": await asyncio.to_thread(paging.list_type_rules)}
+
+
+@router.post("/api/paging/type-rules")
+async def paging_set_type_rule(request: Request, body: dict = Body(...)):
+    """An analyst's decision for one RAPTOR alert type: always page, never page, or '' to clear."""
+    import asyncio
+    from lib import paging
+    key = paging.type_key(str(body.get("type") or ""))
+    if len(key) < 3:
+        raise HTTPException(400, "type is required")
+    user = getattr(request.state, "user", None) or "unknown"
+    try:
+        await asyncio.to_thread(paging.set_type_rule, key, str(body.get("rule") or ""), user)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True, "type": key}
+
+
 @router.get("/settings", response_class=HTMLResponse, include_in_schema=False)
 async def edr_settings_page(request: Request):
     import html as _html
-    from app.auth import _COOKIE_NAME, verify_token
-    user = verify_token(request.cookies.get(_COOKIE_NAME) or "") or "unknown"
+    user = getattr(request.state, "user", None) or "unknown"
     return HTMLResponse(_render_settings_page().replace("__SESSION_USER__", _html.escape(user)))
 
 
@@ -2290,6 +2356,7 @@ def _render_page() -> str:
         <div class="q-wrap"><table class="queue"><thead><tr><th>Ticket</th><th>Alert</th><th>Device</th><th>User</th><th>Sev</th><th>Verdict</th><th>Conf</th><th>Playbook</th><th style="text-align:right">Age</th></tr></thead><tbody id="q-rows"></tbody></table></div>
         <div class="pager-bar"><span class="pi" id="pageinfo">—</span><div class="pager"><button id="prev" disabled>← Prev</button><button id="next" disabled>Next →</button></div></div>
       </section>
+      <!--di-footer-->
     </div>
   </div>
 </div>
@@ -3066,6 +3133,7 @@ _INVESTIGATION_TPL = r"""<!DOCTYPE html>
     <button class="btn" id="jiraBtn" style="display:none"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6M10 14 21 3"/></svg>Open Jira ticket</button>
   </div>
   <div class="fp-wrap" id="wrap"><div class="prev-empty">Loading…</div></div>
+  <!--di-footer-->
 </div>
 <script>
 var ALERT_ID=__ALERT_ID__;
@@ -3091,7 +3159,7 @@ function mdInline(s){
   return esc(s)
     .replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>')
     .replace(/`([^`]+)`/g,'<code>$1</code>')
-    .replace(/\b(SIM-\d+)\b/g,'<a class="jl" href="https://jira.example.com/browse/$1" target="_blank" rel="noopener">$1</a>');
+    .replace(/\b(DEMO-\d+)\b/g,'<a class="jl" href="https://jira.example.com/browse/$1" target="_blank" rel="noopener">$1</a>');
 }
 function reasonHTML(text){
   var raw=String(text||'').trim();
@@ -3821,6 +3889,21 @@ def _render_settings_page() -> str:
         <div class="sec-pad"><div class="spendrow"><span class="big" id="spendBig">—</span><span class="cap" id="spendCap"></span></div><div class="bigtrack"><i id="spendFill"></i></div></div>
         <div class="sec-pad" style="border-top:1px solid var(--line,rgba(255,255,255,.06))"><div class="spendrow"><span class="cap" style="min-width:150px">/shadow · Claude (Opus)</span><span class="big" id="sSpendBig" style="font-size:20px">—</span><span class="cap" id="sSpendCap"></span></div><div class="bigtrack"><i id="sSpendFill"></i></div><div class="cap" style="margin-top:6px">Separate cap, SHADOW_CLAUDE_MONTHLY_BUDGET_USD. Never counted against the agent budget above.</div></div>
       </section>
+      <section class="panel" id="pd">
+        <div class="panel-head"><h2>PagerDuty</h2><span class="count" id="pdMode">—</span><div class="spacer"></div><span class="lock-note">PAGERDUTY_MODE · live by default; trial records what would page and calls nothing</span></div>
+        <div class="sec-pad"><div class="meta-grid" id="pdStats" style="grid-template-columns:repeat(4,1fr)"><div class="prev-empty" style="grid-column:1/-1">Loading…</div></div></div>
+        <div class="q-wrap"><table class="queue"><thead><tr><th>When</th><th>Page</th><th>Source</th><th>What</th><th>Why</th></tr></thead><tbody id="pdRows"></tbody></table></div>
+        <div class="panel-head" style="border-top:1px solid var(--line,rgba(255,255,255,.06))"><h2 style="font-size:14px">Confirmed true positives that did not page</h2><span class="count" id="pdMissedN">—</span><div class="spacer"></div><span class="lock-note">last 7 days · also posted to Slack daily</span></div>
+        <div class="q-wrap"><table class="queue"><thead><tr><th>Item</th><th>What</th><th>Why it did not page</th></tr></thead><tbody id="pdMissed"></tbody></table></div>
+        <div class="panel-head" style="border-top:1px solid var(--line,rgba(255,255,255,.06))"><h2 style="font-size:14px">MITRE tactic rule (observe only)</h2><span class="count" id="pdObsN">—</span><div class="spacer"></div><span class="lock-note">would have phoned · PAGERDUTY_TACTICS=live to enable</span></div>
+        <div class="q-wrap"><table class="queue"><thead><tr><th>When</th><th>Ticket</th><th>What</th><th>Why</th></tr></thead><tbody id="pdObs"></tbody></table></div>
+        <div class="addform" style="border-top:1px solid var(--line,rgba(255,255,255,.06))">
+          <div class="field"><label>RAPTOR alert type</label><input id="pd-type" placeholder="alert name, as on the ticket" style="width:320px"/></div>
+          <div class="field"><label>Decision</label><select id="pd-rule"><option value="always">always page (phone)</option><option value="never">never page</option></select></div>
+          <button class="btn primary" onclick="setPdRule()">Save</button>
+        </div>
+        <div class="q-wrap"><table class="queue"><thead><tr><th>Alert type</th><th>Decision</th><th>By</th><th></th></tr></thead><tbody id="pdTypes"></tbody></table></div>
+      </section>
       <section class="panel">
         <div class="panel-head"><h2>Triage rules</h2><span class="count" id="rc">—</span><div class="spacer"></div><span class="lock-note">Custom rules matched before built-in patterns</span></div>
         <div class="addform">
@@ -3836,7 +3919,7 @@ def _render_settings_page() -> str:
         <div class="panel-head"><h2>Session</h2><div class="spacer"></div><span class="lock-note">Signed in as __SESSION_USER__ · sessions expire after 8 h</span></div>
         <div class="sec-pad"><form method="POST" action="/logout" style="margin:0"><button class="btn" type="submit"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>Sign out</button></form></div>
       </section>
-    </div></div>
+    </div><!--di-footer--></div>
   </div>
 </div>
 <script>
@@ -3888,7 +3971,37 @@ function addRule(){
     .catch(function(e){alert('Could not add rule: '+(e.message||e));});
 }
 function delRule(id){if(!id)return;if(!confirm('Delete this rule?'))return;fetch('/api/edr-triage/rules/'+encodeURIComponent(id),{method:'DELETE'}).then(function(r){return r.json();}).then(function(){loadRules();}).catch(function(){});}
-function loadAll(){loadSettings();loadRules();}
+function loadPaging(){
+  fetch('/api/paging/report?days=14').then(function(r){return r.json();}).then(function(d){
+    document.getElementById('pdMode').textContent=(d.mode||'—').toUpperCase()+(d.mode==='live'&&!d.live_ready?' · no routing key':'');
+    document.getElementById('pdStats').innerHTML=cell('Phone pages (14d)',d.phone_pages)+cell('Per week',d.phone_per_week)+cell('At night',d.phone_at_night)
+      +cell('Worst day',d.worst_day)+cell(d.pushes_on?'Pushes':'Pushes (off, Jira only)',d.pushes_on?d.pushes:d.pushes_skipped)+cell('Joined an open incident',d.joined)+cell('Bursts',d.bursts)
+      +cell('By source',Object.keys(d.by_source||{}).map(function(k){return k+' '+d.by_source[k];}).join(' · ')||'—');
+    var ob=d.observed_recent||[];document.getElementById('pdObsN').textContent=(d.observed||0)+' in 14d';
+    document.getElementById('pdObs').innerHTML=ob.length?ob.map(function(e){return '<tr><td class="c-usr">'+esc(e.at)+'</td><td><span class="tkt">'+esc((e.member||'').replace('raptor:',''))+'</span></td><td>'+esc(e.title)+'</td><td class="c-usr">'+esc(e.reason)+'</td></tr>';}).join(''):'<tr><td colspan="4"><div class="prev-empty" style="padding:24px">Nothing yet</div></td></tr>';
+    var rows=d.recent||[];
+    document.getElementById('pdRows').innerHTML=rows.length?rows.map(function(e){
+      return '<tr><td class="c-usr">'+esc(e.at)+'</td><td><span class="verdict '+(e.urgency==='high'?'l2':'')+'">'+esc(e.urgency==='high'?'phone':'push')+(e.action==='held'?' · held':'')+(e.action==='burst'?' · burst':'')+'</span></td><td>'+esc(e.source)+'</td><td>'+esc(e.title||e.member)+'</td><td class="c-usr">'+esc(e.reason)+'</td></tr>';
+    }).join(''):'<tr><td colspan="5"><div class="prev-empty" style="padding:24px">Nothing would have paged yet</div></td></tr>';
+  }).catch(function(){});
+  fetch('/api/paging/missed?days=7').then(function(r){return r.json();}).then(function(d){
+    var rs=(d.raptor||[]).map(function(x){return ['<span class="tkt">'+esc(x.jira_key)+'</span>',esc(x.alert_name)+(x.device?' · '+esc(x.device):''),esc(x.reason)];})
+      .concat((d.shadow||[]).map(function(x){return ['<a href="/shadow?finding='+encodeURIComponent(x.finding)+'">/shadow '+esc(x.severity)+'</a>',esc(x.detector)+' · '+esc(x.device)+' — '+esc(x.summary),esc(x.reason)];}));
+    document.getElementById('pdMissedN').textContent=rs.length;
+    document.getElementById('pdMissed').innerHTML=rs.length?rs.map(function(c){return '<tr><td>'+c[0]+'</td><td>'+c[1]+'</td><td class="c-usr">'+c[2]+'</td></tr>';}).join(''):'<tr><td colspan="3"><div class="prev-empty" style="padding:24px">'+esc(d.note||'None: every confirmed true positive paged')+'</div></td></tr>';
+  }).catch(function(){});
+  fetch('/api/paging/type-rules').then(function(r){return r.json();}).then(function(d){
+    var rs=(d&&d.rules)||[];
+    document.getElementById('pdTypes').innerHTML=rs.length?rs.map(function(t){
+      return '<tr><td><span class="tkt">'+esc(t.type)+'</span></td><td><span class="verdict '+(t.rule==='always'?'l2':'')+'">'+esc(t.rule)+'</span></td><td class="c-usr">'+esc(t.by)+'</td><td style="text-align:right"><span class="iact no" title="Clear" data-t="'+esc(t.type).replace(/"/g,'&quot;')+'" onclick="clearPdRule(this.dataset.t)">✕</span></td></tr>';
+    }).join(''):'<tr><td colspan="4"><div class="prev-empty" style="padding:24px">No decisions yet. New alert types push once; decide them here.</div></td></tr>';
+  }).catch(function(){});
+}
+function postPdRule(type,rule){return fetch('/api/paging/type-rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:type,rule:rule})}).then(function(r){if(!r.ok)return r.json().then(function(e){throw new Error(e.detail||('HTTP '+r.status));});return r.json();});}
+function setPdRule(){var t=document.getElementById('pd-type').value.trim();if(t.length<3){alert('Alert type is required.');return;}postPdRule(t,document.getElementById('pd-rule').value).then(function(){document.getElementById('pd-type').value='';loadPaging();}).catch(function(e){alert('Could not save: '+(e.message||e));});}
+function clearPdRule(t){postPdRule(t,'').then(loadPaging).catch(function(){});}
+(function(){try{var q=new URLSearchParams(location.search).get('pd_type');if(q){document.getElementById('pd-type').value=q;var el=document.getElementById('pd');if(el)el.scrollIntoView();}}catch(e){}})();
+function loadAll(){loadSettings();loadRules();loadPaging();}
 loadAll();
 
 </script>

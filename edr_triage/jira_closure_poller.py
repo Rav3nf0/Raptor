@@ -47,6 +47,10 @@ _JIRA_TO_TRIAGE: dict[str, str] = {
 
 _SKIP_STATES = frozenset(["NO RESPONSE"])
 
+# Statuses a sibling-close re-triage leaves alone: a person already decided the ticket.
+_CLOSED_FOR_RETRIAGE = frozenset(["FALSE POSITIVE", "RESOLVED", "CLOSED", "DUPLICATE", "DONE",
+                                  "TRUE POSITIVE", "NO RESPONSE"])
+
 # A ticket an analyst closed as a duplicate of another. NOT in _TERMINAL_STATES and NOT
 # in _JIRA_TO_TRIAGE: closing as Duplicate is not a verdict — the analyst never said
 # false positive or true positive, they said "see the other ticket" — so it must never
@@ -128,6 +132,12 @@ async def poll_once(lookback_minutes: int = 5) -> int:
         await expire_holds(cfg)
     except Exception as exc:
         logger.error("closure_poller: expire_holds failed: %s", exc)
+    # Cyble Social Media digests held PENDING at triage close once their lookahead passes.
+    try:
+        from edr_triage.pipeline import cyble_pending_sweep
+        await cyble_pending_sweep(cfg)
+    except Exception as exc:
+        logger.error("closure_poller: cyble_pending_sweep failed: %s", exc)
 
     tickets = await _fetch_recently_closed(cfg, lookback_minutes)
     if not tickets:
@@ -301,16 +311,14 @@ async def _process_closed_ticket(ticket: dict) -> bool:
                 return False
             resolved = await _handle_l2_resolution(jira_key, fields, final_class, analyst_id, analyst_name)
             if resolved:
-                # A human just reached a terminal verdict (FP or TP) on this ticket —
-                # resolve any open page for it. Safe no-op if none was ever triggered
-                # (see lib.pagerduty_client.resolve_event); best-effort, same as
-                # _retrigger_dependents below, so a PagerDuty outage never masks this
-                # ticket's own successful resolution.
+                # A person closed this ticket: its part of any PagerDuty incident closes
+                # (lib/paging.py; the incident resolves when every member has). No-op when
+                # it never paged. Best-effort, like _retrigger_dependents below.
                 try:
-                    from lib.pagerduty_client import resolve_event
-                    await resolve_event(jira_key)
+                    from lib import paging
+                    await paging.close_member(f"raptor:{jira_key}")
                 except Exception as exc:
-                    logger.error("closure_poller: resolve_event(%s) failed: %s", jira_key, exc)
+                    logger.error("closure_poller: paging close for %s failed: %s", jira_key, exc)
                 # This ticket just closed — anything the concurrency gate blocked
                 # specifically because THIS one was open has nothing else watching for
                 # that to change (DEMO-109502/DEMO-109453: a ticket blocked on a sibling's
@@ -385,12 +393,19 @@ async def _retrigger_dependents(jira_key: str, final_class: str = "") -> None:
             ) as client:
                 resp = await client.get(
                     f"/rest/api/3/issue/{dep_key}",
-                    params={"fields": "summary,description,created,priority,labels,comment"},
+                    params={"fields": "summary,description,created,priority,labels,comment,status"},
                 )
                 resp.raise_for_status()
                 issue = resp.json()
 
             dep_fields = issue.get("fields", {})
+            # A person may have closed the dependent first (DEMO-120228: parker closed it a
+            # minute before its sibling, and the re-triage then asked the user on a closed
+            # ticket). Leave a closed ticket alone.
+            dep_status = ((dep_fields.get("status") or {}).get("name") or "").strip().upper()
+            if dep_status in _CLOSED_FOR_RETRIAGE:
+                logger.info("dependent %s is already %s — not re-triaging", dep_key, dep_status)
+                continue
             desc_raw = dep_fields.get("description") or {}
             description = _adf_to_text(desc_raw) if isinstance(desc_raw, dict) else str(desc_raw or "")
             alert_id = parse_mde_alert_id(description)

@@ -145,9 +145,16 @@ def test_the_loop_widens_the_window_the_model_asked_for():
     assert seen[0]["window_hours"] >= 30 + 24          # the finding is 30 h old
 
 
-def test_paused_by_default_with_an_env_switch(monkeypatch):
+def test_on_by_default_on_claude_paused_on_mistral_with_an_env_switch(monkeypatch):
     monkeypatch.delenv("SHADOW_AI_TRIAGE", raising=False)
-    assert not ai_triage.enabled()
+    monkeypatch.delenv("SHADOW_LLM", raising=False)
+    monkeypatch.setenv("SHADOW_CLAUDE_MODEL", "anthropic.claude-opus-x")
+    assert ai_triage.enabled()                          # Opus review: on by default
+    monkeypatch.delenv("SHADOW_CLAUDE_MODEL")
+    monkeypatch.setattr(__import__("agent_core.backend", fromlist=["x"]), "DEFAULT_SHADOW_CLAUDE_MODEL", "")
+    assert not ai_triage.enabled()                      # no Claude id yet: nothing runs
+    monkeypatch.setenv("SHADOW_LLM", "mistral")
+    assert not ai_triage.enabled()                      # the Mistral-only agent stays paused
     for on in ("1", "true", "ON", " yes "):
         monkeypatch.setenv("SHADOW_AI_TRIAGE", on)
         assert ai_triage.enabled()
@@ -260,3 +267,12 @@ def test_attention_flag_keeps_a_benign_finding_out_of_the_fp_queue():
 
     fp, attn = asyncio.run(go())
     assert fp == ["a"] and attn == ["b"]
+
+
+def test_reused_verdict_keeps_the_original_models_name():
+    # edf640c0 copied 0691dfe3's Mistral fallback guess and was recorded as Opus at 0.98, which
+    # paged as Claude-verified (2026-11-04)
+    from shadow_hunter.ai_triage import reused_by
+    same = {"ai_by": "ai:mistral.mistral-large-3", "ai_prompt_version": "review-v3-fallback"}
+    assert reused_by(same, "ai:anthropic.claude-opus-5") == ("ai:mistral.mistral-large-3", "review-v3-fallback")
+    assert reused_by({}, "ai:anthropic.claude-opus-5") == ("ai:anthropic.claude-opus-5", "")

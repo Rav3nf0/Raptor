@@ -1,0 +1,22 @@
+DLP:
+rhys.kohli@example.com - As per confirmation from user, she is from the Investor grievances team and the data is exchange complaint records containing customer identity numbers. Business as usual, no action needed.
+wren.pillai@example.com - As per the confirmation from user, he is from the finance team and does GST reconciliation; the workbook holds vendor tax identifiers.
+finley.rao@example.com - As per the confirmation from user, the sheet contains vendor details, bank transaction references and payout reconciliation for the month.
+pia.gandhi@example.com - As per confirmation from user, she handles regulatory reporting and the file is the quarterly submission draft shared with the compliance reviewer.
+taylor.singh@example.com/Reconciliation - As per confirmation from user, daily settlement files are downloaded from the clearing portal and reconciled locally before upload.
+reese.iyer@example.com/toby.vohra@example.com - As per the confirmation from the user, this data was saved as part of business purposes. Hence marking as false positive.
+oakley.das@example.com - As per confirmation from user, he maintains the partner onboarding tracker which carries partner PAN and bank details.
+blair.ahuja@example.com - As per confirmation from user, the export is the monthly payroll input shared with the payroll vendor under an existing agreement.
+sage.kapoor@example.com - As per the confirmation from user, he is an SRE and the file is an infrastructure inventory; the strings flagged are resource identifiers, not credentials.
+drew.calder@example.com - As per confirmation from user, the attachment is a signed vendor contract sent to the legal team for review.
+morgan.diaz@example.com - As per the confirmation from user, customer KYC documents are handled as part of the account-opening queue.
+emery.bose@example.com/Audit - As per confirmation from user, audit evidence is collected into one workbook each quarter and shared with the external auditor.
+hayden.roy@example.com - As per the confirmation from user, the file is a marketing campaign list exported from the CRM for a scheduled send.
+uma.grover@example.com - As per confirmation from user, she is from the treasury team and the sheet holds counterparty settlement instructions.
+casey.brooks@example.com - As per the confirmation from the user, this data was saved as part of business purposes. Hence marking as false positive.
+nina.dutta@example.com - As per confirmation from user, the document is a board pack prepared for the quarterly meeting.
+theo.malik@example.com - As per the confirmation from user, he is from the data team and the extract is an anonymised sample used for model evaluation.
+vera.sinha@example.com - As per confirmation from user, the export supports a regulator query and was shared only on the official channel.
+yash.oberoi@example.com - As per the confirmation from user, the file is a reconciliation of broker commissions for the previous quarter.
+Dana - bare first name, deliberately not matched to an account (see dlp_context.py).
+Robin K - bare first name, deliberately not matched to an account.

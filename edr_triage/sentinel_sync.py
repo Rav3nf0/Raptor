@@ -46,7 +46,7 @@ _TP_STATUSES = {"closed", "resolved", "in progress", "containment", "eradication
                 "recovery", "rca"}
 _L2 = "l2 analysis required"
 _INCIDENT_RE = re.compile(r"Incidents/([0-9a-fA-F-]{36})")
-_DUP_OF_RE = re.compile(r"Duplicate of (SIM-\d+)")
+_DUP_OF_RE = re.compile(r"Duplicate of (DEMO-\d+)")
 
 
 def _adf_text(node) -> str:
@@ -144,7 +144,7 @@ async def _jira_search(client: httpx.AsyncClient, jql: str, fields: list[str],
 
 
 async def _dup_original_class(client: httpx.AsyncClient, key: str) -> tuple | None:
-    """Classification of the ticket a Duplicate points at (RAPTOR's 'Duplicate of SIM-X'
+    """Classification of the ticket a Duplicate points at (RAPTOR's 'Duplicate of DEMO-X'
     comment), UNDETERMINED when none is named, None while the original is undecided."""
     try:
         resp = await client.get(f"/rest/api/3/issue/{key}/comment", params={"maxResults": 50})

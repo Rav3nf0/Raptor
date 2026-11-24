@@ -20,6 +20,19 @@ from dataclasses import dataclass, field
 _LOGIN_PLACEHOLDER = "LOGIN"
 
 
+def utc_seconds(ts) -> str:
+    """'YYYY-MM-DDTHH:MM:SS' in UTC, or the first 19 characters when unparseable.
+
+    Sentinel and Upwind tickets have no MDE alert, so their alert time is the Jira
+    `created` field, e.g. 2026-11-08T23:04:52.743+0530. Slicing [:19] dropped the
+    offset and IST was shown as UTC (DEMO-121175: '23:04:52 UTC' for a 17:34 UTC alert).
+    """
+    from lib.kql_templates import _ts
+    raw = str(ts or "").strip()
+    iso = _ts(raw)
+    return iso[:19] if iso else raw[:19]
+
+
 @dataclass
 class NormalizedAlert:
     # ── identity ──────────────────────────────────────────────────────
@@ -100,7 +113,7 @@ def normalize_alert(
         or "Unknown Device"
     )
 
-    alert_time = (alert.get("alertCreationTime") or alert.get("firstEventTime", ""))[:19].replace("T", " ")
+    alert_time = utc_seconds(alert.get("alertCreationTime") or alert.get("firstEventTime", "")).replace("T", " ")
 
     return NormalizedAlert(
         name=alert.get("alertDisplayName") or alert.get("title", "") or "Alert",

@@ -49,7 +49,7 @@ def build_kql(lookback_hours: int = 24, history_days: int = 7, max_fleet_devices
             | extend Payload = substring(Payload, 0, strlen(Payload) - strlen(Payload) % 4)
             | extend Decoded = iff(isempty(Payload), "", replace_string(base64_decode_tostring(Payload), "\\u0000", ""))
             // AI agents encode every command they run, so each one is "new to the fleet" (Claude
-            // desktop on u145asawaoprwl1, 2026-10-05: 10 findings of pip list / file listings).
+            // desktop on u145dmorioprwl1, 2026-10-05: 10 findings of pip list / file listings).
             // Claude's wrapper carries the real command as a second base64 layer: judge that,
             // and keep it only when it downloads or executes something.
             | extend Inner = extract(@"\\$EncodedCommand\\s*=\\s*'([A-Za-z0-9+/=]{{16,}})", 1, Decoded)

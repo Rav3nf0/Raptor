@@ -41,6 +41,9 @@ class TriagedAlert(BaseModel):
     additional_users: list[str] = Field(default_factory=list)
     severity: str = ""                    # Low / Medium / High / Informational
     tactics: list[str] = Field(default_factory=list)
+    # Canonical MITRE tactics (edr_triage/paging_rules.tactics_of): the ticket's Tactics line, the
+    # EDR alert's category and its technique ids. Vendor-neutral, for paging.
+    mitre_tactics: list[str] = Field(default_factory=list)
 
     # File evidence (from MDE Evidence API)
     file_name: str = ""

@@ -7,6 +7,10 @@ Routes:
     GET  /api/shadow/findings/{id}      — single finding
     POST /api/shadow/findings/{id}/decision — record TP / FP / snooze
     GET  /api/shadow/allowlist          — all YAML rules as JSON
+    GET  /api/shadow/env-notes          — environment notes the AI reviewer is given
+    POST /api/shadow/env-notes          — admin adds a note (active at once)
+    POST /api/shadow/env-notes/propose  — an AI or analyst proposes one (inactive until approved)
+    POST /api/shadow/env-notes/{id}/approve|retire — admin
     POST /api/shadow/hunt/run           — trigger all detectors immediately
     GET  /api/shadow/process-tree/{id}  — synthetic 3-level process tree
     GET  /api/shadow/stories            — incident stories (related findings grouped)
@@ -21,6 +25,7 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
+from app.views.nav_rail import with_rail
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -45,7 +50,7 @@ def _get_sentinel():
 
 @router.get("/shadow", response_class=HTMLResponse, include_in_schema=False)
 async def shadow_page():
-    return HTMLResponse(_render_page())
+    return HTMLResponse(with_rail(_render_page(), "shadow", theme="cyan"))
 
 
 def _render_page() -> str:
@@ -196,6 +201,9 @@ def _render_page() -> str:
   .ai.true_positive { color: var(--crit); } .ai.false_positive { color: var(--ok); } .ai.unsure { color: var(--med); }
   .aibox .attn { color: var(--med); }
   .aibox { border: 1px dashed var(--rule); border-radius: 10px; padding: 12px 14px; margin-bottom: 22px; background: var(--panel-2); }
+  .aibox .trail { margin: 8px 0; font-size: 12.5px; } .aibox .trail summary { cursor: pointer; color: var(--accent); }
+  .aibox .trail pre { white-space: pre-wrap; word-break: break-word; max-height: 180px; overflow: auto; background: var(--ink);
+                      border: 1px solid var(--rule-soft); border-radius: 6px; padding: 6px 8px; font: 11px/1.4 var(--mono); }
   .aibox .hd { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--fg-dim); }
   .aibox .hd b { font-weight: 600; }
   .aibox p { margin: 8px 0 0; font-size: 13px; color: var(--fg); line-height: 1.5; }
@@ -233,6 +241,18 @@ def _render_page() -> str:
   .rule .why small { display: block; color: var(--fg-faint); }
   .rule .src { display: flex; align-items: center; gap: 10px; margin-top: 5px; font-family: var(--sans); }
   .more { padding: 10px 18px; }
+  #envnotes { margin-top: -40px; }
+  .note { display: grid; grid-template-columns: 90px minmax(0, 1fr) 200px; gap: 14px; padding: 11px 18px;
+          border-bottom: 1px solid var(--rule-soft); font-size: 12.5px; align-items: start; }
+  .note:last-child { border-bottom: 0; }
+  .note .tx { color: var(--fg); white-space: pre-wrap; word-break: break-word; }
+  .note .tx small { display: block; color: var(--fg-faint); margin-top: 4px; }
+  .note .n-acts { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
+  .note-add { display: flex; gap: 10px; padding: 12px 18px; border-top: 1px solid var(--rule-soft); align-items: flex-start; }
+  .note-add textarea { flex: 1; min-height: 54px; resize: vertical; font: inherit; font-size: 12.5px; padding: 8px 10px;
+                       border: 1px solid var(--rule-soft); border-radius: 8px; background: var(--panel-2); color: var(--fg); }
+  .notes-help { padding: 0 18px 12px; color: var(--fg-faint); font-size: 12px; }
+  @media (max-width: 700px) { .note { grid-template-columns: 1fr; } .note .n-acts { justify-content: flex-start; } }
 
   /* drawer */
   .scrim { position: fixed; inset: 0; background: rgba(2, 8, 9, 0.55); opacity: 0; pointer-events: none; transition: .2s; z-index: 30; }
@@ -402,6 +422,16 @@ def _render_page() -> str:
     <div class="more"><button class="btn" id="al-more" type="button" hidden>Load more</button></div>
   </details>
 
+  <details class="allow" id="envnotes">
+    <summary>Environment notes for the AI <span id="en-count"></span></summary>
+    <p class="notes-help">Facts the AI reviewer is told about our environment (an app account, a scheduled job, a known scanner). Active notes go into every review; it still checks they fit the host and time. Notes an AI proposes stay out until an admin approves them.</p>
+    <div class="rules" id="notes"></div>
+    <div class="note-add">
+      <textarea id="en-text" maxlength="600" placeholder="One fact: what it explains, where it applies, and what would NOT be explained by it"></textarea>
+      <button class="btn" id="en-add" type="button">Add note</button>
+    </div>
+  </details>
+
   <section id="stories" hidden>
     <div class="toolbar">
       <div class="seg" id="seg-story" role="group" aria-label="Story status">
@@ -434,6 +464,7 @@ var DET = {
   suspicious_parent_child: ['Parent \u2192 child', 'Office, mail or browser starting a shell or LOLBin with a new command'],
   lolbin_abuse:            ['LOLBins', 'Signed Windows binaries used for their known abuse techniques'],
   unusual_remote_logons:   ['RDP anomalies', 'RDP that breaks the account\u2019s own 14-day pattern'],
+  control_bypass:          ['Control bypass', 'Disguised interpreters, in-house app names in the wrong place, browsers forced through a proxy'],
   defender_exclusions:     ['Defender exclusions', 'Exclusions added by a script host rather than central management'],
   package_installs:        ['Package installs', 'npm/PyPI installs of known-malicious, pulled or brand-new packages'],
   cloud_session_split:     ['Cloud session split', 'One AWS session credential used from a new network, a second OS or a rotating proxy'],
@@ -556,6 +587,7 @@ function aiBlock(f) {
     (f.ai_attention ? '<p class="attn"><b>\u2691 Needs attention:</b> ' + esc(f.ai_attention) + '</p>' : '') +
     (f.ai_reasoning ? '<p>' + esc(f.ai_reasoning) + '</p>' : '') +
     ((f.ai_evidence || []).length ? '<ul>' + f.ai_evidence.map(function (e) { return '<li>' + esc(e) + '</li>'; }).join('') + '</ul>' : '') +
+    (f.ai_trail_id ? '<details class="trail" data-trail="' + esc(f.ai_trail_id) + '"><summary>Full investigation (checks, results, what is missing)</summary><div class="trail-body">Loading…</div></details>' : '') +
     '<small>' + esc(f.ai_by) + ' · ' + esc(ago(f.ai_at)) + ' · a suggestion only: nothing is dismissed or confirmed until an analyst decides</small></div>';
 }
 function rowHTML(f, i) {
@@ -827,10 +859,59 @@ getJSON('/api/shadow/allowlist?limit=1').then(function (d) {
   $('al-count').textContent = (d.total || 0) + ' rule' + (d.total === 1 ? '' : 's');
 }).catch(function () {});
 
+/* ---------- environment notes ---------- */
+/* POST that rejects with the server's own reason (its "detail", else the status), so a refusal
+   says why: too long, admin role needed, or a proxy page instead of JSON. */
+function noteCall(url, body) {
+  return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body || '{}' })
+    .then(function (r) {
+      return r.text().then(function (t) {
+        var d = null; try { d = JSON.parse(t); } catch (e) {}
+        if (r.ok && d) return d;
+        var why = d && d.detail ? (typeof d.detail === 'string' ? d.detail : JSON.stringify(d.detail))
+                : r.status === 403 ? 'admin role needed'
+                : 'HTTP ' + r.status + (d ? '' : ' (not a JSON reply: a proxy or login page?)');
+        throw new Error(why);
+      });
+    });
+}
+function loadNotes() {
+  getJSON('/api/shadow/env-notes').then(function (d) {
+    var ns = d.notes || [];
+    var act = ns.filter(function (n) { return n.status === 'active'; }).length, prop = ns.length - act;
+    $('en-count').textContent = act + ' active' + (prop ? ' \u00b7 ' + prop + ' proposed' : '');
+    $('notes').innerHTML = ns.map(function (n) {
+      var who = n.status === 'proposed' ? 'proposed by ' + n.by : 'added by ' + n.by +
+                (n.approved_by && n.approved_by !== n.by ? ' \u00b7 approved by ' + n.approved_by : '');
+      return '<div class="note"><div><span class="pill">' + esc(n.status) + '</span></div>' +
+        '<div class="tx">' + esc(n.text) + '<small>' + esc(who) + ' \u00b7 ' + esc(ago(n.created_at)) +
+        ((n.evidence || []).length ? ' \u00b7 evidence: ' + esc(n.evidence.join('; ')) : '') + '</small></div>' +
+        '<div class="n-acts">' + (n.status === 'proposed' ? '<button type="button" class="btn primary" data-en="approve" data-id="' + esc(n.id) + '">Approve</button>' : '') +
+        '<button type="button" class="btn" data-en="retire" data-id="' + esc(n.id) + '">' + (n.status === 'proposed' ? 'Reject' : 'Remove') + '</button></div></div>';
+    }).join('') || '<div class="note"><div></div><div class="tx">No notes yet.</div><div></div></div>';
+  }).catch(function () { $('en-count').textContent = ''; });
+}
+$('envnotes').addEventListener('toggle', function () { if (this.open) loadNotes(); });
+$('en-add').addEventListener('click', function () {
+  var t = $('en-text').value.trim(); if (!t) return;
+  noteCall('/api/shadow/env-notes', JSON.stringify({ text: t })).then(function () {
+    $('en-text').value = ''; toast('Note added \u00b7 used from the next review run'); loadNotes();
+  }).catch(function (e) { toast('Could not add the note: ' + e.message); });
+});
+$('notes').addEventListener('click', function (e) {
+  var b = e.target.closest('[data-en]'); if (!b) return;
+  var act = b.getAttribute('data-en');
+  if (act === 'retire' && !confirm('Take this note out of the AI reviewer? It stays in the history.')) return;
+  noteCall('/api/shadow/env-notes/' + encodeURIComponent(b.getAttribute('data-id')) + '/' + act)
+    .then(function () { toast(act === 'approve' ? 'Approved \u00b7 used from the next review run' : 'Note removed'); loadNotes(); })
+    .catch(function (e) { toast('Could not ' + act + ' the note: ' + e.message); });
+});
+loadNotes();
+
 /* ---------- stories ---------- */
 function setView(v) {
   S.view = v;
-  ['overview', 'lanes', 'queue', 'allow'].forEach(function (id) { $(id).hidden = v !== 'queue'; });
+  ['overview', 'lanes', 'queue', 'allow', 'envnotes'].forEach(function (id) { $(id).hidden = v !== 'queue'; });
   document.querySelector('main > .toolbar').hidden = v !== 'queue';
   document.querySelector('.pager').hidden = v !== 'queue';
   $('stories').hidden = v !== 'stories';
@@ -872,6 +953,19 @@ function loadStories() {
       '<li class="empty"><b>No ' + (S.storyStatus === 'all' ? '' : S.storyStatus + ' ') + 'stories</b>Related findings are grouped here every 30 minutes.</li>';
   }).catch(function () { $('story-list').innerHTML = '<li class="empty"><b>Could not load stories</b>Check the session and reload.</li>'; });
 }
+document.addEventListener('toggle', function (e) {   // grouped-review trail, loaded on first open
+  var d = e.target; if (!d.classList || !d.classList.contains('trail') || !d.open || d.getAttribute('data-loaded')) return;
+  d.setAttribute('data-loaded', '1');
+  var body = d.querySelector('.trail-body');
+  getJSON('/api/shadow/ai/trail/' + encodeURIComponent(d.getAttribute('data-trail'))).then(function (t) {
+    var ck = (t.decision || {}).checklist || {};
+    var rows = Object.keys(ck).map(function (k) { return '<li><b>' + esc(k.replace(/_/g, ' ')) + ':</b> ' + esc(ck[k]) + '</li>'; }).join('');
+    var checks = (t.gathered || []).map(function (c) { return '<li><code>' + esc(c.tool) + '</code> ' + esc(JSON.stringify(c.args || {}).slice(0, 160)) + '<pre>' + esc(String(c.result).slice(0, 1200)) + '</pre></li>'; }).join('') +
+      (t.checks || []).map(function (c) { return '<li><b>' + esc(c.what) + '</b><pre>' + esc(String(c.result).slice(0, 1500)) + '</pre></li>'; }).join('');
+    body.innerHTML = (rows ? '<p><b>Checklist</b></p><ul>' + rows + '</ul>' : '') +
+      '<p><b>Checks (' + ((t.gathered || []).length + (t.checks || []).length) + ')</b> on ' + esc((t.hosts || []).length) + ' host(s), ' + esc((t.finding_ids || []).length) + ' finding(s)</p><ul>' + checks + '</ul>';
+  }).catch(function () { body.textContent = 'Could not load the investigation.'; });
+}, true);
 $('story-list').addEventListener('click', function (e) {
   var li = e.target.closest('[data-s]'); if (!li) return;
   location.href = '/shadow/stories/' + encodeURIComponent(S.stories[+li.getAttribute('data-s')].id);
@@ -1129,6 +1223,11 @@ async def shadow_decide(finding_id: str, body: DecisionIn):
     f.note = body.note
     f.ai_agreed = agreement(f.ai_verdict, body.decision)
     await f.save()
+    try:                                   # a person's TP acknowledges a page; it never starts one
+        from shadow_hunter.paging import on_decision
+        await on_decision(f)
+    except Exception:
+        logger.exception("paging update after decision on %s failed", finding_id)
 
     await AuditLog(
         actor=body.reviewer,
@@ -1524,7 +1623,7 @@ async def shadow_ai_reset(ids: str, reason: str = ""):
     res = await Finding.get_pymongo_collection().update_many(
         {"_id": {"$in": id_list}, "reviewed_at": None},
         {"$set": {"ai_verdict": "", "ai_confidence": None, "ai_reasoning": "", "ai_evidence": [], "ai_by": "",
-                  "ai_at": None, "ai_error": "", "ai_attempts": 0, "ai_attention": ""}})
+                  "ai_at": None, "ai_error": "", "ai_attempts": 0, "ai_attention": "", "ai_trail_id": ""}})
     await AuditLog(actor="admin", action="ai_verdict.reset", target_type="finding", target_id=",".join(id_list)[:500],
                    payload={"reset": res.modified_count, "reason": reason}).insert()
     return {"ok": True, "reset": res.modified_count}
@@ -1546,6 +1645,25 @@ _LLM_HINTS = [
 ]
 
 
+async def _claude_variants(model: str) -> list[dict]:
+    """When the configured Claude call fails, try the other ways Mantle might serve it, one
+    tiny prompt each, so one deploy shows which works: the OpenAI-compatible path Mistral
+    uses, and the Anthropic path with the bare model name."""
+    from agent_core.backend import MantleBackend
+    bare = model.split(".", 1)[1] if model.startswith("anthropic.") else model
+    tries = [("openai", model), ("anthropic", bare), ("openai", bare)]
+    res = []
+    for proto, mid in dict.fromkeys(tries):
+        b = MantleBackend()
+        b.protocol, b.model_id, b.budget_scope, b.max_tokens = proto, mid, "shadow", 16
+        try:
+            text, _ = await b.chat([{"role": "user", "content": "Reply with the single word: OK"}], [])
+            res.append({"protocol": proto, "model": mid, "ok": True, "reply": (text or "").strip()[:40]})
+        except Exception as exc:
+            res.append({"protocol": proto, "model": mid, "ok": False, "error": str(exc)[:500]})
+    return res
+
+
 @router.get("/api/shadow/llm-check")
 async def shadow_llm_check():
     """Diagnostic: can /shadow reach its model? Sends one tiny prompt through get_shadow_backend()
@@ -1555,8 +1673,8 @@ async def shadow_llm_check():
     from agent_core.backend import get_shadow_backend, shadow_llm, shadow_model_id
     out: dict = {"llm": shadow_llm(), "model": shadow_model_id(), "region": os.getenv("AWS_REGION", "ap-south-1"),
                  "transport": os.getenv("SHADOW_CLAUDE_TRANSPORT", "runtime") if shadow_llm() == "claude" else "internal",
-                 "ai_triage_on": os.getenv("SHADOW_AI_TRIAGE", "0").lower() in ("1", "true", "yes", "on"),
-                 "story_reports_on": os.getenv("SHADOW_STORY_REPORTS", "0").lower() in ("1", "true", "yes", "on"),
+                 "ai_triage_on": __import__("shadow_hunter.ai_triage", fromlist=["enabled"]).enabled(),
+                 "story_reports_on": os.getenv("SHADOW_STORY_REPORTS", "1").lower() in ("1", "true", "yes", "on"),
                  "ok": False}
     try:
         import asyncio
@@ -1570,11 +1688,36 @@ async def shadow_llm_check():
         out["ok"], out["reply"] = True, (text or "").strip()[:80]
     except Exception as exc:
         msg = str(exc)
-        out["error"] = msg[:600]
+        out["error"] = msg[:1500]
         low = msg.lower()
         out["hint"] = next((h for k, h in _LLM_HINTS if k in low), "")
+    if not out["ok"] and out["llm"] == "claude":
+        out["variants"] = await _claude_variants(out["model"])
+    try:                                   # which Claude ids the Mantle project serves
+        from agent_core.backend import mantle_models
+        ids = await mantle_models()
+        out["mantle_claude_models"] = [i for i in ids if "claude" in i.lower() or "anthropic" in i.lower()]
+        out["mantle_models_total"] = len(ids)
+        if not out["mantle_claude_models"]:
+            out["mantle_models_sample"] = ids[:30]
+    except Exception as exc:
+        out["mantle_models_error"] = str(exc)[:300]
+    if not out["model"] and out["llm"] == "mistral":
+        out["note"] = "No Claude model id set yet: /shadow runs on Mistral. Pick one from mantle_claude_models."
     logger.info("SHADOW-LLM-CHECK %s", {k: v for k, v in out.items() if k != "budget"})
     return out
+
+
+@router.get("/api/shadow/ai/trail/{trail_id}")
+async def shadow_ai_trail(trail_id: str):
+    """The grouped review's full investigation behind a suggestion: the case file Opus read,
+    every check and its result, its checklist (what is missing) and decision. Cleaned."""
+    from shadow_hunter import ai_review
+    d = await ai_review._db()[ai_review.TRAIL_COLL].find_one({"_id": trail_id})
+    if not d:
+        raise HTTPException(404, "not found")
+    d["id"] = d.pop("_id")
+    return d
 
 
 @router.get("/api/shadow/ai/stats")
@@ -1618,6 +1761,69 @@ async def shadow_delete_allowlist_rule(name: str):
     await AuditLog(actor="analyst", action="allowlist.delete", target_type="allowlist_rule",
                    target_id=name, payload=out).insert()
     return {"ok": True, **out}
+
+
+class EnvNoteIn(BaseModel):
+    text: str
+    by: str = ""                 # proposals: who proposed it (e.g. claude-code-manual)
+    evidence: list[str] = []
+
+
+def _who(request: Request) -> str:
+    return str(getattr(request.state, "user", "") or "analyst")
+
+
+@router.get("/api/shadow/env-notes")
+async def shadow_env_notes(include_retired: bool = False):
+    """What the AI reviewer is told about our environment, beyond the notes in the code."""
+    from shadow_hunter import env_notes
+    return {"notes": await env_notes.list_notes(include_retired), "max_active": env_notes.MAX_ACTIVE}
+
+
+@router.post("/api/shadow/env-notes")
+async def shadow_add_env_note(body: EnvNoteIn, request: Request):
+    """An admin's note: active at once, in the next review run's prompt."""
+    from shadow_hunter import env_notes
+    from shadow_hunter.models import AuditLog
+    try:
+        note = await env_notes.add(body.text, _who(request), proposed=False, evidence=body.evidence)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    await AuditLog(actor=_who(request), action="env_note.add", target_type="env_note",
+                   target_id=note["id"], payload={"text": note["text"]}).insert()
+    return note
+
+
+@router.post("/api/shadow/env-notes/propose")
+async def shadow_propose_env_note(body: EnvNoteIn, request: Request):
+    """An AI (or analyst) suggestion: stays out of the prompt until an admin approves it."""
+    from shadow_hunter import env_notes
+    from shadow_hunter.models import AuditLog
+    try:
+        note = await env_notes.add(body.text, body.by or _who(request), proposed=True,
+                                   submitted_by=_who(request), evidence=body.evidence)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    await AuditLog(actor=note["by"], action="env_note.propose", target_type="env_note",
+                   target_id=note["id"], payload={"text": note["text"], "submitted_by": note["submitted_by"]}).insert()
+    return note
+
+
+@router.post("/api/shadow/env-notes/{note_id}/{action}")
+async def shadow_env_note_action(note_id: str, action: str, request: Request):
+    from shadow_hunter import env_notes
+    from shadow_hunter.models import AuditLog
+    if action not in {"approve", "retire"}:
+        raise HTTPException(404, "unknown action")
+    try:
+        ok = await (env_notes.approve if action == "approve" else env_notes.retire)(note_id, _who(request))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if not ok:
+        raise HTTPException(404, "no such note in a state that allows " + action)
+    await AuditLog(actor=_who(request), action=f"env_note.{action}", target_type="env_note",
+                   target_id=note_id, payload={}).insert()
+    return {"ok": True}
 
 
 @router.post("/api/shadow/hunt/run")
@@ -1850,6 +2056,7 @@ def _serialize(f) -> dict:
         "ai_error": f.ai_error,
         "ai_agreed": f.ai_agreed,
         "ai_attention": f.ai_attention,
+        "ai_trail_id": getattr(f, "ai_trail_id", "") or "",
         "story_id": getattr(f, "story_id", "") or "",
     }
 

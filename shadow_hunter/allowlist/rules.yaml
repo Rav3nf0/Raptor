@@ -15,13 +15,13 @@ rules:
   match:
     account_equals: svc_intune
   reason: Intune MDM service account — exclusions are centrally managed
-  owner: security-team@corp.example.com
+  owner: security-team@example.com
 - name: central-mgmt-sccm-svc
   detector: defender_exclusions
   match:
     account_equals: svc_sccm
   reason: SCCM/ConfigMgr agent account — exclusions are centrally managed
-  owner: security-team@corp.example.com
+  owner: security-team@example.com
 # ────────────────────────────────────────────────────────────────────────────
 - detector: rare_external_domains
   match:
@@ -61,3 +61,28 @@ rules:
   name: mac-outlook-tmp-unlock
   owner: td@example.com
   reason: Outlook for Mac clearing the immutable flag on its own sandbox temp folder (seen 2026-09-30)
+# ── Upwind: AWS/EKS automation verified in CloudTrail (2026-11-04, 0 TPs among the 37 these hide since May) ──
+- name: upwind-stacksets-exec-role
+  detector: upwind_threats
+  match:
+    indicator_matches: ^(an iam role was created allowing an external account in its trust policy|administrative policy attached to iam role)\|stacksets-exec-[0-9a-f]+\|
+  reason: AWS Organizations' StackSets org-member service role creates stacksets-exec-* with AdministratorAccess trusting our own management account (SSM Quick Setup deploys, 2-4 Nov). Only that service role creates these names.
+  owner: riley.patel@example.com
+- name: upwind-kube-bench-cis
+  detector: upwind_threats
+  match:
+    indicator_matches: ^kubernetes attack tool executed\|kube-bench-cis\|
+  reason: Our weekly kube-bench CIS benchmark CronJob (Sundays ~02:34 UTC); Upwind classes kube-bench itself as an attack tool.
+  owner: riley.patel@example.com
+- name: upwind-alb-controller-k8s-sg
+  detector: upwind_threats
+  match:
+    indicator_matches: ^a security group inbound rule was modified by assumed role to allow unrestricted traffic \(0\.0\.0\.0/0\) on other ports\|k8s-
+  reason: k8s-* security groups are created and managed by the EKS AWS Load Balancer Controller; every one checked in CloudTrail was its eksctl role opening only tcp/80 and 443 from our NAT. Security groups named by sg id are NOT covered.
+  owner: riley.patel@example.com
+- name: rds-rdsadmin-localhost-denied
+  detector: rds_audit
+  match:
+    indicator_matches: ^access_denied\|[^|]+\|rdsadmin\|localhost\|
+  reason: rdsadmin@localhost is AWS RDS's own management account (thousands of successful logins per cluster); its occasional access-denied lines are internal maintenance. Only access_denied is covered - an account_change or destructive statement by rdsadmin still reports.
+  owner: riley.patel@example.com

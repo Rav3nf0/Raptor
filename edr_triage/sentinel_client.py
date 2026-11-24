@@ -811,7 +811,7 @@ def annotate_session_ambiguity(primary: dict, rows: list[dict]) -> dict:
     Root Privilege Escalation joins a root process to the SSM StartSession events on the
     same instance by time window only, so when two people had sessions on the box the
     telemetry cannot say which of them ran the command. DEMO-112299: `v-quinn.foster`
-    and `v-shreyas.jadhav` both used ssm-session-nerve-charlie-role on the same instance;
+    and `v-shreyas.petrov` both used ssm-session-nerve-charlie-role on the same instance;
     RAPTOR named one of them, arbitrarily. An ambiguous actor must never be auto-closed
     or have one person asked to justify it — the gate in agent_core/loop.py and the
     pipeline's close gate both read `actor_ambiguous`.
@@ -2243,6 +2243,8 @@ def _normalize_failed_login_row(raw: dict) -> dict:
         "ccl":                  pick("ccl"),
         "category":             pick("Category", "category"),
         "alert_name":           pick("alert_name"),
+        "first_failure":        str(raw.get("t0") or ""),
+        "last_failure":         str(raw.get("t1") or ""),
     }
 
 
@@ -2278,7 +2280,9 @@ async def query_netskope_failed_login(
         "Netskope_Alerts_CL\n"
         f"{window}\n"
         f"{_FAILED_LOGIN_FILTER}"
-        f"| summarize count() by {keys}\n"
+        # first/last failure per group: failed_login_guard needs them to tell a re-fire of
+        # the same burst (nothing after the earlier ticket) from new failures.
+        f"| summarize count(), t0=min(TimeGenerated), t1=max(TimeGenerated) by {keys}\n"
         f"| where count_ > {_FAILED_LOGIN_MIN_COUNT}\n"
         "| sort by count_ desc\n"
         f"| take {_FAILED_LOGIN_GROUP_CAP}"

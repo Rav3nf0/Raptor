@@ -204,6 +204,23 @@ async def _notify_job() -> None:
         await release_lease("shadow_notify")
 
 
+async def _paging_job() -> None:
+    """PagerDuty for /shadow (shadow_hunter/paging.py), plus what both sources share: night-held
+    pushes released at 09:00 IST and the daily digest of incidents open over 48h. Live unless
+    PAGERDUTY_MODE says trial or off; sends nothing without the routing key."""
+    if not await acquire_lease("shadow_paging", 12 * 60):
+        return
+    try:
+        from shadow_hunter.paging import run
+        out = await run()
+        if any(v for k, v in out.items() if k != "off"):
+            logger.info("[scheduler] paging: %s", out)
+    except Exception:
+        logger.exception("[scheduler] paging: failed")
+    finally:
+        await release_lease("shadow_paging")
+
+
 async def release_lease(job_id: str) -> None:
     """Drop a lease we hold, so the next job using it is not blocked for its whole TTL."""
     from shadow_hunter.models import Finding
@@ -269,6 +286,12 @@ def build_scheduler() -> AsyncIOScheduler:
         _notify_job, trigger="interval", hours=2,
         id="shadow_notify", name="Slack alerts: TP stories and high/critical TP detections (every 2h)",
         replace_existing=True, misfire_grace_time=300, next_run_time=datetime.now(timezone.utc) + timedelta(minutes=3),
+    )
+    # PagerDuty: /shadow TPs, held pushes, 48h digest (live unless PAGERDUTY_MODE=trial|off).
+    scheduler.add_job(
+        _paging_job, trigger="interval", minutes=15,
+        id="shadow_paging", name="PagerDuty: /shadow TPs, held pushes, digest (every 15m)",
+        replace_existing=True, misfire_grace_time=300, next_run_time=datetime.now(timezone.utc) + timedelta(minutes=5),
     )
     # AI suggestions on new findings (advisory; paused unless SHADOW_AI_TRIAGE=1).
     scheduler.add_job(

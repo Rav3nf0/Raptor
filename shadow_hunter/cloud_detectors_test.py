@@ -74,8 +74,8 @@ def test_cli_from_the_devices_own_ip_while_silent_is_caught():
 
 
 def test_entra_sign_in_as_the_device_is_a_medium_coverage_gap():
-    devs = [_dev("e750rchouoprwl", "2026-09-02T10:04:04Z", os="Windows11", user="raam")]
-    act = [_act("signin", "raam@example.com", "2026-09-07T05:00:00Z", ip="1.2.3.4", dev="E750RCHOUOPRWL",
+    devs = [_dev("e750awrkoprwl", "2026-09-02T10:04:04Z", os="Windows11", user="raam")]
+    act = [_act("signin", "raam@example.com", "2026-09-07T05:00:00Z", ip="1.2.3.4", dev="E750AWRKOPRWL",
                 last="2026-09-07T07:30:00Z")]
     f = EdrSilentActiveDetector().to_findings(match_silent(devs, act, NOW))[0]
     assert f["severity"] == "medium" and "Entra sign-in(s) as this device" in f["summary"]

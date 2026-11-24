@@ -294,7 +294,7 @@ def format_alert(
 
     # Analyst notes ALREADY on the ticket — populated only on a re-triage of a
     # ticket that has been escalated/commented on; empty on a brand-new ticket's
-    # first pass. DEMO-108035: Subodh Patil had already typed out the exact
+    # first pass. DEMO-108035: Subodh Okafor had already typed out the exact
     # Conditional Access diff by hand (Policy, Result, Change Detected, Current
     # Applications, Current Users) and the agent never saw any of it — only
     # `description` was ever fetched, so a re-triage re-derived (or failed to
@@ -320,7 +320,7 @@ def format_alert(
     # below) and an AWS-specific one for role-vs-session confusion, but nothing covered
     # an unbound IDENTITY, and the model does not simply stop: DEMO-107545 lost its actor
     # on re-triage (the live Sentinel entity fetch returned nothing six days on), and the
-    # agent proceeded to investigate `jamie.w@example.com` — Microsoft's stock demo
+    # agent proceeded to investigate `adelev@example.com` — Microsoft's stock demo
     # identity, with zero rows in SigninLogs, AADNonInteractiveUserSignInLogs and
     # AuditLogs across 30 days — then escalated because that account had no telemetry.
     # A confident, well-structured investigation of somebody who does not exist.
@@ -1207,6 +1207,17 @@ def format_alert(
             "domain plus no follow-up traffic is real exculpatory evidence; an uncategorised "
             "or VT-flagged domain, or any evidence of an actual connection, is not — escalate. "
             "Absence of a hunt is NOT absence of traffic.")
+
+    # Canary token: which tripwire fired and whether the visitor was one of ours. Without it
+    # the agent judged DEMO-121175's phishing-kit hit by an unrelated SharePoint file.
+    if ev.get("canary_check") is not None:
+        from edr_triage.canary_guard import prompt_lines
+        lines += prompt_lines(ev["canary_check"])
+
+    # Flagged file's download source and 30-day fleet spread (DEMO-121950).
+    if ev.get("file_origin") is not None:
+        from edr_triage.file_origin import prompt_lines as _fo_lines
+        lines += _fo_lines(ev["file_origin"])
 
     # GuardDuty EC2 finding bound on the generic path (probing, unusual resolver, ...):
     # rendered in the L1 comment but never reached the agent before DEMO-118243.

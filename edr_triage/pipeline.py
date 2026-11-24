@@ -98,6 +98,8 @@ async def _process_ticket(
     existing_comments = ticket.get("existing_comments", "")
     # Set on the agent path below; read by the close reviewer at the auto-close gate.
     _agent_result = None
+    # What the agent was handed, kept for the replay corpus (replay_corpus.py).
+    _corpus_agent_inputs: dict = {}
     _agent_evidence: dict = {}
 
     # Dedup — use jira_key for observe-only tickets
@@ -298,7 +300,7 @@ async def _process_ticket(
                 # "no acting principal identified — there is nobody to ask", overriding
                 # the agent even when it has correctly named the actors from the bound
                 # events. DEMO-110712: the model reached REQUEST_JUSTIFICATION naming
-                # nina.dutta / toby.vo and correctly excused the
+                # nina.dutta / toby.ks and correctly excused the
                 # gsheet.automation service account, and the gate still forced NEEDS_L2
                 # because this field was blank.
                 _accts = sentinel_entities.get("accounts") or []
@@ -1479,7 +1481,21 @@ async def _process_ticket(
                     _actor_reach_reason = f"reachability lookup failed ({str(_e)[:80]})"
                     logger.warning("reachability check failed for %s: %s", jira_key, _e)
 
+            _canary_check = None
+            from edr_triage import canary_guard as _canary
+            if _canary.applies(alert_name):
+                _canary_check = await _canary.check(_spray_anchor)
+
+            # Where the flagged file was downloaded from and who else has it, 30 days.
+            # DEMO-121950 escalated our own unsigned JIT tool: no origin URL, 24h prevalence.
+            _file_origin = None
+            from edr_triage import file_origin as _forigin
+            if _forigin.applies(alert_name, sha256):
+                _file_origin = await _forigin.check(sha256, device_name, _spray_anchor)
+
             _agent_evidence = {
+                "canary_check": _canary_check,
+                "file_origin": _file_origin,
                 "actor_reachable": _actor_reachable,
                 "actor_reach_reason": _actor_reach_reason,
                 "signin_spray_check": _spray_check,
@@ -1582,6 +1598,10 @@ async def _process_ticket(
             }
             # Generous wall-clock failsafe: a healthy run takes 6-8 min, so this
             # only fires if the loop is genuinely hung. Tunable via env.
+            _corpus_agent_inputs = {"prefetched": _prefetched, "evidence": _agent_evidence,
+                                    "alert_type": _alert_type_for_backend, "tactics": _tactics,
+                                    "inv_state": inv_state, "sha256": sha256,
+                                    "is_test_device": is_test}
             _agent_wall_timeout = int(_os.getenv("AGENT_LOOP_WALL_TIMEOUT", "720"))
             _agent_result = await asyncio.wait_for(
                 _agent_loop.run(
@@ -1853,6 +1873,10 @@ async def _process_ticket(
         _dup_action = await _maybe_close_log_ingestion(jira_key, alert_name, result, cfg,
                                                        dry_run, test_labels_only,
                                                        defer=_rule_comments)
+    if not _dup_action:
+        _dup_action = await _maybe_close_failed_login(jira_key, alert_name, ticket,
+                                                      sentinel_entities, result, cfg, dry_run,
+                                                      test_labels_only, defer=_rule_comments)
     if _dup_action in RULE_CLOSE_ACTIONS:
         result.l1_comment, _copilot_comment = _one_story(result.l1_comment, _copilot_comment,
                                                          _dup_action)
@@ -1875,40 +1899,6 @@ async def _process_ticket(
     # first and the agent's take as commentary on it (AGENT_PHASE=copilot only).
     if _copilot_comment:
         await add_comment(jira_key, _copilot_comment, cfg, dry_run=dry_run)
-
-    # Page PagerDuty for severe, non-FP verdicts. Deliberately NOT gated by
-    # _effective_agent_phase/may_change_ticket_state below — paging is a notification,
-    # not a Jira state change, so it fires the same in shadow/copilot/autonomous (see
-    # EDRTriageConfig.should_page). Only dry_run suppresses the real call.
-    _severity = alert_data.get("severity", ticket.get("severity", ""))
-    if cfg.should_page(_severity, result.triage_class):
-        if dry_run:
-            logger.info(
-                "[DRY RUN] would page PagerDuty for %s (severity=%s triage_class=%s)",
-                jira_key, _severity, result.triage_class,
-            )
-        else:
-            # Best-effort, like every PagerDuty call: paging is a side channel, and it must
-            # never be able to break triage. On 2026-09-25 an unguarded import here and in
-            # the close branch shipped before lib/pagerduty_client.py was committed; every
-            # autonomous close then raised AFTER walking the ticket, so its labels and
-            # processed record were never written and the autoclose report went blind.
-            try:
-                from lib.pagerduty_client import trigger_event
-                await trigger_event(
-                    dedup_key=jira_key,
-                    summary=f"{jira_key}: {alert_name} ({_severity})",
-                    severity=_severity,
-                    details={
-                        "alert_name": alert_name,
-                        "device_name": device_name,
-                        "triage_class": result.triage_class,
-                        "jira_url": f"{cfg.jira_url}/browse/{jira_key}",
-                    },
-                )
-            except Exception as exc:
-                logger.error("PagerDuty trigger for %s failed (triage unaffected): %s",
-                             jira_key, exc)
 
     # Execute action
     #
@@ -2055,18 +2045,15 @@ async def _process_ticket(
                     if "raptor-autoclosed" not in result.labels:
                         result.labels.append("raptor-autoclosed")
                     if not dry_run:
-                        # Resolve any open page for this ticket. Safe even when none
-                        # was ever triggered here — this triage_class (AUTO_CLOSED_FP)
-                        # never pages on its own (should_page excludes it), so this
-                        # only matters for a ticket that paged on an EARLIER cycle
-                        # (e.g. NEEDS_L2) and is only now being auto-closed.
-                        # Best-effort: see the note on the trigger call above. Raising
-                        # here skipped the label write for every autonomous close.
+                        # A ticket that paged on an earlier cycle and is only now
+                        # auto-closed closes its part of the incident (lib/paging.py).
+                        # Best-effort: on 2026-09-25 an unguarded PagerDuty import here
+                        # raised after the walk and skipped the label write for every close.
                         try:
-                            from lib.pagerduty_client import resolve_event
-                            await resolve_event(jira_key)
+                            from lib import paging
+                            await paging.close_member(f"raptor:{jira_key}")
                         except Exception as exc:
-                            logger.error("PagerDuty resolve for %s failed (close stands): %s",
+                            logger.error("PagerDuty close for %s failed (close stands): %s",
                                          jira_key, exc)
                 else:
                     # Left wherever the walk stalled. Loud, because a half-walked ticket
@@ -2075,6 +2062,7 @@ async def _process_ticket(
                     logger.error("[AUTOCLOSE] %s: close route FAILED — ticket not closed",
                                  jira_key)
                     action_taken = "close_failed"
+                    _close_refusal = await _close_failed_note(jira_key, cfg, dry_run)
         elif result.action == "event_analysis":
             # RETIRED as a state change (2026-09-30), regardless of EDR_USER_CHASE. This is
             # the legacy chase path: it transitions into `Awaiting more inputs` (the Acme
@@ -2149,7 +2137,7 @@ async def _process_ticket(
         _ask_guard = _usb_ask
         _ask_user = (normalized.user if normalized else current_user) or ""
         _ask_reason = "Files copied to a USB drive — only the copier's reason clears it"
-    if (_ask_guard and _may_change_state and action_taken != "auto_closed"
+    if (_ask_guard and _may_change_state and action_taken not in ("auto_closed", "close_failed")
             and cfg.user_chase_enabled):
         _ok_ask, _no_ask = _pvg_ask.may_ask(
             result.triage_class, _ask_ambiguous, is_test,
@@ -2201,13 +2189,14 @@ async def _process_ticket(
     # is written to the ticket. "route" sends it to L2 under the direct-to-L2 gate.
     if action_taken in _RESIDUAL_ACTIONS and not dry_run and not test_labels_only:
         action_taken = await _handle_residual(jira_key, alert_name, cfg, result, action_taken,
-                                              dry_run, test_labels_only)
+                                              dry_run, test_labels_only, _close_refusal)
 
     # Apply labels
     if result.labels:
         await add_labels(jira_key, result.labels, cfg, dry_run=dry_run)
 
     # Persist
+    from edr_triage.normalized import utc_seconds
     triaged = TriagedAlert(
         jira_key=jira_key,
         alert_id=alert_id,
@@ -2225,12 +2214,13 @@ async def _process_ticket(
         ],
         severity=alert_data.get("severity", ticket.get("severity", "")),
         tactics=alert_data.get("mitreTechniques", []) or [],
+        mitre_tactics=_mitre_tactics(ticket, alert_data),
         file_name=evidence.get("file_name", ""),
         file_path=evidence.get("file_path", ""),
         sha256=sha256,
         initiating_process=evidence.get("initiating_process", ""),
         investigation_state=inv_state,
-        alert_time=(alert_data.get("alertCreationTime") or ticket.get("created_at", ""))[:19],
+        alert_time=utc_seconds(alert_data.get("alertCreationTime") or ticket.get("created_at", "")),
         vt_detections=vt.get("detections"),
         vt_total=vt.get("total"),
         vt_verdict=vt.get("verdict", ""),
@@ -2248,11 +2238,41 @@ async def _process_ticket(
     )
     save_triaged_alert(triaged)
 
+    # Replay corpus: inputs and outcome of this live triage (never on a dry run).
+    from edr_triage import replay_corpus
+    await replay_corpus.capture(
+        cfg, dry_run or test_labels_only, jira_key=jira_key, alert_name=alert_name,
+        source=source, playbook=playbook_name, ticket=ticket, alert_data=alert_data,
+        evidence=evidence, sentinel_entities=sentinel_entities, vt=vt,
+        agent_inputs=_corpus_agent_inputs, agent_result=_agent_result, result=result,
+        action_taken=action_taken)
+
+    # PagerDuty (edr_triage/paging_rules.py): after the action, so a ticket RAPTOR just
+    # closed, de-duplicated or sent to a user never pages. Not gated by the agent phase:
+    # paging is a notification, not a ticket change. Best-effort: it must never break triage.
+    if not dry_run:
+        try:
+            from edr_triage.paging_rules import maybe_page
+            await maybe_page(triaged, cfg.jira_url,
+                             (_corpus_agent_inputs or {}).get("evidence") or {})
+        except Exception as exc:
+            logger.error("PagerDuty paging for %s failed (triage unaffected): %s", jira_key, exc)
+
     logger.info(
         "Triaged %s: playbook=%s class=%s action=%s dry_run=%s",
         jira_key, playbook_name, result.triage_class, action_taken, dry_run,
     )
     return triaged
+
+
+def _mitre_tactics(ticket: dict, alert_data: dict) -> list[str]:
+    """Best-effort: a malformed field must never stop the ticket being saved."""
+    try:
+        from edr_triage.paging_rules import tactics_of
+        return tactics_of(ticket.get("tactics") or "", (alert_data or {}).get("category") or "",
+                          (alert_data or {}).get("mitreTechniques") or [])
+    except Exception:
+        return []
 
 
 def _get_playbook(name: str):
@@ -2621,6 +2641,13 @@ def _playbook_state_note(alert_name: str, phase: str) -> str:
                 "ticket itself under a documented rule (our AnyDesk block rule doing its job); "
                 "if it does not, it moves it to L2 Analysis required — analysts raise every "
                 "other such ticket to L2 — and says so in its own comment.")
+    from edr_triage import failed_login_guard
+    if _resolve_agent_phase() == "autonomous" and failed_login_guard.applies(alert_name):
+        return ("*Ticket state:* this recommendation does not decide it. RAPTOR may close the "
+                "ticket itself under a documented rule (a re-fire of failures already ticketed, "
+                "or an exact repeat of failures a person cleared for this user, app and source "
+                "IP); if it does not, it moves it to L2 Analysis required and says so in its own "
+                "comment.")
     if _resolve_agent_phase() == "autonomous" and _l2_direct_family(alert_name):
         if phase == "autonomous":
             return ("*Ticket state:* RAPTOR may close this ticket itself under its rules; if it "
@@ -2673,6 +2700,7 @@ async def _post(jira_key, text, cfg, dry_run, defer: list | None) -> None:
 
 
 RULE_CLOSE_ACTIONS = ("auto_duplicate", "auto_closed_tp", "auto_closed")
+_CHASE_TRIGGER_STATUSES = ("Awaiting more inputs", "No Response")
 
 
 async def _maybe_mark_duplicate(jira_key, alert_name, ticket, sentinel_entities, result, cfg,
@@ -2690,9 +2718,14 @@ async def _maybe_mark_duplicate(jira_key, alert_name, ticket, sentinel_entities,
     cyble = dg.applies_cyble(alert_name)
     sweep = dg.applies_portsweep(alert_name)
     sqlalter = dg.applies_sqlalter(alert_name)
+    from edr_triage import failed_login_guard as flg
+    _fl = (sentinel_entities or {}).get("netskope_failed_login") or {}
+    refire = flg.applies(alert_name) and bool(_fl.get("groups"))
     _rr = (sentinel_entities or {}).get("rule_replay") or {}
     _sql_t = dg.sqlalter_event_time(_rr) if sqlalter else ""
-    if sqlalter:
+    if refire:
+        orig = await flg.find_refire(jira_key, ticket.get("created_at", ""), _fl, cfg)
+    elif sqlalter:
         orig = await dg.find_sqlalter_original(jira_key, ticket.get("created_at", ""), _sql_t, cfg)
     elif sweep:
         orig = await dg.find_portsweep_open(jira_key, ticket.get("created_at", ""), alert_name, cfg)
@@ -2712,7 +2745,9 @@ async def _maybe_mark_duplicate(jira_key, alert_name, ticket, sentinel_entities,
     if sweep:
         _dests = await _portsweep_destinations(ticket)
         _port = dg.PORTSWEEP_RE.match(alert_name).group(1)
-    _say = ((lambda closed: dg.sqlalter_comment(orig["key"], orig["status"], _sql_t,
+    _say = ((lambda closed: flg.refire_comment(orig["key"], orig["status"], _fl, closed))
+            if refire else
+            (lambda closed: dg.sqlalter_comment(orig["key"], orig["status"], _sql_t,
                                                  str(_rr.get("command") or ""), closed))
             if sqlalter else
             (lambda closed: dg.portsweep_comment(orig["key"], orig["status"], _port, _dests, closed))
@@ -2725,7 +2760,8 @@ async def _maybe_mark_duplicate(jira_key, alert_name, ticket, sentinel_entities,
                                              cfg.auto_duplicate_enabled, "EDR_AUTO_DUPLICATE",
                                              brake_pattern=(dg.CYBLE_BRAKE_PATTERN if cyble else
                                                             dg.PORTSWEEP_BRAKE_PATTERN if sweep else
-                                                            dg.SQLALTER_BRAKE_PATTERN if sqlalter else ""))
+                                                            dg.SQLALTER_BRAKE_PATTERN if sqlalter else
+                                                            flg.BRAKE_PATTERN if refire else ""))
     if why:
         logger.info("[DUPLICATE] %s: exact repeat of %s — recommending only (%s)",
                     jira_key, orig["key"], why)
@@ -2795,6 +2831,75 @@ async def _maybe_close_log_ingestion(jira_key, alert_name, result, cfg, dry_run,
         if lab not in result.labels:
             result.labels.append(lab)
     await _post(jira_key, lg.comment(True, reason, stale), cfg, dry_run, defer)
+    return "auto_closed"
+
+
+async def _maybe_close_failed_login(jira_key, alert_name, ticket, sentinel_entities, result, cfg,
+                                    dry_run, test_labels_only, defer: list | None = None) -> str:
+    """"auto_closed" when a Netskope Failed Login is an exact repeat of failures a person
+    closed False Positive for the same user, app and source IP — see failed_login_guard.py —
+    else "". Never on a ticket the agent called URGENT."""
+    from edr_triage import failed_login_guard as flg
+    from edr_triage.jira_handler import walk_to_status
+    fl = (sentinel_entities or {}).get("netskope_failed_login") or {}
+    if not (flg.applies(alert_name) and fl.get("groups")):
+        return ""
+    cur = flg.shape(fl)
+    if result.triage_class == "URGENT":
+        logger.info("[FAILED-LOGIN] %s: left for L2 — the agent called it URGENT", jira_key)
+        return ""
+    if not cur or len(cur["users"]) != 1:
+        ok, reason, used = flg.precedent_decision(cur, [])
+    else:
+        user = next(iter(cur["users"]))
+        try:
+            prec = await flg.cleared_precedents(user, jira_key, cfg)
+        except Exception as exc:
+            logger.warning("[FAILED-LOGIN] %s: precedent lookup failed — left for L2: %s",
+                           jira_key, exc)
+            return ""
+        ok, reason, used = flg.precedent_decision(cur, prec)
+    if not ok:
+        logger.info("[FAILED-LOGIN] %s: left for L2 — %s", jira_key, reason)
+        return ""
+    # Any other open alert on this person is a reason to look, whatever it is; re-fires of
+    # this same alert are not.
+    from entity_graph.query import check_concurrent_alerts
+    try:
+        conc = await check_concurrent_alerts(user_name=user, exclude_jira_key=jira_key,
+                                             reference_time=ticket.get("created_at", ""))
+    except Exception as exc:
+        logger.warning("[FAILED-LOGIN] %s: concurrency check failed — left for L2: %s", jira_key, exc)
+        return ""
+    others = [d for d in (conc or {}).get("open_alert_details") or []
+              if not flg.applies(d.get("alert_name") or "")]
+    if others:
+        logger.info("[FAILED-LOGIN] %s: left for L2 — %d other open alert(s) on %s (%s)", jira_key,
+                    len(others), user, ", ".join(str(d.get("jira_key")) for d in others[:5]))
+        return ""
+    succ = await flg.later_success(ticket.get("incident_url", ""), user, cur["apps"], cur["first"])
+    if succ is not False:
+        logger.info("[FAILED-LOGIN] %s: left for L2 — %s", jira_key,
+                    "a successful login followed" if succ else "could not check for a later success")
+        return ""
+    why = await _deterministic_close_refusal(alert_name, jira_key, cfg, dry_run, test_labels_only,
+                                             cfg.failed_login_close_enabled,
+                                             "EDR_FAILED_LOGIN_CLOSE",
+                                             brake_pattern=flg.BRAKE_PATTERN)
+    if why:
+        logger.info("[FAILED-LOGIN] %s: would close (%s) — not closing: %s", jira_key, reason, why)
+        if flg.REC_LABEL not in result.labels:
+            result.labels.append(flg.REC_LABEL)
+        return ""
+    if not await walk_to_status(jira_key, cfg.close_route(), cfg, forbidden=cfg.close_forbidden()):
+        logger.error("[FAILED-LOGIN] %s: close route FAILED — ticket not closed", jira_key)
+        return "close_failed"
+    logger.info("[FAILED-LOGIN] %s: closed False Positive — %s (%s)", jira_key, reason,
+                ", ".join(p["key"] for p in used))
+    for lab in (flg.CLOSE_LABEL, "raptor-autoclosed"):
+        if lab not in result.labels:
+            result.labels.append(lab)
+    await _post(jira_key, flg.close_comment(cur, used), cfg, dry_run, defer)
     return "auto_closed"
 
 
@@ -3044,8 +3149,42 @@ def _residual_report_only(alert_name: str) -> bool:
     return applies_cyble(alert_name) or (alert_name or "").strip().casefold() == "netskope dlp alerts"
 
 
+async def _close_failed_note(jira_key: str, cfg, dry_run: bool) -> str:
+    """Say on the ticket that the close was allowed but Jira would not take it, and return the
+    reason. DEMO-115106 (re-triaged in L2 Analysis required, 2026-11-20): "Auto-close permitted"
+    was followed by "asking the user ... the agent asked for a business justification" — the
+    walk had stalled (no Assigned hop from L2 Analysis required) and the ask step ran on a
+    ticket RAPTOR had just cleared. A failed close never asks the user."""
+    from edr_triage.jira_handler import add_comment, get_status
+    try:
+        st = (await get_status(jira_key, cfg)) or "its current status"
+    except Exception:
+        st = "its current status"
+    why = f"the close was permitted, but Jira would not move the ticket from {st} to False Positive"
+    try:
+        await add_comment(jira_key, (
+            "*RAPTOR did not close this ticket.*\n\n"
+            f"The checks allowed an auto-close, but Jira would not move the ticket from {st} to "
+            "False Positive, so it is left for the analyst. Nobody was messaged.\n\n"
+            "[Auto-triaged by RAPTOR]"), cfg, dry_run=dry_run)
+    except Exception as exc:
+        logger.error("close-failed note on %s failed: %s", jira_key, exc)
+    return why
+
+
+def _residual_why(result, close_refusal: str) -> str:
+    """The reason on the L2 move. When the agent called it FP and a close gate refused it, say
+    which gate: DEMO-123173 read "AUTO-FP 95%" then "could not settle it", and the privesc
+    guard's reason (no human-cleared session for that host) was only a label."""
+    r = (close_refusal or "").strip().rstrip(".")
+    if r and getattr(result, "triage_class", "") == "AUTO_CLOSED_FP":
+        return ("the agent judged it a false positive, but RAPTOR's close check refused the "
+                f"close ({r[:300]}), so it needs an analyst")
+    return "RAPTOR could not settle it on the evidence, so it needs an analyst"
+
+
 async def _handle_residual(jira_key: str, alert_name: str, cfg, result, action_taken: str,
-                           dry_run: bool, test_labels_only: bool) -> str:
+                           dry_run: bool, test_labels_only: bool, close_refusal: str = "") -> str:
     """Note (or, in route mode, route) a ticket RAPTOR is leaving for an analyst. Never
     raises and never writes to the ticket in record mode."""
     mode = (getattr(cfg, "residual_mode", "off") or "off").lower()
@@ -3077,7 +3216,7 @@ async def _handle_residual(jira_key: str, alert_name: str, cfg, result, action_t
                 result.labels.append("needs-l2-review")
             return await _execute_l2_route(
                 jira_key, cfg, result, dry_run,
-                why="RAPTOR could not settle it on the evidence, so it needs an analyst")
+                why=_residual_why(result, close_refusal))
     except Exception as exc:
         logger.warning("[RESIDUAL] %s: %s", jira_key, exc)
     return action_taken
@@ -3551,7 +3690,7 @@ def sticky_keep_stored(field: str, new_value, stored_value, user_rebound: bool) 
     days later, so the re-triage overwrote a correct actor with "". A fetch that comes
     back empty is MISSING information, not a finding that the actor is unknown — and the
     blanked ticket then had no principal at all, at which point the agent invented one
-    (jamie.w@example.com, an identity with zero rows anywhere in the tenant) and
+    (adelev@example.com, an identity with zero rows anywhere in the tenant) and
     investigated that instead.
 
     One-directional: a NEW non-empty value always wins (a genuine re-bind, or a

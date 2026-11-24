@@ -180,8 +180,11 @@ def summarize_rows(rows: list[dict], anchor=None) -> dict:
     op     = _first(_OP_COLS)
     cmd    = _first(_CMD_COLS)
 
-    # URLs across all rows (benign-source hinting reuse).
-    urls = sorted({m.group(0) for r in rows for v in r.values()
+    # URLs across all rows (benign-source hinting reuse). Credential query values are
+    # redacted: CanaryTokens_CL rows carry canarytokens.org manage/history links whose
+    # `auth=` lets anyone disable the token, and these URLs are posted to Jira.
+    from edr_triage.canary_guard import redact_url_secrets
+    urls = sorted({redact_url_secrets(m.group(0)) for r in rows for v in r.values()
                    if isinstance(v, str) for m in [_URL_RE.search(v)] if m})
 
     # #4: allowlisted display fields from the primary row. Match on the base name
@@ -199,7 +202,7 @@ def summarize_rows(rows: list[dict], anchor=None) -> dict:
         if pair in seen:
             continue
         seen.add(pair)
-        fields[base] = s
+        fields[base] = redact_url_secrets(s)
 
     # Distinct process/command per row across the WHOLE result set — for
     # multi-process hunting alerts ("rare process as a service"), this is the

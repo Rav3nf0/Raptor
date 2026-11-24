@@ -54,6 +54,9 @@ class Finding(Document):
     # non-empty reason keeps the finding out of ai=fp, so bulk-snoozing AI FPs cannot bury it.
     ai_attention: str = ""
     ai_agreed: Optional[bool] = None
+    # The grouped review's full investigation (shadow_ai_trail): case file, every check and its
+    # result, Opus's checklist. A manual pass continues from it instead of starting over.
+    ai_trail_id: str = ""
     # Incident story this finding was grouped into (shadow_hunter/stories.py); "" when none.
     story_id: str = ""
     # Slack alert sent for this finding (shadow_hunter/notify.py); None = not announced.

@@ -109,7 +109,8 @@ def _fp(gid, **kw):
 async def _db(name):
     mm = pytest.importorskip("mongomock_motor")
     from beanie import init_beanie
-    await init_beanie(database=mm.AsyncMongoMockClient()[name], document_models=[Finding, AuditLog, Story])
+    from entity_graph.models import ShadowResult
+    await init_beanie(database=mm.AsyncMongoMockClient()[name], document_models=[Finding, AuditLog, Story, ShadowResult])
 
 
 def _patch(monkeypatch):
@@ -174,7 +175,7 @@ def test_opus_may_ask_for_one_kql_check_and_decides_again(monkeypatch):
     assert any(e.startswith("check: mde KQL") for e in f.ai_evidence)
 
 
-def test_opus_unavailable_falls_back_to_the_gatherer_but_never_fp_on_high(monkeypatch):
+def test_opus_unavailable_records_no_verdict(monkeypatch):
     _patch(monkeypatch)
 
     class Down:
@@ -191,8 +192,9 @@ def test_opus_unavailable_falls_back_to_the_gatherer_but_never_fp_on_high(monkey
         return r, await Finding.get(hi.id), await Finding.get(lo.id)
     r, hi, lo = asyncio.run(go())
     assert r["fallback"] == 2
-    assert hi.ai_verdict == "unsure" and lo.ai_verdict == "false_positive"
-    assert hi.ai_by.startswith("ai:mistral") and hi.ai_prompt_version.endswith("-fallback")
+    # no Mistral verdict: both stay open for the next run or a manual pass
+    assert not hi.ai_verdict and not lo.ai_verdict and not hi.ai_by
+    assert "Opus unavailable" in hi.ai_error and "Opus unavailable" in lo.ai_error
 
 
 def test_review_mode_needs_claude(monkeypatch):
@@ -202,3 +204,69 @@ def test_review_mode_needs_claude(monkeypatch):
     monkeypatch.delenv("SHADOW_AI_MODE")
     monkeypatch.setenv("SHADOW_LLM", "mistral")
     assert not R.enabled_review()
+
+
+def test_the_case_file_reaches_opus_with_secrets_redacted_and_ids_masked(monkeypatch):
+    _patch(monkeypatch)
+
+    async def go():
+        await _db("review_clean")
+        f = F(1, "h1", sev="high", det="lolbin_abuse",
+              ind="curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456' --password=Hunter2pass "
+                  "arn:aws:iam::111122223333:role/x")
+        await Finding(**f.model_dump()).insert()
+        o = Opus([[_fp("g1")]])
+        await R.run(NOW, opus=o, gatherer=Gatherer(), tools=[], execute=None, pace_s=0)
+        return o.calls[0][1]["content"]
+    body = asyncio.run(go())
+    assert "abcdefghijklmnopqrstuvwxyz123456" not in body and "3456>" in body     # last 4 kept
+    assert "Hunter2pass" not in body and "111122223333" not in body
+
+
+def test_environment_knowledge_is_in_the_cached_prompt(monkeypatch):
+    monkeypatch.setenv("SHADOW_ENV_NOTES", "- build-01 runs nightly pentests")
+    p = R.system_prompt("short")
+    assert "IronWatch" in p and "203.0.113.10" in p and "build-01 runs nightly pentests" in p
+
+
+def test_depth_scales_with_need_and_the_trail_is_stored(monkeypatch):
+    _patch(monkeypatch)
+    calls = []
+
+    async def fake_need(need, f, execute):
+        calls.append(need["tool"])
+        return need["tool"], ({"error": "timeout"} if need["tool"] == "boom" else {"rows": [need["tool"]]})
+    monkeypatch.setattr(R, "run_need", fake_need)
+    unsure = lambda t: {"id": "g1", "verdict": "unsure", "checklist": {"benign_explanation": "none", "missing": "edge logs"},
+                        "need": {"tool": t}}
+
+    async def go():
+        await _db("review_depth")
+        calm = F(1, "h1", sev="low")
+        await Finding(**calm.model_dump()).insert()
+        # routine but unsure: up to 4 checks, an errored one retried for free
+        o = Opus([[unsure("boom")], [unsure("a")], [unsure("b")], [unsure("c")], [unsure("d")],
+                  [{**unsure("e"), "need": None}]])
+        await R.run(NOW, opus=o, gatherer=Gatherer(), tools=[], execute=None, pace_s=0)
+        routine_calls = list(calls)
+        f = await Finding.get(calm.id)
+        trail = await R._db()[R.TRAIL_COLL].find_one({"_id": f.ai_trail_id})
+        return routine_calls, f, trail
+    routine_calls, f, trail = asyncio.run(go())
+    assert routine_calls[:5] == ["boom", "a", "b", "c", "d"]          # 1 retry + 4 checks
+    assert f.ai_trail_id and trail["finding_ids"] == [f.id]
+    assert [c["what"] for c in trail["checks"] if not c["what"].startswith("AUTO")] == ["boom", "a", "b", "c", "d"]
+    assert trail["decision"]["checklist"]["missing"] == "edge logs"
+    assert f.ai_evidence[0] == "missing: edge logs"
+
+
+def test_prefetch_looks_up_public_ips_at_the_edge_but_never_the_shared_nat():
+    seen = []
+
+    async def ex(tool, args):
+        seen.append((tool, args["ip"], args["source"]))
+        return {"rows": []}
+    f = F(1, "h1", det="edge_attacks", ind="198.51.100.44 and 203.0.113.10 hit /actuator")
+    out = asyncio.run(R.prefetch(f, ex))
+    assert seen == [("hunt_vlogs", "198.51.100.44", "edge")]
+    assert out[0]["what"].startswith("AUTO edge activity of 198.51.100.44")

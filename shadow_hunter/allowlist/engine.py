@@ -108,7 +108,9 @@ class AllowlistEngine:
         """Tag each finding with allowlisted_by_rule if matched."""
         for f in findings:
             rule = self.match(f)
-            f["allowlisted_by_rule"] = rule.name if rule else ""
+            # A detector may already have suppressed a finding with a rule a yaml match cannot
+            # express (upwind's time-boxed IronWatch window); keep it rather than clear it.
+            f["allowlisted_by_rule"] = rule.name if rule else f.get("allowlisted_by_rule", "")
         return findings
 
     @staticmethod

@@ -86,7 +86,7 @@ def _arn_session_user(arn: str) -> str:
     person was unresolvable, so RAPTOR never asked them (DEMO-115923, 2026-10-06) — and the
     same person seen with and without it counted as two actors. Only the
     `jit-<a>-<b>-<email>` form is stripped; the console/S3 form that encodes the address
-    (`jit-console-t-security-jordan-blake-at-acme-in`) is left as it is rather than guessed.
+    (`jit-console-t-security-saurav-sagar-at-acme-in`) is left as it is rather than guessed.
     """
     if not arn or "assumed-role/" not in arn:
         return ""
@@ -422,6 +422,24 @@ class GenericPlaybook(BasePlaybook):
         file_path = n.file_path
         sha256    = n.sha256
         init_proc = n.initiating_process
+
+        # ── Canary token: which tripwire fired and whether one of ours walked into it
+        #    (canary_guard.py). Replaces the rule-replay dump, which named neither the
+        #    token type nor the visitor's network and invited a "service activity" close.
+        from edr_triage import canary_guard
+        if canary_guard.applies(alert_name):
+            chk = await canary_guard.check(
+                (alert or {}).get("alertCreationTime") or alert_time or "")
+            lines = ["Hi Team,", "", f"We have observed a *{alert_name}* alert.", ""]
+            lines += canary_guard.l1_comment_lines(chk)
+            lines += ["", "[Auto-triaged by RAPTOR]"]
+            return PlaybookResult(
+                l1_comment="\n".join(lines),
+                triage_class="NEEDS_L2",
+                action="labels_only",
+                labels=["needs-l2-review", "edr-triage-ai", canary_guard.LABEL],
+                auto_close=False,
+            )
 
         # ── Rule-replay evidence (Sentinel scheduled/NRT alert with empty
         #    entities, enriched by re-running the triggering analytics rule) ──

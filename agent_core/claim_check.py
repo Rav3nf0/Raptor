@@ -122,3 +122,87 @@ def ungrounded_values(reasoning: str, tool_calls: list, evidence: dict | None = 
                     and v not in out and len(out) < 6):
                 out.append(v)
     return out
+
+
+# A close that rests on a specific GRANT — an exception, an approval by someone, a change
+# ticket, an allowlist entry, a planned window, a person's confirmation — must rest on one
+# the model was actually shown. Generic words ("authorized activity", "approved folders")
+# are paraphrase of precedents (37 of the 56 such closes in the 21 days to 2026-11-09) and
+# are not checked. The test is the model's own input: DEMO-119919's "the user was granted an
+# exception" looked invented and was not — parker wrote it on DEMO-115148/115090, which the
+# precedents carried. A word list alone would have blocked a correct close.
+# (label, claim in the reasoning, what the model must have seen to say it)
+_GRANTS = (
+    # A person's exception only — "granted/given an exception", "exception was approved".
+    # RAPTOR's own policy exceptions ("the EXACT COMMAND MATCH exception", "the exception for
+    # this alert type", DEMO-118578/119093) live in the fixed guidance and are not grants.
+    ("an exception granted",
+     re.compile(r"\b(?:granted|given|approved|issued)\b[^.]{0,30}\bexceptions?\b"
+                r"|\bexceptions?\b[^.]{0,25}\b(?:was |were |has been |had been )?"
+                r"(?:granted|given|approved|issued)\b", re.I),
+     re.compile(r"\bexception", re.I)),
+    ("a change ticket",
+     re.compile(r"\bchange (?:ticket|request)\b|\bCHG\d+", re.I),
+     re.compile(r"\bchange (?:ticket|request)|\bchg\d+|\bcr[- ]?\d+", re.I)),
+    ("a planned window",
+     re.compile(r"\bplanned (?:maintenance|activity|activities|window|change)\b", re.I),
+     re.compile(r"\bplanned\b|\bmaintenance\b", re.I)),
+    ("an allowlist entry",
+     re.compile(r"\b(?:white|allow)[- ]?list(?:ed|ing)?\b", re.I),
+     re.compile(r"\b(?:white|allow)[- ]?list|known[-_ ]good", re.I)),
+    ("a named approval",
+     re.compile(r"\bapproved by\b|\bapproval (?:from|by|of)\b|\bsigned[- ]off\b|\bpre-?approv", re.I),
+     re.compile(r"\bapprov|\bsign(?:ed)?[- ]off", re.I)),
+    ("a person's confirmation",
+     re.compile(r"\b(?:user|manager|owner|employee)s?\s+(?:has\s+|had\s+)?(?:confirmed|explained|"
+                r"justified|approved)\b|\bconfirmed by (?:the )?(?:user|manager|owner|employee)\b",
+                re.I),
+     re.compile(r"\bconfirm|\bjustif|\bexplain|\bas per the", re.I)),
+)
+
+
+# A recommendation is not a claim: "Update the whitelist to include `CxAudioSvc.exe`"
+# (DEMO-121040), "consider adding an exception".
+_ADVICE = re.compile(
+    r"^\W*(?:update|add|consider|recommend|request|create|raise|document|ask|tune)\b"
+    r"|\b(?:should|recommend(?:ed)?|consider|to prevent recurrence|needs? (?:to be )?updat)", re.I)
+
+
+def unbacked_grants(reasoning, seen: str) -> list[str]:
+    """Labels of grants the reasoning relies on that appear nowhere in what the model was
+    shown (`seen`: its prompt, tool results and evidence — never its own replies).
+    Negated sentences ("no change ticket was found") are not claims."""
+    text = reasoning if isinstance(reasoning, str) else " ".join(map(str, reasoning or []))
+    if not text.strip():
+        return []
+    out: list[str] = []
+    for sentence in _SENTENCE.split(text):
+        if (_NEGATED.search(sentence) or re.search(r"\bno\b", sentence, re.I)
+                or _ADVICE.search(sentence)):
+            continue
+        for label, claim, backing in _GRANTS:
+            if label not in out and claim.search(sentence) and not backing.search(seen or ""):
+                out.append(label)
+    return out
+
+
+def seen_text(messages: list, tool_calls: list, evidence: dict | None = None,
+              alert: dict | None = None, static_prompt: str = "",
+              skip: tuple = ()) -> str:
+    """What the model was shown about THIS ticket: its prompt minus the fixed guidance
+    (`static_prompt`, which itself says "confirm", "exception", "allowlist" in general
+    terms and would back any claim), tool results, evidence and the alert. Its own replies
+    and the gate's nudges (`skip`, by identity) are left out, so a claim cannot back itself."""
+    import json
+    parts = []
+    for m in messages or []:
+        if (m or {}).get("role") == "assistant" or any(m is x for x in skip):
+            continue
+        c = m.get("content")
+        c = c if isinstance(c, str) else json.dumps(c, default=str)
+        if static_prompt and m.get("role") == "system":
+            c = c.replace(static_prompt, "")
+        parts.append(c)
+    parts += [json.dumps(getattr(tc, "result", None), default=str) for tc in tool_calls or []]
+    parts += [json.dumps(evidence or {}, default=str), json.dumps(alert or {}, default=str)]
+    return "\n".join(parts)

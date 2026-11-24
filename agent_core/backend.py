@@ -488,18 +488,39 @@ class BedrockBackend(LLMBackend):
             kwargs["system"] = system + ([{"cachePoint": {"type": "default"}}] if self.cache_system else [])
         if tool_config:
             kwargs["toolConfig"] = tool_config
-        if int(self.thinking_budget or 0) > 0:
+        effort = (getattr(self, "claude_effort", "") or "").strip().lower()
+        if effort:
+            # Newer Claude (Opus 5, 2026-11): no temperature; depth is effort, and a call that
+            # asked for thinking gets adaptive thinking rather than a fixed token budget.
+            kwargs["inferenceConfig"].pop("temperature", None)
+            extra: dict = {"output_config": {"effort": effort}}
+            if int(self.thinking_budget or 0) > 0:
+                extra["thinking"] = {"type": "adaptive"}
+            kwargs["additionalModelRequestFields"] = extra
+        elif int(self.thinking_budget or 0) > 0:
             # Claude requires the default temperature with thinking, and maxTokens above the budget.
             kwargs["additionalModelRequestFields"] = {
                 "thinking": {"type": "enabled", "budget_tokens": int(self.thinking_budget)}}
             kwargs["inferenceConfig"].pop("temperature", None)
             kwargs["inferenceConfig"]["maxTokens"] = max(self.max_tokens, int(self.thinking_budget) + 2048)
 
+        client = boto3.client("bedrock-runtime", region_name=self.region,
+                              config=_boto_config(getattr(self, "timeout", 0)))
         try:
-            client = boto3.client("bedrock-runtime", region_name=self.region,
-                                  config=_boto_config(getattr(self, "timeout", 0)))
             resp = client.converse(**kwargs)
-        except (ClientError, BotoCoreError) as exc:
+        except ClientError as exc:
+            # If Bedrock rejects the effort/thinking fields for this model, run the call plain
+            # once rather than fail it; the warning says which field to revisit.
+            if not (effort and exc.response.get("Error", {}).get("Code") == "ValidationException"):
+                raise OllamaUnavailableError(f"Bedrock converse failed ({self.model_id}): {exc}") from exc
+            logger.warning("[BEDROCK] %s rejected effort/thinking fields, retrying without them: %s",
+                           self.model_id, exc)
+            kwargs.pop("additionalModelRequestFields", None)
+            try:
+                resp = client.converse(**kwargs)
+            except (ClientError, BotoCoreError) as exc2:
+                raise OllamaUnavailableError(f"Bedrock converse failed ({self.model_id}): {exc2}") from exc2
+        except BotoCoreError as exc:
             raise OllamaUnavailableError(f"Bedrock converse failed ({self.model_id}): {exc}") from exc
 
         usage = resp.get("usage", {})
@@ -632,6 +653,27 @@ def _sigv4_headers(method: str, url: str, body: str, headers: dict,
     SigV4Auth(creds, service, region).add_auth(req)
     prepped = req.prepare()
     return {k: v for k, v in dict(prepped.headers).items() if v is not None}
+
+
+async def mantle_models() -> list[str]:
+    """Model ids the Mantle project serves (GET /v1/models), signed like every Mantle call.
+    For finding the Claude id to put in SHADOW_CLAUDE_MODEL."""
+    import json as _json
+
+    import httpx
+    m = MantleBackend()
+    url = f"{m.base_url}/models"
+    headers = {"OpenAI-Project": m.project}
+    if m.auth_mode == "apikey" and m.api_key:
+        headers["Authorization"] = f"Bearer {m.api_key}"
+    else:
+        headers = _sigv4_headers("GET", url, "", headers, m.region, m.sigv4_service)
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(url, headers=headers)
+    if resp.status_code >= 300:
+        raise OllamaUnavailableError(f"Mantle /models {resp.status_code}: {resp.text[:300]}")
+    data = _json.loads(resp.text).get("data") or []
+    return sorted(str(d.get("id", "")) for d in data if d.get("id"))
 
 
 class MantleBackend(LLMBackend):
@@ -800,21 +842,27 @@ class MantleBackend(LLMBackend):
             "aws_region": self.region,
             "default_headers": {"anthropic-workspace-id": self.project},
         }
-        if self.api_key:
+        # Same auth as the Mistral path: SigV4 with the pod's IRSA role unless MANTLE_AUTH=apikey.
+        # The MANTLE_API secret holds a key Mantle rejects (401 invalid_api_key), so passing it
+        # whenever it is present would fail every Claude call.
+        if self.auth_mode == "apikey" and self.api_key:
             client_kwargs["api_key"] = self.api_key
         client = AsyncAnthropicBedrockMantle(**client_kwargs)
         kwargs: dict = {
             "model": self.model_id,
             "max_tokens": self.max_tokens,
-            "temperature": _effective_temperature(self.temperature),
             "messages": conv,
         }
-        # Extended thinking (the close reviewer sets thinking_budget). Claude requires the
-        # default temperature when thinking is on, so the override is dropped.
+        # No temperature: the current SDK's messages.create() rejects it (2026-11-04,
+        # anthropic.claude-opus-5). Effort is medium for every call (the user's call,
+        # 2026-11-04); only a call that asked for thinking (Opus on high/critical groups and
+        # stories, the close reviewer) also gets adaptive thinking.
         _think = int(getattr(self, "thinking_budget", 0) or 0)
         if _think > 0:
-            kwargs["thinking"] = {"type": "enabled", "budget_tokens": _think}
-            kwargs.pop("temperature", None)
+            kwargs["thinking"] = {"type": "adaptive"}
+            kwargs["output_config"] = {"effort": os.getenv("CLAUDE_EFFORT_THINKING", "medium").strip().lower()}
+        else:
+            kwargs["output_config"] = {"effort": os.getenv("CLAUDE_EFFORT", "medium").strip().lower()}
         if system:
             kwargs["system"] = ([{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
                                 if getattr(self, "cache_system", False) else system)
@@ -907,15 +955,28 @@ def get_internal_backend() -> LLMBackend:
     return MantleBackend()       # mantle (default) + any unrecognized value
 
 
+# /shadow runs on Claude by default (2026-11-03, the user's call): Mistral gathers evidence,
+# Opus decides. Until a model id is known (set it here or SHADOW_CLAUDE_MODEL), an unset
+# SHADOW_LLM stays on Mistral rather than failing every call; SHADOW_LLM=claude with no id
+# fails loudly, and SHADOW_LLM=mistral goes back to Mistral only. RAPTOR never reads these.
+# AWS support (2026-11-13): Opus 5 is NOT served for inference on Mantle in ap-south-1 (the
+# catalogue lists it, every call 404s). Bedrock Runtime with the India cross-region profile
+# keeps processing in ap-south-1/ap-south-2; the base model id is not invocable on-demand.
+DEFAULT_SHADOW_CLAUDE_MODEL = "in.anthropic.claude-opus-5"
+
+
 def shadow_llm() -> str:
-    """Which model family /shadow uses: "mistral" (default, the shared in-region backend) or
-    "claude" (SHADOW_LLM=claude). RAPTOR ticket triage never reads this."""
-    return "claude" if os.getenv("SHADOW_LLM", "mistral").strip().lower() == "claude" else "mistral"
+    """Which model family /shadow uses: "claude" (default once a Claude model id is set) or
+    "mistral" (the shared in-region backend). RAPTOR ticket triage never reads this."""
+    want = os.getenv("SHADOW_LLM", "").strip().lower()
+    if want:
+        return "claude" if want == "claude" else "mistral"
+    return "claude" if os.getenv("SHADOW_CLAUDE_MODEL", DEFAULT_SHADOW_CLAUDE_MODEL).strip() else "mistral"
 
 
 def shadow_model_id() -> str:
     if shadow_llm() == "claude":
-        return os.getenv("SHADOW_CLAUDE_MODEL", "").strip()
+        return os.getenv("SHADOW_CLAUDE_MODEL", DEFAULT_SHADOW_CLAUDE_MODEL).strip()
     return os.getenv("AGENT_MODEL", "mistral.mistral-large-3-675b-instruct")
 
 
@@ -928,11 +989,15 @@ def get_shadow_backend(thinking: bool = False) -> LLMBackend:
                                    (required; Anthropic models in ap-south-1 are reached through a
                                    cross-region inference profile — apac.* keeps inference in APAC
                                    regions, global.* may route anywhere)
-      SHADOW_CLAUDE_TRANSPORT      "runtime" (default: bedrock-runtime Converse, needs
-                                   bedrock:InvokeModel on the profile) or "mantle" (the Mantle
-                                   gateway's Anthropic path, like the close reviewer)
+      SHADOW_CLAUDE_TRANSPORT      "runtime" (default: bedrock-runtime Converse with the IRSA role,
+                                   needs bedrock:InvokeModel on the in.* profile and the model in
+                                   ap-south-1/ap-south-2; Opus 5 is not on Mantle in ap-south-1,
+                                   per AWS support 2026-11-13) or "mantle" (Mantle Anthropic path)
       SHADOW_CLAUDE_MAX_TOKENS     default 16000
-      SHADOW_CLAUDE_THINKING_TOKENS  extended thinking for single-shot calls (thinking=True),
+      CLAUDE_EFFORT / CLAUDE_EFFORT_THINKING  mantle transport: effort for ordinary calls and
+                                   for thinking=True calls (both default medium); thinking=True
+                                   calls also get adaptive thinking; no temperature is sent
+      SHADOW_CLAUDE_THINKING_TOKENS  runtime transport: extended thinking for single-shot calls (thinking=True),
                                    default 6000; tool loops always run without it
       SHADOW_CLAUDE_TIMEOUT        seconds, default 300
     Anything else: the shared internal backend (Mistral on Mantle), exactly as before.
@@ -954,4 +1019,6 @@ def get_shadow_backend(thinking: bool = False) -> LLMBackend:
     b.max_tokens = int(os.getenv("SHADOW_CLAUDE_MAX_TOKENS", "16000"))
     b.timeout = int(os.getenv("SHADOW_CLAUDE_TIMEOUT", "300"))
     b.thinking_budget = int(os.getenv("SHADOW_CLAUDE_THINKING_TOKENS", "6000")) if thinking else 0
+    if isinstance(b, BedrockBackend):           # Opus 5 on Converse: effort, no temperature
+        b.claude_effort = os.getenv("CLAUDE_EFFORT_THINKING" if thinking else "CLAUDE_EFFORT", "medium")
     return b

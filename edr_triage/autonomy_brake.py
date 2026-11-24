@@ -42,7 +42,11 @@ DEFAULT_REARM = {
     # 118678 is a different user and file from the same CASB scan wave, which the L1 closed
     # False Positive himself — a bulk-close habit, not a dispute that the file was benign.
     # Re-armed just after it.
-    "netskope dlp alerts": "2026-10-26T07:54:00+00:00",
+    # DEMO-120563 (2026-11-04 19:55 UTC): an L1 filed it Duplicate seconds before RAPTOR's
+    # close, RAPTOR then moved it to False Positive and the L1 moved it back — a race, not a
+    # dispute. RAPTOR no longer moves a ticket someone else closed, and FP <-> Duplicate is no
+    # longer read as a reopen. Re-armed just after it.
+    "netskope dlp alerts": "2026-11-04T19:56:00+00:00",
     # DEMO-116082 (2026-10-07 10:35 UTC): an L1 reopened a correct close that listed only
     # retired tables, after RAPTOR's own comments wrongly said "escalate to L2" (fixed in the
     # same change). Re-armed just after it.
@@ -55,13 +59,17 @@ DEFAULT_REARM = {
     # DEMO-118428 (2026-10-23 21:55 UTC): a 7680 re-fire RAPTOR folded as Duplicate, re-filed
     # False Positive by an L1 an hour later — agreement, not an overturn. Re-armed after it.
     r"^\s*network port sweep detected on": "2026-10-23T21:56:00+00:00",
-    # Cyble digests (duplicate_guard.CYBLE_BRAKE_PATTERN, all services).
+    # Threat-intel digests (duplicate_guard.CYBLE_BRAKE_PATTERN, all services).
     # DEMO-118854 (2026-10-27 06:02 UTC): RAPTOR
     # closed a twin copy Duplicate and an L1 re-filed it False Positive the next minute —
     # agreement, not an overturn — which stopped every Cyble twin and close. Re-armed after it.
     r"^\s*[Ff]ound\s+\d+\s+alerts?\s+for\s": "2026-10-27T06:03:00+00:00",
     r"^\s*[Ff]ound\s+\d+\s+alerts?\s+for\s+[Ss]ocial\s+[Mm]edia\s+[Mm]onitoring\s":
         "2026-10-27T06:03:00+00:00",
+    # DEMO-119202 (2026-10-28): an L1 reopened a close of blair Nadar's D:\busywin writes, the
+    # SATA DVD-drive rule artifact IT already confirmed benign (G14 drive_check proves no
+    # removable drive). Re-armed by the user's call on 2026-11-02.
+    "files copied to usb drives": "2026-11-02T06:00:00+00:00",
 }
 
 

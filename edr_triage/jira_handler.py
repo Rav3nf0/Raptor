@@ -438,6 +438,10 @@ async def transition_to_status(
         return False
 
 
+_TERMINAL_STATUSES = frozenset(("false positive", "duplicate", "closed", "resolved", "done",
+                                "no response"))
+
+
 async def walk_to_status(
     issue_key: str,
     route: list[str],
@@ -479,6 +483,13 @@ async def walk_to_status(
     if current and current.lower() == target.lower():
         logger.info("walk_to_status(%s): already %s — nothing to do", issue_key, target)
         return True
+    # Someone closed it while RAPTOR was working (seconds apart). Their close stands: DEMO-120563
+    # was filed Duplicate by an L1, RAPTOR then moved it to False Positive, the L1 moved it
+    # back, and the brake read that as an overturn and stopped DLP autonomy for a day.
+    if current and current.lower() in _TERMINAL_STATUSES:
+        logger.info("walk_to_status(%s): already closed as %r by someone else — not moving it "
+                    "to %r", issue_key, current, target)
+        return False
 
     # Resume mid-route when the ticket has already advanced past some hops.
     remaining = route
@@ -612,7 +623,7 @@ async def get_description_adf(
 
 
 def _find_involved_users_row(adf: dict) -> Optional[list]:
-    """Locate the description's `table` node and return the row (list of 2 cells)
+    """Locate the description's `table` node(s) and return the row (list of 2 cells)
     whose first cell reads "Involved User(s)", or None if there is no such table/row.
 
     Sentinel/MDE tickets carry the description as ONE `table` node of label/value row
@@ -626,15 +637,12 @@ def _find_involved_users_row(adf: dict) -> Optional[list]:
 
     if not isinstance(adf, dict):
         return None
-    table = None
-    for node in adf.get("content") or []:
-        if node.get("type") == "table":
-            table = node
-            break
-    if table is None:
-        return None
+    # Every top-level table, not just the first: a multi-paragraph Incident description
+    # splits the source table in two, leaving Involved Users in the second (DEMO-121856,
+    # which was then left unrouted as "no Involved Users row").
+    tables = [n for n in adf.get("content") or [] if n.get("type") == "table"]
     label_re = re.compile(r"^\s*involved\s+users?\s*$", re.IGNORECASE)
-    for row in table.get("content") or []:
+    for row in (r for t in tables for r in t.get("content") or []):
         cells = row.get("content") or []
         # A label-only row is the NORMAL shape on a fresh ticket: the source system
         # emits "Involved Users" with no value cell at all, and the cell only appears

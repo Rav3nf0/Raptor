@@ -96,3 +96,29 @@ def test_dismissing_rdp_allowlists_the_pair_not_the_account():
     assert eng.match({"detector": "unusual_remote_logons", "indicator": "rms.a1@rms-nt-admin-09.corp.example.com"})
     assert not eng.match({"detector": "unusual_remote_logons", "indicator": "rms.a1@prod-db-01.corp.example.com"})
     assert not eng.match({"detector": "unusual_remote_logons", "indicator": "xrms.a1@rms-nt-admin-09.corp.example.com"})
+
+
+def test_upwind_automation_rules_are_narrow():
+    from pathlib import Path
+    from shadow_hunter.allowlist import AllowlistEngine
+    eng = AllowlistEngine.load(Path(__file__).parent / "allowlist" / "rules.yaml")
+    def hit(ind):
+        return eng.match({"detector": "upwind_threats", "indicator": ind, "raw": {}})
+    assert hit("administrative policy attached to iam role|stacksets-exec-07a82a7a744716af|2026-11-03")
+    assert hit("kubernetes attack tool executed|kube-bench-cis|2026-11-02")
+    assert hit("a security group inbound rule was modified by assumed role to allow unrestricted traffic (0.0.0.0/0) on other ports|k8s-upositionapiservi-5c03a5d679|2026-11-01")
+    # look-alikes stay visible
+    assert not hit("administrative policy attached to iam role|evil-admin|2026-11-03")
+    assert not hit("kubernetes attack tool executed|payin-service|2026-11-02")
+    assert not hit("a security group inbound rule was modified by assumed role to allow unrestricted traffic (0.0.0.0/0) on other ports|uat::ap-south-1::sg-0571|2026-11-01")
+
+
+def test_rdsadmin_rule_covers_only_its_access_denied():
+    from pathlib import Path
+    from shadow_hunter.allowlist import AllowlistEngine
+    eng = AllowlistEngine.load(Path(__file__).parent / "allowlist" / "rules.yaml")
+    m = lambda ind: eng.match({"detector": "rds_audit", "indicator": ind, "raw": {}})
+    assert m("access_denied|prod-campaign-service-v2|rdsadmin|localhost|2026-11-05")
+    assert not m("account_change|prod-campaign-service-v2|rdsadmin|localhost|2026-11-05")
+    assert not m("access_denied|prod-campaign-service-v2|rdsadmin|10.1.2.3|2026-11-05")
+    assert not m("access_denied|prod-campaign-service-v2|root|localhost|2026-11-05")

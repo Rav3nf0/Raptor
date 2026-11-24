@@ -103,3 +103,23 @@ def test_startup_folder_scripts_count_shortcuts_do_not():
     assert r'FolderPath has @"\Start Menu\Programs\Startup\"' in kql
     assert "(cmd|bat|vbs|vbe|js|jse|wsf|ps1|hta|exe|scr|com|pif)$" in kql and "lnk" not in kql
     assert 'Mechanism = "startup_folder"' in kql and "union winFleet, macFleet, startupFleet" in kql
+
+
+def test_intune_enrolment_and_azure_arc_tasks_skipped_only_in_their_exact_form():
+    kql = build_kql()
+    assert 'Item has "enterprisemgmt" and TaskCmd endswith @"\\system32\\deviceenroller.exe"' in kql
+    assert 'Item == @"\\azcmagent" and TaskArgs has @"\\Program Files\\AzureConnectedMachineAgent\\"' in kql
+
+
+def test_windows_update_medic_and_mrt_heartbeat_tasks_skipped_only_in_their_exact_form():
+    kql = build_kql()
+    assert '== "{72566E27-1ABB-4EB3-B4F0-EB431CB1CB32}"' in kql and 'Item has "waasmedic" and isempty(TaskCmd)' in kql
+    assert 'Item has "removaltools" and TaskCmd endswith @"\\system32\\mrt.exe" and TaskArgs startswith "/EHB "' in kql
+
+
+def test_update_orchestrator_manageengine_and_google_updater_skipped_only_in_their_exact_form():
+    kql = build_kql()
+    assert r'%(systemroot|windir)%\\system32\\(usoclient|musnotification|mlenginestub)\.exe$' in kql
+    assert r'manageengine\\uems_agent\\bin\\(dcagentupgrader|uemslogcollector)\.exe$' in kql and 'TaskArgs == "Task"' in kql
+    assert r'\\google\\googleupdater\\[0-9.]+\\updater\.exe' in kql
+    assert '"com.google.googleupdater.wake.system.plist") and InitiatingProcessFileName =~ "googleupdater"' in kql.replace("\n", " ").replace("                        ", "")

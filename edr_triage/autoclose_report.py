@@ -62,6 +62,7 @@ _CLOSED_STATUS = "False Positive"
 _DUPLICATE_STATUS = "Duplicate"
 # custom_block_guard.py closes as a true positive, to Closed.
 _CLOSE_STATUSES = (_CLOSED_STATUS, _DUPLICATE_STATUS, "Closed")
+_AGREEING_CLOSES = {_CLOSED_STATUS, _DUPLICATE_STATUS}
 
 # The L2 review marker. An analyst adds this label to an autonomous close once they have
 # looked at it. Before this, "unreviewed" was purely age-based — every unreopened close
@@ -125,6 +126,14 @@ async def poll_once(lookback_days: int = 30) -> dict:
 
     await _notify(cfg, closes, overturned, unreviewed)
 
+    # A few random closes a day to L2 — the only measure of RAPTOR's error rate once
+    # nobody else reads its closes. See qa_sample.py.
+    from edr_triage import qa_sample
+    try:
+        await qa_sample.maybe_sample(closes, cfg)
+    except Exception as exc:
+        logger.error("autoclose_report: QA sample failed: %s", exc)
+
     scored = len(closes)
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -141,6 +150,7 @@ async def poll_once(lookback_days: int = 30) -> dict:
         "reviewed_label": REVIEWED_LABEL,
         "unreviewed_beyond_threshold": len(unreviewed),
         "review_threshold_hours": cfg.autoclose_review_hours,
+        "qa_sample": qa_sample.summary(closes),
         "closes": sorted(closes, key=lambda c: c["closed_at"] or "", reverse=True),
     }
 
@@ -236,8 +246,16 @@ def _read_close(issue: dict, bot_email: str) -> dict | None:
     if not closed_at:
         return None      # a human closed this, or nobody did — not ours to report
 
+    _now = closed_to
     for created, _email, display, frm, to in events:
-        if created > closed_at and frm == closed_to:
+        if created > closed_at and frm == _now:
+            # Re-filing a close as its twin (False Positive <-> Duplicate) agrees that it is
+            # not a threat; it is not a reopen. Read as one, it braked whole families four
+            # times (DEMO-118679, 118428, 118854, 120563). A move to "Closed" (true positive)
+            # or to any open status still counts.
+            if {frm, to} <= _AGREEING_CLOSES:
+                _now = to          # a later reopen from the re-filed status still counts
+                continue
             reopened_at, reopened_by, reopened_to = created, display, to
             break
 
@@ -274,6 +292,7 @@ def _read_close(issue: dict, bot_email: str) -> dict | None:
         "reviewed_by": reviewed_by,
         # The allowlist entry that caused this close, if one did — so a reopen can
         # disarm exactly that entry instead of leaving it to decay for months.
+        "qa_sampled": "raptor-qa-sample" in (fields.get("labels") or []),
         "allowlist_memory_id": next(
             (l[len(_ALLOWLIST_MEM_PREFIX):] for l in (fields.get("labels") or [])
              if isinstance(l, str) and l.startswith(_ALLOWLIST_MEM_PREFIX)), ""),

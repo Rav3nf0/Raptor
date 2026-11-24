@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException, Body, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Body, BackgroundTasks, Request
 from fastapi.responses import HTMLResponse
 
 logger = logging.getLogger(__name__)
@@ -86,8 +86,13 @@ async def quarantine_counts():
     return await get_quarantine_counts_by_type()
 
 
+def _actor(request: Request) -> str:
+    """Who is acting, from the login session (set by the auth middleware)."""
+    return getattr(request.state, "user", None) or "l2_analyst"
+
+
 @router.post("/api/memory/quarantine/{memory_id}/promote")
-async def promote(memory_id: str, payload: dict = Body(default={})):
+async def promote(memory_id: str, request: Request, payload: dict = Body(default={})):
     """Promote a quarantined memory to golden.
 
     Optional body: {"scope": "entity"|"playbook", "auto_fp": bool, "apps": [str]}.
@@ -100,6 +105,10 @@ async def promote(memory_id: str, payload: dict = Body(default={})):
     from entity_graph.memory import promote_memory
     scope = (payload or {}).get("scope")
     auto_fp = (payload or {}).get("auto_fp")
+    # Analysts may promote; arming an auto-close (auto_fp) stays with admins.
+    if auto_fp and getattr(request.state, "role", None) != "admin":
+        raise HTTPException(403, "Arming an auto-close needs the admin role; "
+                                 "promote without auto-close, or ask an admin")
     apps = (payload or {}).get("apps")
     if isinstance(apps, str):           # tolerate "Slack" or "Slack, Drive"
         apps = [a for a in (p.strip() for p in apps.split(",")) if a]
@@ -108,7 +117,7 @@ async def promote(memory_id: str, payload: dict = Body(default={})):
     commands = (payload or {}).get("commands")
     if isinstance(commands, str):
         commands = [c for c in (p.strip() for p in commands.splitlines()) if c]
-    ok = await promote_memory(memory_id, resolved_by="l2_analyst", scope=scope,
+    ok = await promote_memory(memory_id, resolved_by=_actor(request), scope=scope,
                               auto_fp=auto_fp, apps=apps, commands=commands)
     if not ok:
         raise HTTPException(404, "Memory not found")
@@ -1226,7 +1235,8 @@ async def analyze_allowlist_suggestions(
 
 
 @router.post("/api/memory/suggestions/{suggestion_id}/arm")
-async def arm_allowlist_suggestion(suggestion_id: str, payload: dict = Body(default={})):
+async def arm_allowlist_suggestion(suggestion_id: str, request: Request,
+                                   payload: dict = Body(default={})):
     """Approve a suggestion — writes a golden auto_fp memory so the pipeline
     short-circuit auto-closes this actor's future FPs. Body may override
     {device, commands} before arming (e.g. narrow to a command set). Reversible:
@@ -1251,7 +1261,7 @@ async def arm_allowlist_suggestion(suggestion_id: str, payload: dict = Body(defa
         uba_baseline=getattr(sugg, "uba_baseline", {}) or {},
         jira_key=(sugg.evidence_jira_keys or [""])[0],
         evidence_jira_keys=sugg.evidence_jira_keys,
-        resolved_by="l2_analyst",
+        resolved_by=_actor(request),
         alert_name=sugg.alert_name,
     )
     if not mem_id:
@@ -1260,14 +1270,14 @@ async def arm_allowlist_suggestion(suggestion_id: str, payload: dict = Body(defa
     from datetime import datetime as _dt
     sugg.status = "armed"
     sugg.armed_memory_id = mem_id
-    sugg.reviewed_by = "l2_analyst"
+    sugg.reviewed_by = _actor(request)
     sugg.reviewed_at = _dt.utcnow()
     await sugg.save()
     return {"ok": True, "id": suggestion_id, "status": "armed", "memory_id": mem_id}
 
 
 @router.post("/api/memory/suggestions/{suggestion_id}/dismiss")
-async def dismiss_allowlist_suggestion(suggestion_id: str):
+async def dismiss_allowlist_suggestion(suggestion_id: str, request: Request):
     """Dismiss a suggestion without arming anything."""
     from entity_graph.models import AllowlistSuggestion
     from datetime import datetime as _dt
@@ -1275,7 +1285,7 @@ async def dismiss_allowlist_suggestion(suggestion_id: str):
     if not sugg:
         raise HTTPException(404, "Suggestion not found")
     sugg.status = "dismissed"
-    sugg.reviewed_by = "l2_analyst"
+    sugg.reviewed_by = _actor(request)
     sugg.reviewed_at = _dt.utcnow()
     await sugg.save()
     return {"ok": True, "id": suggestion_id, "status": "dismissed"}
@@ -1313,7 +1323,7 @@ async def list_planned_activity(limit: int = 100):
 
 
 @router.post("/api/memory/planned-activity", status_code=201)
-async def create_planned_activity(payload: dict = Body(...)):
+async def create_planned_activity(request: Request, payload: dict = Body(...)):
     """Declare a maintenance/compliance window. Body: {pattern, label?, alert_type?,
     and an expiry — either expires_at (ISO 'YYYY-MM-DD' or full timestamp) or days:int}.
     A date-only expiry is treated as end of that day (UTC)."""
@@ -1349,7 +1359,7 @@ async def create_planned_activity(payload: dict = Body(...)):
     if exp <= _dt.utcnow():
         raise HTTPException(400, "expiry must be in the future")
     doc = PlannedActivity(pattern=pattern, label=label, alert_type=alert_type,
-                          expires_at=exp, created_by="l2_analyst")
+                          expires_at=exp, created_by=_actor(request))
     await doc.insert()
     return {"ok": True, "id": str(doc.id), "expires_at": exp.isoformat()}
 
@@ -1960,6 +1970,7 @@ def _render_page() -> str:
       </table></div></div>
       <div class="note" style="margin-top:12px;font-size:12px;color:var(--muted)"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg> Escalation precision is scored only on tickets that went L1 → L2 (the only case with an independent second opinion). An escalation counts as correct when L2 confirmed a true positive. Trust tier locks in after 50 scored decisions.</div>
     </div>
+    <!--di-footer-->
   </main>
 </div>
 
