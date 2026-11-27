@@ -251,7 +251,8 @@ rather than a compromise. Deterministic checks catch the failure modes you would
 pay a much larger model to avoid, so the budget goes into verification instead of parameters.
 The production queue this was built against averages about 4,400 alerts a month and runs on
 under $100 of model spend: about two cents an alert, for the whole volume rather than per
-analyst.
+analyst. The backend is pluggable, and on a local model through Ollama the model spend is
+zero, at whatever accuracy your hardware buys.
 
 The cap is enforced, not reported. Every call's token usage and USD cost is written to Mongo
 and the monthly limit is checked in-process — the backend refuses the call once
